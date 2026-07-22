@@ -114,21 +114,38 @@ Rule: a feature is not `complete` until acceptance criteria pass AND `/gap-check
 
 ### [FEAT-004] Docling parser service
 **Phase:** 1
-**Status:** planned
+**Status:** complete
 **Owner:** claude-code
 **Files:**
-- `apps/api/services/parser.py`
+- `apps/api/services/parser.py` — `Parser`, `ParsedDocument` (`dropped_elements: int`), `ParsedElement` (now with `element_id`, `associated_caption_ids`, `association_method`), `BBox`, `ElementType`, `ParseError`
 **Tests:**
-- `apps/api/tests/test_parser.py` — three fixture PDFs (clean digital, scanned, table-heavy)
+- `apps/api/tests/test_parser.py` — 15 tests against three real fixture PDFs (`apps/api/tests/fixtures/`: `clean_digital.pdf`, `table_heavy.pdf`, `scanned.pdf`) plus fake-converter unit tests for iteration-failure and silent-drop paths
 **Acceptance criteria:**
-- [ ] `Parser.parse(pdf_bytes) -> ParsedDocument` returns typed elements: text, heading, table, figure, caption, list
-- [ ] Each element has: page_number, bbox (x0,y0,x1,y1), content, element_type
-- [ ] Tables are extracted as markdown-formatted content
-- [ ] Figures are returned as PIL Image objects for downstream storage
-- [ ] Parse failures raise `ParseError` with the source page number
+- [x] `Parser.parse(pdf_bytes) -> ParsedDocument` returns typed elements: text, heading, table, figure, caption, list — verified: no single fixture exercises all six (see element counts below), coverage confirmed across the three combined
+- [x] Each element has: page_number, bbox (x0,y0,x1,y1), content, element_type — verified via pytest against every element in `clean_digital.pdf`
+- [x] Tables are extracted as markdown-formatted content — verified: all 29 tables in `table_heavy.pdf` contain markdown pipe-table syntax
+- [x] Figures are returned as PIL Image objects for downstream storage — verified against `scanned.pdf`'s one figure
+- [x] Parse failures raise `ParseError` with the source page number — `ParseError.page_number` structurally tested; invalid/empty/truncated-bytes tests confirm the raise path; a fake-converter test confirms a failure *during element iteration* (not just at `converter.convert()`) also raises `ParseError`, carrying the last successfully-processed element's page number as "best available"
+
+**Actual output per fixture (CPU, `do_ocr=False`, `generate_picture_images=True`) — pinned as a regression test, unchanged since first implementation:**
+- `clean_digital.pdf`: 21 elements — 9 list, 6 heading, 5 text, 1 table. No figure/caption (fixture has neither). `dropped_elements`: 0.
+- `table_heavy.pdf`: 66 elements — 29 table, 19 caption, 8 heading, 6 list, 4 text, across 11 pages. `dropped_elements`: 0.
+- `scanned.pdf`: **2 elements total** across 3 pages — 1 heading (page 1's title, real embedded text, not OCR'd) + 1 tiny figure (logo). Pages 2–3: zero elements each. No crash — but see below. `dropped_elements`: 0.
+
+**Scanned-PDF finding (informs FEAT-017 scoping):** with OCR off, a fully-scanned 3-page document degrades to almost nothing rather than erroring — "graceful" in that it doesn't crash, but it's silent, near-total data loss with no signal anything went wrong. FEAT-017 will need an explicit trigger heuristic (e.g. element count far below what page count would suggest) rather than relying on `ParseError` or empty output alone, since empty output here is indistinguishable from "this page is genuinely blank." (Full trigger-heuristic note now also in FEAT-017's own entry below.)
+
+**Docling setup notes:** `do_ocr=False` set explicitly — Docling's default pipeline probes every page for OCR need and downloads RapidOCR models on first use even for fully-digital PDFs, which is both slow and out of FEAT-004's scope (OCR is FEAT-017). `generate_picture_images=True` set explicitly — `PictureItem.get_image()` returns `None` otherwise (`generate_picture_images` defaults to `False` in Docling). First run downloads the ~heron layout model from Hugging Face (one-time, cached after); full fixture suite now runs in ~4.5 min on CPU once models are cached (up from ~2.5 min — more tests re-parse the fixtures).
+
+**Codex review follow-up #1 (2026-07-22):** found two real gaps, both closed. (1) The `try/except` around `converter.convert()` didn't cover the subsequent element-iteration loop — a failure during iteration, provenance access, or bbox extraction would have propagated unwrapped instead of as `ParseError`. Now the entire loop is wrapped, and the exception carries the last successfully-processed element's page number (`last_page_number`) as the best available context, since the failure itself may not have reached a new element's provenance yet. (2) Elements with missing provenance (a type we model, like caption, but with no page/bbox available) were silently `continue`d — no error, no log, invisible. Same silent drop existed for figures where `get_image()` returned `None`. Both now increment a new `ParsedDocument.dropped_elements` counter and log a WARN with what was dropped and why. Distinguished deliberately from labels we don't model at all (`page_header`, `footnote`, etc.) — that filtering stays silent since it's expected, not an anomaly; conflating the two would make `dropped_elements` noise rather than signal. Real-PDF corruption (truncation, mid-file byte removal) could not be made to reliably reproduce the iteration-level failure — pdfium either refuses to open the file outright (caught by the pre-existing `try/except`) or silently tolerates the corruption and returns fewer elements with no error. A fake converter/document is used instead for deterministic coverage of that specific path.
+
+**Codex review follow-up #2 (2026-07-23) — table/figure ↔ caption association:** verified empirically (not assumed from docs) that the installed Docling version (2.87.0) exposes an explicit caption link: `TableItem.captions` / `PictureItem.captions` return a list of `RefItem`, each resolvable via `.resolve(doc)` to the actual caption `TextItem`, with a stable `self_ref` string (e.g. `#/tables/0`, `#/texts/1`) usable as a correlation id. **Tier 1 exists in this Docling version** — this was not a given going in. Added `element_id` (= Docling's own `self_ref`) to every `ParsedElement`; `associated_caption_ids: list[str]` populated on TABLE/FIGURE elements from resolved caption refs; `association_method: "explicit" | "none"` set on every CAPTION element (never left unset) — `"explicit"` if some table/figure's `captions` list claimed it, `"none"` otherwise. Resolution failures or refs pointing at something other than a caption are logged as WARN and skipped, not silently ignored. **Measured against `table_heavy.pdf`: 13 of 19 captions got `"explicit"`, 6 got `"none"`** (13 of 29 tables have at least one associated caption — the gap between 29 tables and 19 captions is multiple `table` elements sharing one caption, e.g. multi-year tables split into per-year sub-tables under one heading). Scope stops exactly at "extract what Docling knows" — proximity/positional matching for the 6 unclaimed captions (Tier 2) is explicitly FEAT-005's problem, not implemented here.
+
+**All three fixtures re-verified to produce identical element counts (21/66/2, `dropped_elements: 0` for all three) after both follow-up rounds** — confirmed via a pinned-count regression test, not eyeballed.
 
 **Run:**
-- `pytest apps/api/tests/test_parser.py -v`
+- `cd apps/api && uv run pytest tests/test_parser.py -v` (first run downloads Docling's layout model from Hugging Face — expect several minutes; cached after)
+
+**Changelog:** See CHANGELOG.md 2026-07-22 "feature: Docling parser service (FEAT-004)", 2026-07-22 "fix: parser exception coverage + silent-drop visibility (FEAT-004 Codex follow-up)", and 2026-07-23 "feature: table/figure caption association, Tier 1 (FEAT-004 Codex follow-up #2)"
 
 ---
 
@@ -372,6 +389,10 @@ Features here are placeholders until Phase 3 ships. Do not start unless Phase 3 
 
 - [FEAT-016] Streaming responses via SSE — planned
 - [FEAT-017] OCR fallback via Gemini Flash — planned
+  - **Trigger (updated 2026-07-22, FEAT-004 session):** *not* "low Docling confidence" — no such signal exists. `Parser.parse()` (FEAT-004) exposes no confidence score to threshold on; Docling just silently returns fewer/zero elements for pages it can't read, indistinguishable from a legitimately blank page. Confirmed against the `scanned.pdf` fixture: with OCR off, a fully-scanned 3-page PDF returned 2 elements total, 0 on 2 of the 3 pages, no error. The trigger must be a positive heuristic evaluated over `ParsedDocument`, e.g.:
+    - Element count for a page falls below some threshold relative to what a page with real content typically produces, or
+    - Zero elements on a page that isn't the last page of a short document (near-certain sign of missed content, not a genuinely blank page)
+  - Original wording ("for low-confidence Docling pages," still in SCOPE.md and ARCHITECTURE.md as of this edit) assumed a confidence signal that doesn't exist — see CHANGELOG.md 2026-07-22 "feature: Docling parser service (FEAT-004)" for the full finding.
 - [FEAT-018] Reranker step — planned
 - [FEAT-019] Conversation memory in prompt — planned
 - [FEAT-020] DOCX/PPTX ingestion — planned

@@ -1,4 +1,4 @@
-# Gap Check — 2026-07-22T16:30:55Z
+# Gap Check — 2026-07-22T23:03:11Z
 
 <!-- MANUAL ENTRIES BELOW — preserved across /gap-check runs, edit freely -->
 
@@ -35,6 +35,6 @@ The Codex review above flagged (WARNING) that RLS enforcement had never been pro
   4. **Authenticated write to the `figures` storage bucket:** `400` / `"new row violates row-level security policy"` — this one *is* a genuine RLS-policy rejection (figures has a `select`-only policy, no insert policy), giving one real example of the RLS layer itself firing, not just the grant layer.
 - [x] `test_migrations.py` run for real against the local instance: **14/14 passed, 0 skipped** (previously 14/14 skipped — no local Postgres reachable).
 
-**CRITICAL — not yet resolved on the live project.** The live Supabase project (`nbrfjbjjjhawscncshdz`) almost certainly has the identical gap — nothing has ever attempted a write against these tables there, so it's never been exercised. `20260722_002_grant_table_privileges.sql` needs to be applied there the same way `001` was (dashboard SQL editor), before FEAT-004+ (ingestion pipeline) can actually write data. **Do not build FEAT-004+ against the live project until this is applied and re-verified there.**
+**RESOLVED on the live project as of the FEAT-004 session (2026-07-22).** `20260722_002_grant_table_privileges.sql` has been applied to the live Supabase project (`nbrfjbjjjhawscncshdz`) via the dashboard SQL editor, same as `001`. Not independently re-verified with the live-enforcement script from this entry (that was only run locally) — worth doing before FEAT-007+ (`/ingest`, `/query`) writes real data there for the first time.
 
 **Local Supabase stack:** left running (`http://127.0.0.1:54321`, DB on `:54322`) rather than torn down — useful for FEAT-004+ integration tests per STANDARDS.md ("No mocking of Supabase in integration tests — use `supabase start`"). Stop with `npx supabase stop` from `apps/api/` if not wanted.
