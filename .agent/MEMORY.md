@@ -1,0 +1,139 @@
+# Memory
+
+Persistent agentic memory. Never cleared. Append-only within sections. Tag every entry with timestamp + agent ID.
+
+**Read at session start:**
+1. `§Anti-patterns` — what not to repeat
+2. `§Open questions` — what still needs human input
+
+**Updated at session end** via `/memory-sync`.
+
+---
+
+## §Anti-patterns
+
+Things tried and failed, or explicitly rejected during design. Do not retry without human confirmation.
+
+### 2026-07-22 [claude-code] — CLIP-style dual-tower embeddings
+**Context:** During v1 strategy selection, considered CLIP-style multimodal embeddings (separate text and image encoders).
+**Why rejected:** Modality gap — image embeddings cluster near other image embeddings, text near text. Cross-modal retrieval (text query → image match) is degraded. Voyage's unified single-encoder architecture eliminates this. Do not swap to CLIP-family without solving the modality gap first.
+
+### 2026-07-22 [claude-code] — Vercel serverless for the Docling backend
+**Context:** User asked whether Python backend could run as Vercel serverless functions.
+**Why rejected:** (1) Vercel serverless function size cap of 250MB is smaller than PyTorch + Docling. (2) 10-30s cold starts on first invocation kill UX. (3) Default 15s timeout too short for multi-page parse. Do not attempt to move FastAPI to Vercel serverless. If Render becomes a problem, use Railway or Fly.io — not Vercel.
+
+### 2026-07-22 [claude-code] — Application-level tenant filtering as primary defense
+**Context:** Considered relying on app-level `WHERE user_id = ?` alone for multi-tenancy.
+**Why rejected:** Every route becomes a potential leak surface. RLS at Postgres is the primary defense. App-level user_id filters remain for clarity/testability but the DB is the enforcement point. Never bypass RLS with service-role for a user-facing read path.
+
+### 2026-07-22 [claude-code] — Building all four multimodal-RAG strategies simultaneously
+**Context:** User initially proposed offering all four strategies (extract-to-text, unified multimodal embeddings, layout-aware, page-as-image) as user-selectable in v1.
+**Why rejected:** Massive engineering surface for a solo portfolio project. Ship layout-aware first end-to-end, add other strategies behind a common interface in v2 once the shape is proven. Do not build the strategy-selector abstraction before v1 ships.
+
+### 2026-07-22 [claude-code] — Building over-engineered documentation system
+**Context:** Considered separate DECISIONS.md, API_CONTRACT.md, CONVENTIONS.md, flow.md, PROJECT_STATE.md files.
+**Why rejected:** Seven living docs is more overhead than a solo dev needs. Merged into agent-os defaults (CHANGELOG absorbs decisions, ARCHITECTURE absorbs conventions, HANDOFF absorbs flow narrative). Only added .agent/SCHEMA.md and .agent/API_CONTRACT.md as project-specific additions on top of agent-os defaults. Do not add more living docs without a concrete failure case that the existing set doesn't cover.
+
+---
+
+## §Open questions
+
+Things that need human input before proceeding. Do not assume answers.
+
+### 2026-07-22 [claude-code] — Final project name
+**Context:** Placeholder `multimodal-rag` used throughout. Real name TBD by user.
+**Blocking:** No immediate action needed; find-replace closes it before FEAT-023 landing page work.
+
+### 2026-07-22 [claude-code] — Post-credit-expiry generation provider
+**Context:** $120 Anthropic credits expire Aug 9 ($20) and Sep 19 ($100). After that, provider choice reopens: Claude paid vs Gemini swap.
+**Blocking:** No before Sep 19. Deferring decision until real usage data exists.
+
+### 2026-07-22 [claude-code] — Rerank in Phase 2 or Phase 4
+**Context:** Voyage rerank-2 or a cross-encoder could improve retrieval precision.
+**Leaning:** Defer to Phase 4. Measure quality without it first — if RRF alone is sufficient, rerank adds latency without value.
+**Blocking:** Not blocking; can start Phase 2 without rerank.
+
+### 2026-07-22 [claude-code] — Chunking granularity
+**Context:** ~500-token target chosen. Could be smaller (finer citations) or larger (more context per chunk).
+**Leaning:** Start at 500 tokens with element-boundary respect. Revisit after real documents are ingested.
+**Blocking:** Not blocking; FEAT-005 encodes 500-token default.
+
+### 2026-07-22 [claude-code] — Document status update mechanism
+**Context:** Polling vs Supabase Realtime subscription for parsing progress.
+**Leaning:** Polling (simpler, works everywhere, no websocket setup).
+**Blocking:** Not blocking; FEAT-014 defaults to polling.
+
+---
+
+## §Decision log
+
+Every fork, what was chosen, why. Append-only.
+
+### 2026-07-22 [claude-code] — v1 strategy: layout-aware parsing (Docling)
+**Alternatives considered:** Extract-to-text (simpler but lossy), unified multimodal embeddings (heavier compute, less deterministic chunks), page-as-image ColPali-style (highest fidelity but heaviest compute per page).
+**Chosen:** Layout-aware parsing via Docling.
+**Reasoning:** Widest applicability across document types, best portfolio depth, fully free at portfolio scale, preserves table structure and element relationships better than plain text extraction.
+
+### 2026-07-22 [claude-code] — Embeddings: Voyage multimodal-3.5
+**Alternatives considered:** OpenAI text-embedding-3, Cohere embed-4, Jina v4, self-hosted nomic-embed.
+**Chosen:** Voyage multimodal-3.5.
+**Reasoning:** Unified encoder avoids CLIP modality gap on cross-modal retrieval. 200M tokens + 150B pixels free tier covers portfolio scale by wide margin. Anthropic-recommended, natural fit with Claude generation.
+
+### 2026-07-22 [claude-code] — Storage: Supabase (Postgres + pgvector + Storage + Auth)
+**Alternatives considered:** Dedicated vector DB (Pinecone, Weaviate, Qdrant), separate auth provider (Clerk, Auth0), separate file storage (S3).
+**Chosen:** Supabase for all four.
+**Reasoning:** One system to run and deploy. pgvector is production-ready for portfolio-scale (<10M chunks). RLS enables true multi-tenancy without app-level enforcement. Free tier is workable.
+
+### 2026-07-22 [claude-code] — Multi-tenancy day 1 via RLS
+**Alternatives considered:** Ship single-user v1, retrofit multi-tenancy later.
+**Chosen:** Multi-tenant schema from day 1, tested single-user until Phase 3.
+**Reasoning:** Retrofitting is painful (touches every query). RLS at schema is a one-time cost that closes an entire class of bugs permanently.
+
+### 2026-07-22 [claude-code] — Repo shape: monorepo
+**Alternatives considered:** Two separate repos (apps/web, apps/api).
+**Chosen:** Monorepo with `apps/web`, `apps/api`, `docs/`, `.agent/`.
+**Reasoning:** Solo dev + multi-agent, agents share context better with one repo. Shared TS types easier to sync. Simpler deploys (Vercel and Render both handle subdirectories).
+
+### 2026-07-22 [claude-code] — Deploy: Vercel (web) + Render (api)
+**Alternatives considered:** All-Vercel (Python serverless), Railway, Fly.io, self-hosted VPS.
+**Chosen:** Vercel + Render.
+**Reasoning:** Vercel serverless can't fit Docling under size limits. Render free tier is sufficient (750 hrs/mo, Docker for Python). Railway is the fallback if Render's 15-min idle spin-down becomes a UX issue.
+
+### 2026-07-22 [claude-code] — Four-agent development workflow (user override)
+**Alternatives considered:** Recommended reducing to two agents (claude-code + claude-design) for solo scope.
+**Chosen (by user):** Keep all four (claude-code, claude-design, gemini, codex).
+**Reasoning:** User wants full multi-agent orchestration experience for portfolio angle. Handoff discipline via AGENT.md role table + commit tags mitigates coordination overhead. Reversible if friction exceeds value by Week 2.
+
+### 2026-07-22 [claude-code] — Documentation set: agent-os defaults + SCHEMA + API_CONTRACT
+**Alternatives considered:** Full seven-doc system (adding DECISIONS, CONVENTIONS, flow, PROJECT_STATE).
+**Chosen:** Agent-os defaults (AGENT, CHANGELOG, SCOPE, ARCHITECTURE, STANDARDS, FEATURES, MEMORY) + two additions (SCHEMA, API_CONTRACT).
+**Reasoning:** Agent-os covers most needs. SCHEMA is essential for a DB-heavy project. API_CONTRACT documents internal endpoints; external APIs handled by `/api-check` under `.agent/api-docs/`. Nine docs is at the edge of manageable; do not grow this further without concrete evidence a doc is missing.
+
+---
+
+## §Assumptions
+
+Explicit assumptions made without confirmation. Flag before acting on them.
+
+### 2026-07-22 [claude-code] — Frontend stack
+**Assumed:** Next.js 14 App Router, TypeScript, Tailwind, shadcn/ui.
+**Rationale:** Matches Reminisce muscle memory per user context. Standard portfolio stack.
+**Risk:** Low. User would flag differently.
+
+### 2026-07-22 [claude-code] — Python version
+**Assumed:** 3.12.
+**Rationale:** Current stable, Docling supports it.
+**Risk:** Low. Change is trivial if 3.11 preferred.
+
+### 2026-07-22 [claude-code] — Package managers
+**Assumed:** pnpm (web), uv (api).
+**Rationale:** Faster, modern, standard for new projects.
+**Risk:** Low. Swap to npm/pip if user prefers.
+
+---
+
+## §Agent identity log
+
+Who wrote what, when. Populated as agents work.
+
+*(empty — populated during real work)*
