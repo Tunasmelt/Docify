@@ -20,6 +20,16 @@ add_gap() {
   [[ "$severity" == "CRITICAL" ]] && echo "❌ CRITICAL: $msg" || echo "⚠  WARNING:  $msg"
 }
 
+# This script used to fully overwrite GAPS.md on every run, silently
+# destroying any manually-added content (e.g. a resolved-findings log from
+# an external review). Anything below MANUAL_MARKER is now preserved
+# across runs instead of being wiped.
+MANUAL_MARKER="<!-- MANUAL ENTRIES BELOW — preserved across /gap-check runs, edit freely -->"
+MANUAL_SECTION=""
+if [[ -f "$GAP_FILE" ]] && grep -qF "$MANUAL_MARKER" "$GAP_FILE"; then
+  MANUAL_SECTION=$(awk -v m="$MANUAL_MARKER" 'index($0,m){f=1} f' "$GAP_FILE")
+fi
+
 echo "# Gap Check — $DATE" > "$GAP_FILE"
 echo "Running gap checks..."
 echo ""
@@ -105,6 +115,17 @@ if [[ -f .agent/scripts/api-check.sh && -d .agent/api-docs ]]; then
   if [[ "$STALE_APIS" -gt 0 ]]; then
     add_gap "WARNING" "$STALE_APIS API doc(s) stale or missing — run /api-check"
   fi
+fi
+
+echo "" >> "$GAP_FILE"
+if [[ -n "$MANUAL_SECTION" ]]; then
+  echo "$MANUAL_SECTION" >> "$GAP_FILE"
+else
+  {
+    echo "$MANUAL_MARKER"
+    echo ""
+    echo "Findings resolved from external reviews, or other notes that shouldn't be wiped by the next /gap-check run. Nothing in this section is auto-detected."
+  } >> "$GAP_FILE"
 fi
 
 echo ""

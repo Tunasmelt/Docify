@@ -6,6 +6,16 @@ Entry types: `feature` · `fix` · `decision` · `refactor` · `test` · `infra`
 
 ---
 
+## 2026-07-22 — fix: live RLS/storage enforcement proven; found and fixed missing table grants (FEAT-001)
+**Phase:** 1 (Ingestion Pipeline)
+**Feature:** FEAT-001
+**Decision:** Codex's review flagged that RLS enforcement had only ever been checked statically (policy presence in the SQL) — never proven against a live database, since `test_migrations.py`'s 14 tests had always skipped (no local Postgres reachable). Set up a real local Supabase instance (`supabase init` + `supabase start` via Docker; first run pulled ~20 images, several minutes) and ran the full migration + test suite against it for real: **14/14 passed, 0 skipped**. Then wrote a live enforcement script exercising four real scenarios over actual HTTP (PostgREST/GoTrue/Storage, no mocks): cross-user `chunks` isolation via two real logged-in users, an authenticated non-owner INSERT attempt, a fully anonymous INSERT attempt, and an authenticated write attempt to the `figures` storage bucket. First run failed immediately — not on RLS, but on a service-role INSERT into `documents` returning `permission denied for table documents`. Root cause: `20260722_001_initial.sql` creates RLS policies but never grants the underlying table-level `SELECT`/`INSERT`/`UPDATE`/`DELETE` privileges to `anon`/`authenticated`/`service_role` — Postgres requires both a GRANT and a matching policy, and RLS alone doesn't unlock a table a role has no base privilege on. This blocked *everything*, including `service_role` (its `BYPASSRLS` attribute only bypasses the RLS layer, not the independent GRANT layer). Wrote `apps/api/migrations/20260722_002_grant_table_privileges.sql`, granting exactly what each table's existing policies imply — nothing more. Re-ran the live script: all four checks now pass (see `.agent/GAPS.md` for the exact status codes and response bodies, since two of the four rejections come from the GRANT layer and two from genuine RLS policy firing — worth keeping that distinction visible rather than reporting a flat "4/4 RLS enforced").
+**Changed:** `apps/api/migrations/20260722_002_grant_table_privileges.sql` (new), `.agent/SCHEMA.md` (§Migration log entry), `.agent/GAPS.md` (new finding logged under a live-verification section).
+**Impact:** **CRITICAL, unresolved on the live project.** This gap almost certainly exists on the live Supabase project (`nbrfjbjjjhawscncshdz`) too — nothing has ever attempted a write against these tables there. FEAT-004 onward (ingestion pipeline) cannot actually persist data against the live project until `20260722_002_grant_table_privileges.sql` is applied there via the dashboard SQL editor, the same way `001` was, and re-verified. Local Supabase stack left running (`localhost:54321`/`:54322`) rather than torn down, per STANDARDS.md's "no mocking Supabase in integration tests" rule — useful for FEAT-004+ testing going forward.
+**Rollback:** Local: run the ROLLBACK block at the bottom of `20260722_002_grant_table_privileges.sql`. Live project: not applied, nothing to roll back yet.
+
+---
+
 ## 2026-07-22 — fix: JWT middleware verified against wrong signing scheme, corrected to JWKS/ES256 (FEAT-003 correction)
 **Phase:** 1 (Ingestion Pipeline)
 **Feature:** FEAT-003
