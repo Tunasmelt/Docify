@@ -6,6 +6,16 @@ Entry types: `feature` · `fix` · `decision` · `refactor` · `test` · `infra`
 
 ---
 
+## 2026-07-22 — feature: repo skeleton scaffolded (FEAT-000)
+**Phase:** 0 (Setup)
+**Feature:** FEAT-000
+**Decision:** Scaffolded `apps/web` (Next.js 14.2 App Router + TypeScript + Tailwind, via `pnpm create next-app`) and `apps/api` (FastAPI on Python 3.12 via `uv init`, deps: fastapi, uvicorn, docling, voyageai, google-genai, supabase, pydantic, python-dotenv; dev: pytest, pytest-asyncio, httpx). Restructured both to match STANDARDS.md's directory layout — `apps/web/app/(auth)`, `app/(app)`, `app/api`, `components/{ui,layout}`, `lib/{supabase,api,types}`; `apps/api/{routes,services,db,models,migrations,tests}` — with `.gitkeep` placeholders for empty dirs. `main.py` is a bare `FastAPI()` instance with no routes (routes start at FEAT-002). `middleware.ts` deliberately not created — an empty one breaks Next.js, and real auth logic belongs to FEAT-013. `uv` wasn't installed on this machine; installed it via `pip install --user uv`, which then fetched Python 3.12 automatically (system had only 3.14) — no system Python install needed. Wrote root `README.md` (quick-start for both apps) and expanded root `.gitignore` (node_modules, .next, __pycache__, .venv, .env*, editor/OS cruft — `uv.lock` and `pnpm-lock.yaml` intentionally still tracked per STANDARDS.md). Added per-app `.env.example` reflecting the current (Gemini, not Anthropic) provider decision. Verified all four FEAT-000 acceptance criteria directly: `uv sync` succeeded, `pnpm install` succeeded (implicit in scaffold), `pnpm dev` served 200 on :3000, `uv run uvicorn main:app` served 200 (`/openapi.json`) on :8000. Also fixed a `/gap-check` bug found while verifying: Check 1 flagged every `Files:` entry across the whole registry as a critical missing-file gap regardless of feature status, so any `planned` feature's not-yet-created files were reported as gaps against FEAT-000. Patched it to skip `status: planned` features and to accept an optional `FEAT-NNN` arg to scope the check.
+**Changed:** `apps/web/**` (new), `apps/api/**` (new), `README.md` (new), `.gitignore`, `.agent/FEATURES.md` (FEAT-000 → complete, fixed ambiguous `.env.example` file listing), `.agent/scripts/gap-check.sh` (scoping + planned-status fix).
+**Impact:** FEAT-001 (Supabase project + migration) can now start — it depends on `apps/api/db/` existing, which it now does. `/gap-check` is now meaningfully scopable per-feature instead of always dumping the full backlog.
+**Rollback:** `rm -rf apps/ README.md`, revert `.gitignore` and `.agent/FEATURES.md` to prior commit, revert `.agent/scripts/gap-check.sh`. `uv` (installed via pip) can be removed with `pip uninstall uv` if desired — nothing else depends on it being globally present, since `uv` manages its own Python versions per-project.
+
+---
+
 ## 2026-07-22 — decision: generation + verification switched from Claude to Gemini
 **Phase:** 0 (Setup)
 **Feature:** —

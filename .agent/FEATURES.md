@@ -12,27 +12,27 @@ Rule: a feature is not `complete` until acceptance criteria pass AND `/gap-check
 
 ### [FEAT-000] Repo skeleton
 **Phase:** 0
-**Status:** planned
+**Status:** complete
 **Owner:** claude-code
 **Files:**
 - `apps/web/package.json` — Next.js 14 App Router boilerplate
 - `apps/api/pyproject.toml` — FastAPI + Docling + Voyage + Gemini deps
 - `.gitignore` — node_modules, .env, __pycache__, HANDOFF.md, .agent/logs, .agent/index.json
 - `README.md` — root readme with quick-start
-- `.env.example` at both app roots
+- `apps/web/.env.example`, `apps/api/.env.example`
 
-**Tests:** —
+**Tests:** — (no test suite yet — nothing to test in a skeleton with no logic)
 **Acceptance criteria:**
-- [ ] `pnpm install` succeeds in `apps/web`
-- [ ] `uv sync` succeeds in `apps/api`
-- [ ] `pnpm dev` starts Next.js on :3000
-- [ ] `uvicorn apps.api.main:app --reload` starts FastAPI on :8000
+- [x] `pnpm install` succeeds in `apps/web`
+- [x] `uv sync` succeeds in `apps/api`
+- [x] `pnpm dev` starts Next.js on :3000
+- [x] `uvicorn apps.api.main:app --reload` starts FastAPI on :8000
 
 **Run:**
 - Web: `cd apps/web && pnpm dev`
-- API: `cd apps/api && uvicorn main:app --reload`
+- API: `cd apps/api && uv run uvicorn main:app --reload`
 
-**Changelog:** — (add on completion)
+**Changelog:** See CHANGELOG.md 2026-07-22 "feature: repo skeleton scaffolded (FEAT-000)"
 
 ---
 

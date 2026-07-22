@@ -1,0 +1,22 @@
+[project]
+name = "docify-api"
+version = "0.1.0"
+description = "Docify FastAPI backend — ingestion, retrieval, generation"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115,<0.116",
+    "uvicorn[standard]>=0.30,<0.31",
+    "docling>=2.0,<3.0",
+    "voyageai>=0.3,<0.4",
+    "google-genai>=1.0,<2.0",
+    "supabase>=2.7,<3.0",
+    "pydantic>=2.8,<3.0",
+    "python-dotenv>=1.0,<2.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9.0",
+    "pytest-asyncio>=0.24,<0.25",
+    "httpx>=0.27,<0.28",
+]

@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # gap-check — Detect implementation gaps
+# Usage: gap-check.sh [FEAT-NNN]   (optional: scope to a single feature)
 set -euo pipefail
 DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+DATE_ONLY=$(date -u +"%Y-%m-%d")
 GAP_FILE=".agent/GAPS.md"
 FEATURES=".agent/FEATURES.md"
 SCOPE=".agent/SCOPE.md"
 INDEX=".agent/index.json"
+TARGET_FEAT="${1:-}"
 GAPS=0
 
 add_gap() {
@@ -21,15 +24,29 @@ echo "# Gap Check — $DATE" > "$GAP_FILE"
 echo "Running gap checks..."
 echo ""
 
-# Check 1: Features with no implementation files
+# Check 1: Non-planned features with missing implementation files
+# Skips features still in status "planned" — their files aren't expected to exist yet.
+# Optionally scoped to a single FEAT-NNN via $1.
 if [[ -f "$FEATURES" ]]; then
   echo "→ Checking feature implementation coverage..."
+  CUR_FEAT=""
+  CUR_STATUS=""
+  FILE_SECTION=false
   while IFS= read -r line; do
-    if [[ "$line" =~ ^\*\*Files:\*\* ]]; then
+    if [[ "$line" =~ ^###\ \[(FEAT-[0-9]+)\] ]]; then
+      CUR_FEAT="${BASH_REMATCH[1]}"
+      CUR_STATUS=""
+      FILE_SECTION=false
+    elif [[ "$line" == "**Status:**"* ]]; then
+      CUR_STATUS="${line#\*\*Status:\*\* }"
+      CUR_STATUS="${CUR_STATUS%% *}"
+    elif [[ "$line" =~ ^\*\*Files:\*\* ]]; then
       FILE_SECTION=true
     elif [[ "${FILE_SECTION:-false}" == true && "$line" =~ \`([^\`]+)\` ]]; then
-      fpath="${BASH_REMATCH[1]}"
-      [[ ! -f "$fpath" ]] && add_gap "CRITICAL" "Feature file missing: $fpath"
+      if [[ "$CUR_STATUS" != "planned" && ( -z "$TARGET_FEAT" || "$CUR_FEAT" == "$TARGET_FEAT" ) ]]; then
+        fpath="${BASH_REMATCH[1]}"
+        [[ ! -f "$fpath" ]] && add_gap "CRITICAL" "Feature file missing: $fpath ($CUR_FEAT)"
+      fi
     elif [[ "$line" =~ ^\*\* && "${FILE_SECTION:-false}" == true ]]; then
       FILE_SECTION=false
     fi
@@ -71,7 +88,7 @@ fi
 if command -v git &>/dev/null && git rev-parse --git-dir &>/dev/null 2>&1; then
   echo "→ Checking changelog coverage..."
   CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -v "^\.agent/" || true)
-  CHANGELOG_DATE=$(grep "^## $DATE" CHANGELOG.md 2>/dev/null | head -1 || echo "")
+  CHANGELOG_DATE=$(grep "^## $DATE_ONLY" CHANGELOG.md 2>/dev/null | head -1 || echo "")
   if [[ -n "$CHANGED_FILES" && -z "$CHANGELOG_DATE" ]]; then
     add_gap "WARNING" "Files changed today with no CHANGELOG entry for today"
   fi
