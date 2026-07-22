@@ -6,6 +6,16 @@ Entry types: `feature` · `fix` · `decision` · `refactor` · `test` · `infra`
 
 ---
 
+## 2026-07-22 — decision: generation + verification switched from Claude to Gemini
+**Phase:** 0 (Setup)
+**Feature:** —
+**Decision:** Reversed the generation and citation-verification provider decision from Claude to Gemini, consolidating all LLM calls onto a single provider. Ran `/api-check gemini` and verified current model IDs live: `gemini-3.6-flash` (generation, replaces Claude Sonnet) and `gemini-3.5-flash-lite` (verification/LLM-as-judge, replaces Claude Haiku), cached in `.agent/api-docs/gemini.md`. Gemini was already in the stack for OCR fallback (`gemini-2.5-flash`, left unchanged), so this removes the Anthropic SDK and second API credential rather than running two providers. Moved the "post-credit-expiry generation provider" entry in `.agent/MEMORY.md §Open questions` to `§Decision log`. Voyage (embeddings) is untouched — separate decision, separate provider.
+**Changed:** `AGENT.md` (stack line, locked/open decisions), `.agent/ARCHITECTURE.md` (system diagram, stack table, query/verify flows, module map, locked/open decisions), `.agent/API_CONTRACT.md` (error codes, response metadata example, error list), `.agent/FEATURES.md` (FEAT-010 generator wrapper, FEAT-011 verifier acceptance criteria, pyproject.toml deps note), `.agent/MEMORY.md` (open question → decision log), `.agent/api-docs/gemini.md` (new).
+**Impact:** FEAT-010 and FEAT-011 now target the Gemini SDK instead of Anthropic's. No code exists yet for either (both `planned`), so this is a pure documentation change with no migration required.
+**Rollback:** Revert this commit, or find-replace `gemini-3.6-flash` → `claude-sonnet-latest` and `gemini-3.5-flash-lite` → `claude-haiku-latest` across the changed files and move the MEMORY.md entry back to `§Open questions`.
+
+---
+
 ## 2026-07-22 — decision: project renamed to Docify
 **Phase:** 0 (Setup)
 **Feature:** —

@@ -2,7 +2,7 @@
 
 Specification for the internal FastAPI endpoints. Both `apps/api` (Pydantic models) and `apps/web` (TS types) must conform to this document. Changes require a CHANGELOG entry and a version bump if breaking.
 
-**Scope:** internal endpoints only. External API references (Voyage, Anthropic, Gemini, Supabase, Docling) live under `.agent/api-docs/` and are populated by `/api-check`.
+**Scope:** internal endpoints only. External API references (Voyage, Gemini, Supabase, Docling) live under `.agent/api-docs/` and are populated by `/api-check`.
 
 ---
 
@@ -49,7 +49,7 @@ All errors return this shape with the appropriate HTTP status:
 | `RATE_LIMITED` | 429 | Free-tier ceiling hit on a downstream API |
 | `PARSE_FAILED` | 500 | Docling could not parse the document |
 | `EMBED_FAILED` | 502 | Voyage API call failed |
-| `GENERATE_FAILED` | 502 | Anthropic API call failed |
+| `GENERATE_FAILED` | 502 | Gemini API call failed |
 | `INTERNAL` | 500 | Anything unexpected |
 
 ---
@@ -195,8 +195,8 @@ Ask a question over one or more documents.
     }
   ],
   "metadata": {
-    "model": "claude-sonnet-latest",
-    "verifier_model": "claude-haiku-latest",
+    "model": "gemini-3.6-flash",
+    "verifier_model": "gemini-3.5-flash-lite",
     "retrieved_count": 8,
     "cited_count": 2,
     "latency_ms": 3420
@@ -213,7 +213,7 @@ Ask a question over one or more documents.
 **Errors:**
 - `403 FORBIDDEN` if any `document_ids` don't belong to user
 - `422 VALIDATION_ERROR` if `document_ids` empty or `question` empty
-- `502 GENERATE_FAILED` if Claude call fails after retries
+- `502 GENERATE_FAILED` if Gemini call fails after retries
 
 ---
 

@@ -40,10 +40,6 @@ Things tried and failed, or explicitly rejected during design. Do not retry with
 
 Things that need human input before proceeding. Do not assume answers.
 
-### 2026-07-22 [claude-code] — Post-credit-expiry generation provider
-**Context:** $120 Anthropic credits expire Aug 9 ($20) and Sep 19 ($100). After that, provider choice reopens: Claude paid vs Gemini swap.
-**Blocking:** No before Sep 19. Deferring decision until real usage data exists.
-
 ### 2026-07-22 [claude-code] — Rerank in Phase 2 or Phase 4
 **Context:** Voyage rerank-2 or a cross-encoder could improve retrieval precision.
 **Leaning:** Defer to Phase 4. Measure quality without it first — if RRF alone is sufficient, rerank adds latency without value.
@@ -109,6 +105,12 @@ Every fork, what was chosen, why. Append-only.
 **Alternatives considered:** Placeholder `multimodal-rag` (working name only, never intended as final).
 **Chosen:** Docify.
 **Reasoning:** User locked the name, closing the open question that was blocking FEAT-023 landing page work. Find-replaced across AGENT.md (`name:` field + Open→Locked decisions), .agent/API_CONTRACT.md (placeholder Render URL), and this entry's own move out of §Open questions. No occurrences existed in .agent/ARCHITECTURE.md or .agent/FEATURES.md — checked, nothing to change there.
+
+### 2026-07-22 [claude-code] — Generation + verification provider: Gemini (reversing Claude)
+**Alternatives considered:** Staying on Claude paid tier post-credit-expiry (the original plan reflected in the now-closed §Open questions entry); Gemini swap.
+**Chosen:** Gemini — `gemini-3.6-flash` for generation, `gemini-3.5-flash-lite` for citation verification.
+**Reasoning:** Consolidating all LLM calls onto a single provider. Gemini was already in the stack for OCR fallback (`gemini-2.5-flash`), so this removes the Anthropic SDK dependency and the second API credential entirely rather than running two providers side by side. Verified current model IDs via `/api-check gemini` on 2026-07-22 (cached in `.agent/api-docs/gemini.md`). Voyage (embeddings) is unaffected — different provider, different decision.
+**Changed:** `AGENT.md`, `.agent/ARCHITECTURE.md`, `.agent/API_CONTRACT.md`, `.agent/FEATURES.md`, `.agent/MEMORY.md` (this entry), `.agent/api-docs/gemini.md` (new).
 
 ---
 

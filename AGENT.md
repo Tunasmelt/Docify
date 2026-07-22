@@ -46,7 +46,7 @@ api-contract:.agent/API_CONTRACT.md
 - FastAPI + Python 3.12 (backend)
 - Docling (layout-aware parsing, self-hosted)
 - Voyage multimodal-3.5 (embeddings)
-- Claude Sonnet / Haiku (generation + citation verification)
+- Gemini 3.6 Flash / 3.5 Flash-Lite (generation + citation verification)
 - Gemini Flash (OCR fallback only)
 - Supabase — Postgres + pgvector + Auth + Storage
 
@@ -66,7 +66,6 @@ Read only the file relevant to your current task.
 
 ## Open decisions
 - [ ] Strategy selector as v2 feature or later
-- [ ] Post-credit-expiry generation provider (Claude paid vs Gemini swap)
 
 ## Locked decisions
 - [x] Project name: Docify
@@ -75,7 +74,7 @@ Read only the file relevant to your current task.
 - [x] Monorepo — apps/web + apps/api
 - [x] Deploy Vercel (web) + Render (api)
 - [x] Voyage multimodal-3.5 for embeddings (unified encoder, generous free tier)
-- [x] Claude for generation + verification while credits last
+- [x] Gemini (3.6 Flash generation / 3.5 Flash-Lite verification) for generation + verification — consolidated onto one provider
 
 ---
 

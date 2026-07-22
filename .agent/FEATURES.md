@@ -16,7 +16,7 @@ Rule: a feature is not `complete` until acceptance criteria pass AND `/gap-check
 **Owner:** claude-code
 **Files:**
 - `apps/web/package.json` — Next.js 14 App Router boilerplate
-- `apps/api/pyproject.toml` — FastAPI + Docling + Voyage + Anthropic deps
+- `apps/api/pyproject.toml` — FastAPI + Docling + Voyage + Gemini deps
 - `.gitignore` — node_modules, .env, __pycache__, HANDOFF.md, .agent/logs, .agent/index.json
 - `README.md` — root readme with quick-start
 - `.env.example` at both app roots
@@ -224,23 +224,23 @@ Rule: a feature is not `complete` until acceptance criteria pass AND `/gap-check
 
 ---
 
-### [FEAT-010] Claude generator wrapper
+### [FEAT-010] Gemini generator wrapper
 **Phase:** 2
 **Status:** planned
 **Owner:** claude-code
 **Files:**
 - `apps/api/services/generator.py`
-- `.agent/api-docs/anthropic.md` (via `/api-check anthropic`)
+- `.agent/api-docs/gemini.md` (via `/api-check gemini`)
 **Tests:**
 - `apps/api/tests/test_generator.py`
 **Acceptance criteria:**
 - [ ] `Generator.generate(question, chunks) -> GenerateResult` returns answer text + parsed citation markers
-- [ ] System prompt instructs Claude to cite chunk IDs inline as `[N]`
-- [ ] Multimodal — figure chunks pass their image content to Claude
+- [ ] System prompt instructs Gemini 3.6 Flash to cite chunk IDs inline as `[N]`
+- [ ] Multimodal — figure chunks pass their image content to Gemini
 - [ ] Returns metadata: model, input_tokens, output_tokens, latency_ms
 
 **Run:**
-- Before implementation: `/api-check anthropic`
+- Before implementation: `/api-check gemini`
 
 ---
 
@@ -253,7 +253,7 @@ Rule: a feature is not `complete` until acceptance criteria pass AND `/gap-check
 **Tests:**
 - `apps/api/tests/test_verifier.py` — supported / partial / unsupported fixtures
 **Acceptance criteria:**
-- [ ] `Verifier.verify(claim, chunk) -> Verdict{verdict, quote}` uses Claude Haiku
+- [ ] `Verifier.verify(claim, chunk) -> Verdict{verdict, quote}` uses Gemini 3.5 Flash-Lite
 - [ ] Verdict enum: supported | partial | unsupported
 - [ ] Returns the supporting quote from the source (or null if unsupported)
 - [ ] Batches verifications per generate call
