@@ -88,21 +88,25 @@ Rule: a feature is not `complete` until acceptance criteria pass AND `/gap-check
 
 ### [FEAT-003] JWT auth middleware
 **Phase:** 1
-**Status:** planned
+**Status:** complete
 **Owner:** claude-code
 **Files:**
-- `apps/api/middleware/auth.py`
-- `apps/api/main.py` — wire middleware
+- `apps/api/middleware/auth.py` — `JWTAuthMiddleware`, secret injectable via constructor (falls back to `SUPABASE_JWT_SECRET` env)
+- `apps/api/main.py` — wired middleware + `load_dotenv()`
+- `apps/api/errors.py` — shared `error_envelope()` helper matching API_CONTRACT.md's error shape
 **Tests:**
-- `apps/api/tests/test_auth.py` — valid JWT, expired JWT, malformed JWT, missing JWT
+- `apps/api/tests/test_auth.py` — 8 tests: missing header, `/health` stays exempt, invalid signature, expired JWT, malformed JWT, valid JWT attaches `user_id`, env-var-driven secret (not hardcoded), missing-env-var fails loudly
 **Acceptance criteria:**
-- [ ] Non-`/health` routes reject requests without `Authorization: Bearer <jwt>` with 401
-- [ ] Invalid signature returns 401
-- [ ] Valid JWT attaches `user_id` to `request.state.user_id`
-- [ ] JWT verification uses `SUPABASE_JWT_SECRET`
+- [x] Non-`/health` routes reject requests without `Authorization: Bearer <jwt>` with 401 — verified live (`curl /documents` → 401) and via pytest
+- [x] Invalid signature returns 401 — verified live and via pytest
+- [x] Valid JWT attaches `user_id` to `request.state.user_id` — verified via pytest against an isolated test app with a `/protected` route reading `request.state.user_id`; verified live against the real project secret (valid JWT → 404 on `/documents`, i.e. passed the middleware and reached routing, not blocked at 401)
+- [x] JWT verification uses `SUPABASE_JWT_SECRET` — verified via pytest (env-var-driven default, missing-var raises `KeyError`) and live against the real `.env` value
 
 **Run:**
 - `curl -H "Authorization: Bearer <token>" http://localhost:8000/documents`
+- Tests: `cd apps/api && uv run pytest tests/test_auth.py -v`
+
+**Changelog:** See CHANGELOG.md 2026-07-22 "feature: JWT auth middleware (FEAT-003)"
 
 ---
 

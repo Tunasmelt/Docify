@@ -6,6 +6,16 @@ Entry types: `feature` · `fix` · `decision` · `refactor` · `test` · `infra`
 
 ---
 
+## 2026-07-22 — feature: JWT auth middleware (FEAT-003)
+**Phase:** 1 (Ingestion Pipeline)
+**Feature:** FEAT-003
+**Decision:** Ran `/test-scaffold FEAT-003` first per instructions and hit a real bug: the script was hardcoded to always emit Jest-style `.test.ts` stubs into `tests/unit/`, regardless of project language, and used an unbounded `grep -A50` window to pull acceptance criteria — which bled past FEAT-003's own 4 criteria into FEAT-004's and FEAT-005's (Docling parser, chunker) for this short entry. Fixed `.agent/scripts/test-scaffold.sh`: it now isolates each feature's block with awk (stops at the next `### [FEAT-` header instead of a fixed line count), reads the actual test file path out of the feature's own `**Tests:**` line, and picks pytest vs. vitest/jest stub syntax from that path's extension. Deleted the bogus `tests/unit/*.test.ts` output and re-ran to get `apps/api/tests/test_auth.py` correctly. Implemented `JWTAuthMiddleware` (`apps/api/middleware/auth.py`) exactly per API_CONTRACT.md's auth model: extracts `Authorization: Bearer <jwt>`, verifies via PyJWT (HS256) against `SUPABASE_JWT_SECRET`, extracts `sub` as `user_id`, attaches to `request.state.user_id`, rejects everything else with 401 in the standard error envelope (added `apps/api/errors.py` for that shape, shared for future routes). `/health` stays exempt via a hardcoded path allowlist. The secret is constructor-injectable (`jwt_secret` param, defaults to reading `SUPABASE_JWT_SECRET` from env at middleware construction) specifically so tests can inject a known test secret instead of monkeypatching env vars or depending on the real project secret — `apps/api/tests/test_auth.py` builds an isolated FastAPI app per test rather than importing `main.app`. Also added `load_dotenv()` to `main.py` — nothing was loading `apps/api/.env` into process env before this, so `SUPABASE_JWT_SECRET` (and every other env-var-driven feature going forward) would have silently failed at runtime.
+**Changed:** `apps/api/middleware/auth.py` (new), `apps/api/errors.py` (new), `apps/api/tests/test_auth.py` (new, 8 tests), `apps/api/main.py` (middleware + dotenv wired), `apps/api/pyproject.toml` + `uv.lock` (added `pyjwt`), `.agent/scripts/test-scaffold.sh` (fixed language-detection + unbounded-window bugs), `.agent/FEATURES.md` (FEAT-003 → complete).
+**Impact:** Every future route except `/health` is now protected by default — FEAT-007 through FEAT-012 build directly on `request.state.user_id` instead of needing to add auth themselves. `test-scaffold.sh` is now safe to run against any future Python feature (FEAT-004 onward) without manual cleanup.
+**Rollback:** Remove `app.add_middleware(JWTAuthMiddleware)` and `load_dotenv()` from `main.py`, delete the new files, revert `pyproject.toml`/`uv.lock` and `.agent/FEATURES.md`. `test-scaffold.sh` fix can stay regardless — it's a strict correctness fix, not feature-coupled.
+
+---
+
 ## 2026-07-22 — feature: GET /health endpoint (FEAT-002)
 **Phase:** 1 (Ingestion Pipeline)
 **Feature:** FEAT-002
