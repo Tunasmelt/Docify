@@ -1,6 +1,7 @@
 import os
 
 import jwt
+from jwt import PyJWKClient
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -11,9 +12,13 @@ EXEMPT_PATHS = {"/health"}
 
 
 class JWTAuthMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, jwt_secret: str | None = None):
+    def __init__(self, app, jwks_client: PyJWKClient | None = None):
         super().__init__(app)
-        self.jwt_secret = jwt_secret if jwt_secret is not None else os.environ["SUPABASE_JWT_SECRET"]
+        if jwks_client is not None:
+            self.jwks_client = jwks_client
+        else:
+            supabase_url = os.environ["SUPABASE_URL"]
+            self.jwks_client = PyJWKClient(f"{supabase_url}/auth/v1/.well-known/jwks.json")
 
     async def dispatch(self, request: Request, call_next):
         if request.url.path in EXEMPT_PATHS:
@@ -25,10 +30,11 @@ class JWTAuthMiddleware(BaseHTTPMiddleware):
             return _unauthorized("Missing or invalid Authorization header")
 
         try:
+            signing_key = self.jwks_client.get_signing_key_from_jwt(token)
             payload = jwt.decode(
                 token,
-                self.jwt_secret,
-                algorithms=["HS256"],
+                signing_key.key,
+                algorithms=["ES256"],
                 options={"verify_aud": False},
             )
         except jwt.PyJWTError:

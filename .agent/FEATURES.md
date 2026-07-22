@@ -91,22 +91,24 @@ Rule: a feature is not `complete` until acceptance criteria pass AND `/gap-check
 **Status:** complete
 **Owner:** claude-code
 **Files:**
-- `apps/api/middleware/auth.py` — `JWTAuthMiddleware`, secret injectable via constructor (falls back to `SUPABASE_JWT_SECRET` env)
+- `apps/api/middleware/auth.py` — `JWTAuthMiddleware`, verifies ES256 via Supabase JWKS (`jwt.PyJWKClient`, injectable via constructor for tests, falls back to `{SUPABASE_URL}/auth/v1/.well-known/jwks.json`)
 - `apps/api/main.py` — wired middleware + `load_dotenv()`
 - `apps/api/errors.py` — shared `error_envelope()` helper matching API_CONTRACT.md's error shape
 **Tests:**
-- `apps/api/tests/test_auth.py` — 8 tests: missing header, `/health` stays exempt, invalid signature, expired JWT, malformed JWT, valid JWT attaches `user_id`, env-var-driven secret (not hardcoded), missing-env-var fails loudly
+- `apps/api/tests/test_auth.py` — 8 tests against a locally-generated EC keypair + fake JWKS client: missing header, `/health` stays exempt, invalid signature, expired JWT, malformed JWT, valid JWT attaches `user_id`, JWKS URL derived from `SUPABASE_URL` (not hardcoded), missing-env-var fails loudly
 **Acceptance criteria:**
-- [x] Non-`/health` routes reject requests without `Authorization: Bearer <jwt>` with 401 — verified live (`curl /documents` → 401) and via pytest
-- [x] Invalid signature returns 401 — verified live and via pytest
-- [x] Valid JWT attaches `user_id` to `request.state.user_id` — verified via pytest against an isolated test app with a `/protected` route reading `request.state.user_id`; verified live against the real project secret (valid JWT → 404 on `/documents`, i.e. passed the middleware and reached routing, not blocked at 401)
-- [x] JWT verification uses `SUPABASE_JWT_SECRET` — verified via pytest (env-var-driven default, missing-var raises `KeyError`) and live against the real `.env` value
+- [x] Non-`/health` routes reject requests without `Authorization: Bearer <jwt>` with 401 — verified via pytest
+- [x] Invalid signature returns 401 — verified via pytest
+- [x] Valid JWT attaches `user_id` to `request.state.user_id` — verified via pytest (fake JWKS client); via my own admin-created test user (created, logged in, verified, deleted); **and independently by the owner**, against a user they created themselves via the Supabase dashboard — same temporary `/whoami` route, `request.state.user_id` matched their real `auth.users.id` (`abe7cc2e-a062-4058-8b00-16c2e022c8fe`) exactly. Route removed after (`main.py` back to zero diff).
+- [x] JWT verification uses Supabase's JWKS (not a hardcoded value) — verified via pytest
+
+**Note on how this became `complete`:** it was first marked complete on `f5cd00f` incorrectly — that verification was circular (an HS256 implementation checked against a self-forged HS256 token). Caught when challenged to verify against a real login; the real token was ES256/JWKS. Corrected implementation + tests, then verified three separate ways before marking complete again: fake-JWKS pytest suite, my own throwaway admin-created Supabase user, and the owner's own dashboard-created user via their own login. See CHANGELOG's correction entry and `.agent/MEMORY.md §Anti-patterns`.
 
 **Run:**
 - `curl -H "Authorization: Bearer <token>" http://localhost:8000/documents`
 - Tests: `cd apps/api && uv run pytest tests/test_auth.py -v`
 
-**Changelog:** See CHANGELOG.md 2026-07-22 "feature: JWT auth middleware (FEAT-003)"
+**Changelog:** See CHANGELOG.md 2026-07-22 "feature: JWT auth middleware (FEAT-003)" and the same-day correction entry "fix: JWT middleware verified against wrong signing scheme, corrected to JWKS/ES256"
 
 ---
 

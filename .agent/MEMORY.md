@@ -34,6 +34,10 @@ Things tried and failed, or explicitly rejected during design. Do not retry with
 **Context:** Considered separate DECISIONS.md, API_CONTRACT.md, CONVENTIONS.md, flow.md, PROJECT_STATE.md files.
 **Why rejected:** Seven living docs is more overhead than a solo dev needs. Merged into agent-os defaults (CHANGELOG absorbs decisions, ARCHITECTURE absorbs conventions, HANDOFF absorbs flow narrative). Only added .agent/SCHEMA.md and .agent/API_CONTRACT.md as project-specific additions on top of agent-os defaults. Do not add more living docs without a concrete failure case that the existing set doesn't cover.
 
+### 2026-07-22 [claude-code] — Validating a security mechanism using a token forged by that same mechanism
+**Context:** FEAT-003 (JWT auth middleware) was first built and "verified live" by self-signing an HS256 token with `SUPABASE_JWT_SECRET` and confirming the middleware accepted it. It did — because the verification code and the test both used the identical secret and algorithm, so the check could only ever pass. It never touched a real Supabase-issued token. When challenged to test against an actual login-issued JWT, that token turned out to be ES256 (Supabase's asymmetric signing-keys scheme, verified via JWKS) — completely incompatible with the HS256-shared-secret implementation, which had been sitting in `main` as "complete" and committed (`f5cd00f`).
+**Why rejected:** Never treat "I forged a credential and my own code accepted it" as verification of anything except that the forging and the checking agree with each other — that's circular by construction. Never validate a security mechanism using a token forged by that same mechanism; get a token from the actual issuing system (a real login, a real signup, a real third-party auth flow) before calling any auth code "verified." This generalizes beyond JWTs — the same trap applies to webhook signature verification, API key checks, or any place where "I can produce output my own code accepts" is being mistaken for "my code correctly implements someone else's spec."
+
 ---
 
 ## §Open questions

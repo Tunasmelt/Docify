@@ -17,12 +17,14 @@ All non-`/health` endpoints require a Supabase JWT as `Authorization: Bearer <to
 
 The FastAPI middleware:
 1. Extracts the JWT
-2. Verifies signature against Supabase JWT secret (via `SUPABASE_JWT_SECRET` env var)
+2. Verifies signature via Supabase's JWKS endpoint (`{SUPABASE_URL}/auth/v1/.well-known/jwks.json`), algorithm `ES256` — this project uses Supabase's asymmetric signing keys, not the legacy shared HS256 secret. Keys are resolved by `kid` via `jwt.PyJWKClient`.
 3. Extracts `sub` claim as `user_id`
 4. Attaches `user_id` to the request state
 5. Rejects with `401` on any failure
 
 `user_id` is **never accepted from the request body** for user-owned resources — always derived from the JWT.
+
+**Note on `SUPABASE_JWT_SECRET`:** still present in `.env` and `.env.example`, but currently unused by the auth middleware — it's the legacy HS256 shared secret, and this project's Supabase instance issues ES256 tokens verified via JWKS instead. Kept in case a future Supabase config change reverts to legacy signing, or another service needs it. FEAT-003 originally implemented HS256-against-this-secret verification and it was wrong for this project; see CHANGELOG 2026-07-22 and MEMORY.md §Anti-patterns for how that was caught.
 
 ## Standard error envelope
 
