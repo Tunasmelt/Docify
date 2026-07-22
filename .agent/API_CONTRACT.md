@@ -9,7 +9,7 @@ Specification for the internal FastAPI endpoints. Both `apps/api` (Pydantic mode
 ## Base URL
 
 - Development: `http://localhost:8000`
-- Production: `https://multimodal-rag-api.onrender.com` (placeholder — update after Render deploy)
+- Production: `https://docify-api.onrender.com` (placeholder — update after Render deploy)
 
 ## Auth model
 

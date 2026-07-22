@@ -29,7 +29,7 @@
 # §PROJECT
 
 ```yaml
-name:        multimodal-rag
+name:        docify
 type:        saas
 agent-index: .agent/index.json
 handoff:     HANDOFF.md
@@ -65,11 +65,11 @@ Read only the file relevant to your current task.
 | Agent memory        | .agent/MEMORY.md                       |
 
 ## Open decisions
-- [ ] Final project name (currently placeholder `multimodal-rag`)
 - [ ] Strategy selector as v2 feature or later
 - [ ] Post-credit-expiry generation provider (Claude paid vs Gemini swap)
 
 ## Locked decisions
+- [x] Project name: Docify
 - [x] Layout-aware structured parsing as v1 strategy (Docling)
 - [x] Multi-tenant from day one — RLS at schema level
 - [x] Monorepo — apps/web + apps/api

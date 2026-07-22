@@ -40,10 +40,6 @@ Things tried and failed, or explicitly rejected during design. Do not retry with
 
 Things that need human input before proceeding. Do not assume answers.
 
-### 2026-07-22 [claude-code] — Final project name
-**Context:** Placeholder `multimodal-rag` used throughout. Real name TBD by user.
-**Blocking:** No immediate action needed; find-replace closes it before FEAT-023 landing page work.
-
 ### 2026-07-22 [claude-code] — Post-credit-expiry generation provider
 **Context:** $120 Anthropic credits expire Aug 9 ($20) and Sep 19 ($100). After that, provider choice reopens: Claude paid vs Gemini swap.
 **Blocking:** No before Sep 19. Deferring decision until real usage data exists.
@@ -108,6 +104,11 @@ Every fork, what was chosen, why. Append-only.
 **Alternatives considered:** Full seven-doc system (adding DECISIONS, CONVENTIONS, flow, PROJECT_STATE).
 **Chosen:** Agent-os defaults (AGENT, CHANGELOG, SCOPE, ARCHITECTURE, STANDARDS, FEATURES, MEMORY) + two additions (SCHEMA, API_CONTRACT).
 **Reasoning:** Agent-os covers most needs. SCHEMA is essential for a DB-heavy project. API_CONTRACT documents internal endpoints; external APIs handled by `/api-check` under `.agent/api-docs/`. Nine docs is at the edge of manageable; do not grow this further without concrete evidence a doc is missing.
+
+### 2026-07-22 [claude-code] — Project name: Docify
+**Alternatives considered:** Placeholder `multimodal-rag` (working name only, never intended as final).
+**Chosen:** Docify.
+**Reasoning:** User locked the name, closing the open question that was blocking FEAT-023 landing page work. Find-replaced across AGENT.md (`name:` field + Open→Locked decisions), .agent/API_CONTRACT.md (placeholder Render URL), and this entry's own move out of §Open questions. No occurrences existed in .agent/ARCHITECTURE.md or .agent/FEATURES.md — checked, nothing to change there.
 
 ---
 

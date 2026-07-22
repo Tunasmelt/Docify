@@ -6,6 +6,16 @@ Entry types: `feature` · `fix` · `decision` · `refactor` · `test` · `infra`
 
 ---
 
+## 2026-07-22 — decision: project renamed to Docify
+**Phase:** 0 (Setup)
+**Feature:** —
+**Decision:** Locked final project name as Docify, closing the "final project name" entry in `.agent/MEMORY.md §Open questions` (moved to `§Decision log`). Find-replaced the `multimodal-rag` placeholder to `docify` in AGENT.md's `name:` field and `.agent/API_CONTRACT.md`'s placeholder production URL (`docify-api.onrender.com`). Moved the corresponding AGENT.md open-decision item to Locked decisions. No occurrences of the placeholder existed in `.agent/ARCHITECTURE.md` or `.agent/FEATURES.md` — verified via grep, nothing to change there. (Unrelated: "multimodal-RAG" as a technique name in MEMORY.md and this changelog's own Setup entry refers to the RAG strategy category, not the project name, and was left as-is.)
+**Changed:** `AGENT.md`, `.agent/API_CONTRACT.md`, `.agent/MEMORY.md`.
+**Impact:** All project-identity references now resolve to the real name. Unblocks FEAT-023 landing page work, which was waiting on this.
+**Rollback:** Revert this commit, or find-replace `docify` back to `multimodal-rag` in the three changed files and move the MEMORY.md entry back to `§Open questions`.
+
+---
+
 ## 2026-07-22 — infra: agent-os subsystem install + ground-truth doc repair
 **Phase:** 0 (Setup)
 **Feature:** —
