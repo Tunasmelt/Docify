@@ -245,4 +245,4 @@ create policy figures_select on storage.objects for select
 
 | Date | Migration | Summary |
 |---|---|---|
-| — | — | No migrations applied yet. First migration will be `20260721_001_initial.sql` implementing everything above. |
+| 2026-07-22 | `apps/api/migrations/migration1script.sql` | Initial schema — everything in this document (extensions, enums, 5 tables, indexes incl. HNSW on `chunks.embedding`, RLS policies, `uploads`/`figures` storage buckets + policies). Applied manually via Supabase dashboard SQL editor against the live project; verified clean with `apps/api/migrations/verifymigration1.sql` (all checks `OK`). Filename deviates from the `YYYYMMDD_NNN_description.sql` convention below — authored as `20260722_001_initial.sql`, renamed post-write. Kept as-is rather than renamed back, since the applied-migration filename should match what Supabase's history actually shows. |
