@@ -1,4 +1,4 @@
--- migration1script.sql (originally authored as 20260722_001_initial.sql)
+-- 20260722_001_initial.sql
 -- Initial schema per .agent/SCHEMA.md. Multi-tenant via RLS from day one.
 
 -- ── Extensions ──────────────────────────────────────────────────────────────

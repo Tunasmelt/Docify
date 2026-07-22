@@ -1,5 +1,5 @@
--- verifymigration1.sql (originally authored as verify_20260722_001.sql)
--- Run this in the Supabase SQL editor AFTER applying migration1script.sql.
+-- verify_20260722_001.sql
+-- Run this in the Supabase SQL editor AFTER applying 20260722_001_initial.sql.
 -- Every row should show status = 'OK'. Anything else means the migration
 -- didn't fully apply — check that statement's error in the SQL editor history.
 

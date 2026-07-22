@@ -41,21 +41,21 @@ Rule: a feature is not `complete` until acceptance criteria pass AND `/gap-check
 **Status:** complete
 **Owner:** claude-code
 **Files:**
-- `apps/api/migrations/migration1script.sql` — schema per SCHEMA.md (authored as `20260722_001_initial.sql`; renamed by owner post-write, header comment updated to match — see CHANGELOG for naming-convention note)
-- `apps/api/migrations/verifymigration1.sql` — dashboard-runnable verification query (checklist-style output; authored as `verify_20260722_001.sql`)
+- `apps/api/migrations/20260722_001_initial.sql` — schema per SCHEMA.md
+- `apps/api/migrations/verify_20260722_001.sql` — dashboard-runnable verification query (checklist-style output)
 - `apps/api/db/client.py` — service-role client
 **Tests:**
-- `apps/api/tests/test_migrations.py` — verifies tables exist, RLS is enabled, policies present (requires `TEST_DATABASE_URL`, skips if unreachable — not run against the live project this round; verification was via `verifymigration1.sql` in the dashboard instead)
+- `apps/api/tests/test_migrations.py` — verifies tables exist, RLS is enabled, policies present (requires `TEST_DATABASE_URL`, skips if unreachable — not run against the live project this round; verification was via `verify_20260722_001.sql` in the dashboard instead)
 **Acceptance criteria:**
 - [x] Migration applies cleanly — applied by owner via Supabase dashboard SQL editor on the live project
-- [x] All tables from SCHEMA.md exist with correct columns and types — confirmed via `verifymigration1.sql`, all checks `OK`
-- [x] RLS is enabled on documents, chunks, conversations, messages, citations — confirmed via `verifymigration1.sql`, all checks `OK`
-- [x] pgvector extension enabled, HNSW index on chunks.embedding — confirmed via `verifymigration1.sql`, all checks `OK`
-- [x] Two storage buckets created: `uploads` (private), `figures` (private) with policies — confirmed via `verifymigration1.sql`, all checks `OK`
+- [x] All tables from SCHEMA.md exist with correct columns and types — confirmed via `verify_20260722_001.sql`, all checks `OK`
+- [x] RLS is enabled on documents, chunks, conversations, messages, citations — confirmed via `verify_20260722_001.sql`, all checks `OK`
+- [x] pgvector extension enabled, HNSW index on chunks.embedding — confirmed via `verify_20260722_001.sql`, all checks `OK`
+- [x] Two storage buckets created: `uploads` (private), `figures` (private) with policies — confirmed via `verify_20260722_001.sql`, all checks `OK`
 
 **Run:**
-- Apply: paste `apps/api/migrations/migration1script.sql` into the Supabase dashboard SQL editor and run it
-- Verify: paste `apps/api/migrations/verifymigration1.sql` into the SQL editor — every row should read `status = OK`
+- Apply: paste `apps/api/migrations/20260722_001_initial.sql` into the Supabase dashboard SQL editor and run it
+- Verify: paste `apps/api/migrations/verify_20260722_001.sql` into the SQL editor — every row should read `status = OK`
 - (Alt/local path, not used this round: `supabase start` then `supabase db push`, `psql -h localhost -p 54322 -U postgres -d postgres -c "\dt"`)
 
 **Changelog:** See CHANGELOG.md 2026-07-22 "feature: Supabase initial migration applied + verified (FEAT-001)"
