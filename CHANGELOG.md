@@ -6,6 +6,16 @@ Entry types: `feature` · `fix` · `decision` · `refactor` · `test` · `infra`
 
 ---
 
+## 2026-07-22 — feature: GET /health endpoint (FEAT-002)
+**Phase:** 1 (Ingestion Pipeline)
+**Feature:** FEAT-002
+**Decision:** Implemented `/health` exactly per API_CONTRACT.md's spec — `{status, version, timestamp}` on 200, no auth. `apps/api/models/health.py` holds the `HealthResponse` Pydantic model (kept separate from the route per STANDARDS.md's models/ convention even though it's a one-liner, for consistency with how every later endpoint will be structured); `apps/api/routes/health.py` holds the route itself. `version` is a hardcoded `"0.1.0"` constant matching `pyproject.toml` rather than read via `importlib.metadata` — simpler and doesn't depend on the package being installed with matching distribution metadata. `timestamp` is formatted as `%Y-%m-%dT%H:%M:%SZ` to match the API_CONTRACT.md example literally (`Z` suffix, not `+00:00`). Wired `health.router` into `main.py` — not in FEAT-002's original Files list but required for the endpoint to be reachable at all; `main.py` had no routes registered since FEAT-000. Added `[tool.pytest.ini_options] pythonpath = ["."]` to `apps/api/pyproject.toml` — without it, pytest couldn't resolve `from main import app` in the test (pytest only added `tests/` to `sys.path`, not `apps/api/` itself). Deliberately did not add any auth check — FEAT-003 owns JWT middleware, and this endpoint must stay open for uptime monitors per its own spec.
+**Changed:** `apps/api/routes/health.py` (new), `apps/api/models/health.py` (new), `apps/api/tests/test_health.py` (new), `apps/api/main.py` (router wired), `apps/api/pyproject.toml` (pytest pythonpath config), `.agent/FEATURES.md` (FEAT-002 → complete, acceptance criteria checked, Files list corrected).
+**Impact:** First live endpoint in the API. Verified locally: `curl http://localhost:8000/health` → `{"status":"ok","version":"0.1.0","timestamp":"..."}`, 200, no auth header needed. `uv run pytest` — 2 passed (health), 14 skipped (migrations, no local DB configured — expected). FEAT-003 (JWT middleware) can now build on a running app with at least one route to protect *around*, not through.
+**Rollback:** Remove the four new files, revert `main.py`'s router registration and `pyproject.toml`'s pytest config, revert `.agent/FEATURES.md`.
+
+---
+
 ## 2026-07-22 — feature: Supabase initial migration applied + verified (FEAT-001)
 **Phase:** 0 (Setup)
 **Feature:** FEAT-001

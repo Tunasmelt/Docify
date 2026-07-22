@@ -66,18 +66,23 @@ Rule: a feature is not `complete` until acceptance criteria pass AND `/gap-check
 
 ### [FEAT-002] `/health` endpoint
 **Phase:** 1
-**Status:** planned
+**Status:** complete
 **Owner:** claude-code
 **Files:**
 - `apps/api/routes/health.py`
+- `apps/api/models/health.py` — `HealthResponse` Pydantic model
+- `apps/api/main.py` — wired `health.router` (not listed originally, but required for the route to be reachable)
 **Tests:**
 - `apps/api/tests/test_health.py`
 **Acceptance criteria:**
-- [ ] GET /health returns `{status, version, timestamp}` with 200
-- [ ] No auth required
+- [x] GET /health returns `{status, version, timestamp}` with 200 — verified live: `{"status":"ok","version":"0.1.0","timestamp":"2026-07-22T14:12:40Z"}`
+- [x] No auth required — no middleware exists yet (FEAT-003), confirmed 200 with no auth header
 
 **Run:**
-- `curl http://localhost:8000/health`
+- `cd apps/api && uv run uvicorn main:app --reload` then `curl http://localhost:8000/health`
+- Tests: `cd apps/api && uv run pytest tests/test_health.py -v`
+
+**Changelog:** See CHANGELOG.md 2026-07-22 "feature: GET /health endpoint (FEAT-002)"
 
 ---
 
