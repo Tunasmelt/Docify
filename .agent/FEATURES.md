@@ -151,20 +151,30 @@ Rule: a feature is not `complete` until acceptance criteria pass AND `/gap-check
 
 ### [FEAT-005] Chunker
 **Phase:** 1
-**Status:** planned
+**Status:** complete
 **Owner:** claude-code
 **Files:**
-- `apps/api/services/chunker.py`
+- `apps/api/services/chunker.py` — `Chunker`, `Chunk` (now with `split_from_element_id`), `TOKEN_BUDGET`, `MAX_CHUNK_TOKENS`
 **Tests:**
-- `apps/api/tests/test_chunker.py`
+- `apps/api/tests/test_chunker.py` — 21 tests: real fixtures (module-scoped parse) plus hand-built `ParsedDocument`s for shapes no real fixture has (captioned figure, orphaned caption, Tier-2 tie-breaking edge cases, oversized-element splitting, reparse stability)
 **Acceptance criteria:**
-- [ ] Groups adjacent text/heading elements into chunks of ~500 tokens, respecting element boundaries (never splits a table row or a heading)
-- [ ] Preserves metadata: page numbers, source element indices, element_type of primary element
-- [ ] Each chunk has a stable `chunk_index` (ordinal within document)
-- [ ] Figure elements produce their own chunks (one figure = one chunk, with caption prepended if adjacent)
+- [x] Groups adjacent text/heading elements into chunks of ~500 tokens, respecting element boundaries (never splits a table row or a heading) — verified: `clean_digital.pdf`'s 19 groupable elements merge into one chunk (small enough to fit the token budget together), tables always get their own chunk regardless of size
+- [x] Preserves metadata: page numbers, source element indices, element_type of primary element — verified against every chunk of `table_heavy.pdf`; `page_numbers` cross-checked against the actual pages of each chunk's source elements, not just type-checked
+- [x] Each chunk has a stable `chunk_index` (ordinal within document) — verified sequential, 0-based
+- [x] Figure elements produce their own chunks (one figure = one chunk, with caption prepended if adjacent) — verified against `scanned.pdf`'s uncaptioned figure (empty content, image present) and a hand-built captioned figure (no real fixture has one — neither `table_heavy.pdf` nor `scanned.pdf` contains a figure with a nearby caption)
+
+**Caption association — Tier 1 (parser, explicit) + Tier 2 (chunker, heuristic), per task instructions:**
+- Tier 1: a table/figure with `associated_caption_ids` already populated by the parser gets its caption(s) merged directly — no heuristic involved. 13/29 tables in `table_heavy.pdf`.
+- Tier 2: a caption with `association_method == "none"` (parser found no explicit link) gets matched here by: same page → prefer adjacency in reading order → break ties by bbox distance. 6/19 captions in `table_heavy.pdf` needed this. **All 6 resolved to a plausible match on manual inspection** (caption text plausibly describes its matched table's actual content) — 0 left unmatched in this fixture. See CHANGELOG for the full pairing list.
+- Every chunk carries `association_method: "explicit" | "heuristic" | "unmatched" | None` — traceable after the fact whether a caption pairing was Docling-verified, guessed, or not applicable. `merged_caption_ids: list[str]` records which caption(s), if any, fed into a chunk's content.
+- Scope stops exactly where instructed: 10/29 tables in `table_heavy.pdf` have no caption at all (neither tier found one) — genuinely uncaptioned in the source, not a matching failure.
+
+**Codex review follow-up (2026-07-23) — size ceiling + test-coverage gaps:** found one architecturally real gap (no size ceiling before chunks reach FEAT-006's embedding calls) and one test-coverage gap (Tier-2 tie-breaking logic was correct per manual probing but not permanently tested). Both closed. `MAX_CHUNK_TOKENS = 4000` added — verified against Voyage's real per-input limit (32,000 tokens, `.agent/api-docs/voyage.md`) rather than guessed; set at ~1/8 of it. Oversized tables split by row group (header/separator repeated on every part, never mid-row); oversized text/heading splits by paragraph then sentence boundary, never mid-sentence. Splitting happens strictly after caption association is resolved — a split part inherits its parent's `association_method` and `merged_caption_ids` unchanged, and gets a new `split_from_element_id` pointing back at the original element so the split is traceable. **Confirmed on all three fixtures: nothing actually splits** — the largest real table chunk measured ~418 proxy tokens against a 4,000 ceiling. Fixture counts and Tier-2 resolutions (13 explicit / 6 heuristic / 10 uncaptioned) unchanged. Splitting itself verified via synthetic oversized inputs (2,000-row table, 1,000-sentence paragraph) — both split correctly with no content lost or duplicated. Also converted Codex's manual synthetic probes into 6 new permanent tests (equidistant reading-order candidates, reading-order-beats-position, duplicate-claimant first-caption-wins, fully-equal-tie document-order fallback, plus splitting and reparse-stability). **Proxy token-count accuracy measured against Voyage's real local tokenizer** (`voyageai.Client.tokenizer(...)`, no API call needed): mean proxy/real ratio 0.94 across 46 real chunks, but individual chunks ranged 0.43x–2.31x — worst-case measured underestimate still leaves the 4,000-token ceiling at only ~29% of Voyage's real 32,000 limit even in that worst case. Conclusion recorded in `.agent/api-docs/voyage.md`: this ceiling has enough margin on its own: FEAT-006 doesn't need its own separate size defense based on what's been measured so far. `claimed_targets` first-caption-wins greedy limitation logged in `.agent/MEMORY.md §Anti-patterns` as an accepted simplification, not a bug.
 
 **Run:**
-- `pytest apps/api/tests/test_chunker.py -v`
+- `cd apps/api && uv run pytest tests/test_chunker.py -v`
+
+**Changelog:** See CHANGELOG.md 2026-07-23 "feature: chunker service, Tier 1 + Tier 2 caption association (FEAT-005)" and the same-day follow-up "fix: chunker size ceiling + Tier-2 test coverage (FEAT-005 Codex follow-up)"
 
 ---
 

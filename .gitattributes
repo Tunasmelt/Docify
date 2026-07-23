@@ -1,1 +1,7 @@
 * text=auto eol=lf
+
+# Binary fixtures — never apply eol/text normalization, byte-exactness matters for tests
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
