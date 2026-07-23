@@ -46,6 +46,7 @@ Source of truth for what is and is not in scope, per phase. The agent checks her
 - [ ] Failure handling: parse failures write to `documents.error` and set status to `failed`, no partial-ingest data left in `chunks`
 
 ### Explicitly out of scope
+- Background-task durability (timeouts, dead-letter, crash recovery) deferred to Phase 5 — FastAPI BackgroundTasks has no durability guarantee; a genuinely hung or crashed task is currently invisible beyond ordinary log output. Revisit as part of deploy architecture, not patched incrementally here. (Flagged by Codex review of FEAT-007, 2026-07-23 — confirmed real, deliberately not fixed in that pass.)
 - OCR fallback for scanned PDFs (Phase 4 — add Gemini Flash route only when Docling low-confidence pages appear in real usage)
 - DOCX/PPTX/HTML inputs (Phase 4)
 - Streaming upload progress to frontend (Phase 3)

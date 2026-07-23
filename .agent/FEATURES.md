@@ -208,25 +208,41 @@ Rule: a feature is not `complete` until acceptance criteria pass AND `/gap-check
 
 ### [FEAT-007] `/ingest` endpoint
 **Phase:** 1
-**Status:** planned
+**Status:** complete
 **Owner:** claude-code
 **Depends on:** FEAT-003, FEAT-004, FEAT-005, FEAT-006
 **Files:**
-- `apps/api/routes/ingest.py`
-- `apps/api/db/queries.py` — document + chunk insert helpers
+- `apps/api/routes/ingest.py` — `post_ingest`, `run_ingest_pipeline`, `get_pipeline_runner` (FastAPI `Depends` hook so tests inject fake pipeline stages via real constructor injection, not monkeypatching), `_upload_figures`, `_fail_document` (best-effort failure/cleanup handling), `IngestInvariantError`
+- `apps/api/db/queries.py` — document status-transition helpers (`create_document`, `mark_parsing`, `mark_parsed`, `mark_embedded`, `mark_ready`, `mark_failed`) and chunk persistence (`build_chunk_rows`, `insert_chunks`, `delete_chunks_for_document`)
+- `apps/api/models/ingest.py` — `IngestRequest`, `IngestResponse`
+- `apps/api/main.py` — wired `ingest.router` in (necessary plumbing, not in the original Files: list, same class of implicit-but-required change as FEAT-003's middleware wiring)
+- `apps/api/tests/_local_supabase.py` (new) — shared local-Supabase-stack test helpers (real admin client, real user create/login, real REST/storage calls) used by both test files below
+- `apps/api/tests/conftest.py` (new) — overrides `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` to the local stack's fixed CLI demo values before `main.app` is ever imported (`.env` points at the live project; STANDARDS.md requires integration tests to run against `supabase start` instead), plus `require_local_supabase`/`admin` fixtures
 **Tests:**
-- `apps/api/tests/test_ingest.py` — integration test with local Supabase
-- `apps/api/tests/e2e/test_ingest_e2e.py`
+- `apps/api/tests/test_ingest.py` — 10 tests, real local Supabase Auth+DB+Storage throughout (real users, real ES256 login, real RLS), Docling/Voyage faked (FakeParser/FakeChunker/FakeEmbedder) for speed — covers all 5 acceptance criteria below plus an extra dedicated no-partial-data test, an extra mime_type-422 test, and three Codex-review hardening tests (see below)
+- `apps/api/tests/e2e/test_ingest_e2e.py` — 1 test, fully real pipeline (real Docling parse, real Voyage embed call, real chunk insert, real figure upload, raw pgvector similarity query), gated behind `RUN_INGEST_E2E_TEST=1` (skipped by default — slow, spends Voyage quota, same pattern as `test_embedder.py`'s real-API test)
 **Acceptance criteria:**
-- [ ] POST /ingest with valid body returns 202 + document_id
-- [ ] storage_path prefix mismatch with JWT user_id returns 403
-- [ ] Background task: download → parse → chunk → embed → insert → update status
-- [ ] Failure at any stage sets documents.status = 'failed' with error message
-- [ ] Multi-tenant isolation: user A cannot see user B's document via any query path
+- [x] POST /ingest with valid body returns 202 + document_id — `test_post_ingest_with_valid_body_returns_202_document_id`; verified the response's `status` field is the literal DB value at insert time (`"uploaded"`) — API_CONTRACT.md's example previously showed `"parsing"`, corrected (see CHANGELOG)
+- [x] storage_path prefix mismatch with JWT user_id returns 403 — `test_storage_path_prefix_mismatch_with_jwt_user_id_returns_403`; also confirmed no `documents` row is created (check happens before anything else)
+- [x] Background task: download → parse → chunk → embed → insert → update status — `test_background_task_download_parse_chunk_embed_insert_update_sta`; verified status reaches `ready`, `page_count`/`parsed_at`/`embedded_at` populated, a text chunk and a figure chunk both land correctly (figure actually present in Storage, not just a recorded path), and the figure's `PIL.Image` is closed after use (FEAT-004's ownership contract)
+- [x] Failure at any stage sets documents.status = 'failed' with error message — `test_failure_at_any_stage_sets_documents_status_failed_with_error`, mocking the embedder to fail; **plus this task's explicit depth requirement**, proven concretely rather than assumed: `test_no_partial_chunk_rows_after_embedder_fails_partway` gives the fake embedder 5 chunks and has it fail after "computing" 3, then confirms zero rows in `chunks` for that document — not just that `status='failed'`. Architecturally guaranteed, not just tested-around: all chunk rows for a document are written in exactly one bulk INSERT (a single atomic Postgres statement), and every stage that can fail happens strictly before that call
+- [x] Multi-tenant isolation: user A cannot see user B's document via any query path — `test_multi_tenant_isolation_user_a_cannot_see_user_b_s_document_v`, two real users via real local Auth, checked via three real RLS-scoped REST query paths (list, direct ID lookup, chunk search) since `GET /documents` doesn't exist yet (FEAT-008's job) — this test hits `/rest/v1/documents` and `/rest/v1/chunks` directly with each user's own access token. Includes a **positive control**: confirmed user A can see their own document/chunks via all three paths first, so an empty result for user B actually proves isolation rather than "RLS blocks everyone" going unnoticed (see .agent/MEMORY.md's circular-verification anti-pattern from FEAT-003 — same discipline applied here)
+
+**Real end-to-end numbers (`table_heavy.pdf`, live Docling + live Voyage + local Postgres, not simulated):** POST → pipeline-complete in **72.70s**, `status: ready`, `page_count: 11`, **43 chunks inserted** (matches FEAT-005/006's known count for this fixture), 0 figure chunks (this fixture has none). Raw pgvector query against the actually-inserted rows: a chunk's own embedding as the probe vector returns itself as nearest neighbor at cosine distance **0.000000**, next-nearest real chunks at **0.49–0.51** — confirms the stored vectors are real, round-trip correctly through the REST insert, and are meaningfully differentiated (not degenerate).
+
+**Codex review follow-up, 2026-07-23 — defense-in-depth hardening:** review found `run_ingest_pipeline()`'s correctness depended on invariants (`storage_path` belongs to `user_id`; dependencies construct successfully) that were only ever true because its one caller (`post_ingest`) happened to check first — the function itself trusted both unconditionally. Fixed: the storage_path/user_id check now runs again inside `run_ingest_pipeline()` itself (`IngestInvariantError` if violated), and `client`/`Parser`/`Chunker`/`Embedder` construction moved inside the `try` block so a construction failure gets caught and marks the document `failed` instead of leaving it stuck at `uploaded` with zero signal. The except block's own cleanup calls (`delete_chunks_for_document`, `mark_failed`) are now each wrapped independently in a best-effort try, logging at ERROR with full context if cleanup itself fails, rather than letting a second failure go unnoticed. Three new tests prove each of these directly: `test_run_ingest_pipeline_refuses_mismatched_user_id_and_storage_path` (calls the function directly, bypassing the route), `test_dependency_construction_failure_marks_document_failed` (patches `Parser` to fail construction), `test_cleanup_failure_is_logged_and_does_not_crash_pipeline` (an always-failing fake client, asserts the pipeline call itself doesn't raise and both cleanup failures are logged). General lesson logged in `.agent/MEMORY.md §Anti-patterns`: "no current caller violates an invariant" is not the same claim as "the invariant is enforced." Background-task durability (timeouts, dead-letter, crash recovery) was confirmed as a real, separate gap but deliberately deferred to Phase 5 — logged as an explicit out-of-scope entry in `.agent/SCOPE.md` rather than patched incrementally here.
+
+**Known, accepted gaps (flagged, not fixed here — out of this task's scope):**
+- Figure objects uploaded to Storage before a later stage fails are not cleaned up — SCOPE.md's no-partial-data guarantee is scoped to the `chunks` table specifically, not Storage objects
+- Pydantic-level 422s (malformed JSON body) don't yet match API_CONTRACT.md's standard error envelope — only this endpoint's own application-level 403/422 checks do; a global exception handler would need to touch `main.py` more broadly, cross-cutting every route, not just this one
+- Background-task durability (timeouts, dead-letter, crash recovery) — deferred to Phase 5, see `.agent/SCOPE.md`
 
 **Run:**
-- Upload sample.pdf to Supabase Storage under `uploads/{user_id}/`
-- `curl -X POST -H "Authorization: Bearer <jwt>" -d '{"storage_path":"...","filename":"...","mime_type":"application/pdf","size_bytes":123}' http://localhost:8000/ingest`
+- `supabase start` (local stack), then `cd apps/api && uv run pytest tests/test_ingest.py -v`
+- Full real pipeline: `RUN_INGEST_E2E_TEST=1 uv run pytest tests/e2e/test_ingest_e2e.py -v -s`
+- Manual: upload a PDF to Supabase Storage under `uploads/{user_id}/`, then `curl -X POST -H "Authorization: Bearer <jwt>" -d '{"storage_path":"...","filename":"...","mime_type":"application/pdf","size_bytes":123}' http://localhost:8000/ingest`
+
+**Changelog:** See CHANGELOG.md 2026-07-23 "feature: `/ingest` endpoint, full pipeline wiring (FEAT-007)"
 
 ---
 
