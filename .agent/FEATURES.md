@@ -180,22 +180,29 @@ Rule: a feature is not `complete` until acceptance criteria pass AND `/gap-check
 
 ### [FEAT-006] Voyage embedder wrapper
 **Phase:** 1
-**Status:** planned
+**Status:** complete
 **Owner:** claude-code
 **Files:**
-- `apps/api/services/embedder.py`
-- `.agent/api-docs/voyage.md` (via `/api-check voyage`)
+- `apps/api/services/embedder.py` — `Embedder`, `EmbedError`, `Vector`
+- `.agent/api-docs/voyage.md` (via `/api-check voyage` — expanded well beyond the FEAT-005-era token-limit-only version; now covers auth, request/response shape, retry behavior, and the corrected batch limit, verified against the installed SDK's source directly)
 **Tests:**
-- `apps/api/tests/test_embedder.py` — mocked HTTP, real HTTP behind env flag
+- `apps/api/tests/test_embedder.py` — 23 tests: fake-client unit tests (fast, no network) including chunk<->vector correspondence and cardinality-mismatch tests, real-`voyageai.Client`-with-patched-transport tests for retry/error behavior (exercises the SDK's actual tenacity retry logic), one test against real chunker output on `table_heavy.pdf`, one test confirming Voyage's real tokenizer is available without an API call, and one real-API test gated behind `RUN_REAL_VOYAGE_TEST=1` (skipped by default)
 **Acceptance criteria:**
-- [ ] `Embedder.embed(chunks) -> list[Vector]` handles text-only and text+image chunks
-- [ ] Returns 1024-dim vectors from `voyage-multimodal-3.5`
-- [ ] Batches API calls (max 128 inputs per call)
-- [ ] Retries on 429 with exponential backoff (max 3 retries)
-- [ ] Raises `EmbedError` on non-transient failures
+- [x] `Embedder.embed(chunks) -> list[Vector]` handles text-only and text+image chunks — verified against both synthetic chunks and real `table_heavy.pdf` output; a chunk's text and image become segments of one combined multimodal input, never separate inputs
+- [x] Returns 1024-dim vectors from `voyage-multimodal-3.5` — verified via mock and via one real API call against all 43 of `table_heavy.pdf`'s real chunks (see CHANGELOG for the live result)
+- [x] Batches API calls — **corrected: the "128 inputs" figure above was an unverified guess, not a checked fact.** Verified via the installed SDK's source: `multimodal_embed()` has no client-side batch cap; the real server-side limits are 1,000 inputs **and** 320,000 total tokens per call (`.agent/api-docs/voyage.md`). `embedder.py` batches against both, using a 300,000-token safety budget. **Updated 2026-07-23 (Codex review):** the text-token portion of the batching estimate now uses Voyage's own real local tokenizer (`voyageai.Client.tokenizer(MODEL)`, confirmed available fully offline for `voyage-multimodal-3.5` after a one-time HF download) instead of the char/4 proxy — only the image-token portion (Voyage's documented pixel/560 formula, not an estimate) carries any residual uncertainty now, which is why the safety margin could be tightened from 280,000 to 300,000 without reintroducing the proxy's ~2.3x worst-case error risk that FEAT-005 measured.
+- [x] Retries on 429 with exponential backoff (max 3 retries) — **the Voyage SDK already implements this natively** (`tenacity`-based, exponential + jitter) via `voyageai.Client(max_retries=3)`; `embedder.py` uses the SDK's own mechanism rather than hand-rolling one. Verified empirically: `max_retries=3` yields exactly 3 total attempts (not 4), confirmed by patching `voyageai.MultimodalEmbedding.create` and counting calls.
+- [x] Raises `EmbedError` on non-transient failures — verified for `AuthenticationError` and `InvalidRequestError` (fail on first attempt, no retry — neither is in the SDK's retry predicate) and for retry-exhausted `RateLimitError` (fails only after 3 real attempts)
+- [x] **Added 2026-07-23 (Codex review):** Response cardinality is checked against the batch before vectors are returned — `embed()` now raises `EmbedError` (with the batch's chunk-index context) if Voyage ever returns a different number of embeddings than inputs sent, rather than silently returning a partial/misaligned list. Concretely demonstrated to have been a real gap before the fix: a fake client returning 4 embeddings for 5 submitted chunks previously passed silently; `test_cardinality_mismatch_raises_embed_error_with_batch_context` and `test_cardinality_mismatch_returns_no_partial_vectors` now cover it directly, plus `test_cardinality_mismatch_across_multiple_batches_still_raises` for the multi-batch case. `test_each_chunk_maps_to_its_own_distinct_vector` closes the underlying test-double gap: the original `FakeVoyageClient` returned an identical vector for every input, which could never have caught a correspondence bug even with a correct count — it now returns distinct, index-derived vectors per input.
+
+**FEAT-004 image ownership contract, explicitly tested:** `embedder.py` reads a chunk's `PIL.Image` to pass to Voyage's SDK (which converts it to base64 WEBP internally) but never closes it — verified both by confirming the image is still usable after `embed()` returns and by patching `PIL.Image.Image.close` and asserting it's never called.
+
+**Real batch behavior on `table_heavy.pdf`'s 43 chunks (live API call, not simulated):** all 43 chunks fit in **1 batch** (~5,182 proxy tokens total, nowhere near the 300,000-token safety budget or the 1,000-input cap) → **1 real API call**, no retries triggered, **43 vectors returned, all confirmed 1024-dimensional**, ~3.75s elapsed. This is expected for a document this size — multi-batch behavior is proven separately via synthetic tests (`test_batches_respect_max_inputs_per_batch`, `test_batching_preserves_order_and_uses_multiple_calls`), not against a real fixture large enough to actually need 2+ batches (none of the three fixtures are).
 
 **Run:**
-- Before implementation: `/api-check voyage` and read `.agent/api-docs/voyage.md`
+- `cd apps/api && uv run pytest tests/test_embedder.py -v` (real-API test skipped unless `RUN_REAL_VOYAGE_TEST=1` is set)
+
+**Changelog:** See CHANGELOG.md 2026-07-23 "feature: Voyage embedder wrapper (FEAT-006)"
 
 ---
 
