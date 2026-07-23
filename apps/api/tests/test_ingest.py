@@ -3,15 +3,16 @@
 # Runs against a real local Supabase stack (Auth + Postgres + Storage via
 # `supabase start`) — per STANDARDS.md, no mocking Supabase in integration
 # tests. Docling parsing and Voyage embedding ARE faked here (FakeParser/
-# FakeChunker/FakeEmbedder below) so this file stays fast and deterministic;
-# the fully real pipeline (real Docling + real Voyage) is exercised
-# separately in tests/e2e/test_ingest_e2e.py, gated behind an env var since
-# it's slow and costs Voyage quota.
+# FakeChunker/FakeEmbedder, defined in conftest.py and shared with
+# test_documents.py) so this file stays fast and deterministic; the fully
+# real pipeline (real Docling + real Voyage) is exercised separately in
+# tests/e2e/test_ingest_e2e.py, gated behind an env var since it's slow
+# and costs Voyage quota.
 #
 # Auth is real too: every test logs in a genuinely created local user and
 # uses their real ES256 access token — never a self-forged token (see
 # .agent/MEMORY.md's anti-pattern entry on circular JWT verification from
-# FEAT-003).
+# FEAT-003). app_client/user_a/user_b/admin fixtures come from conftest.py.
 
 from io import BytesIO
 from unittest.mock import patch
@@ -19,129 +20,26 @@ from unittest.mock import patch
 import pytest
 from PIL import Image
 
-from main import app
 from routes import ingest
 from routes.ingest import StoragePathError, validate_storage_path
 from services.chunker import Chunk
-from services.embedder import EmbedError
-from services.parser import BBox, ElementType, ParsedDocument, ParsedElement
-from tests._local_supabase import create_test_user, delete_test_user, login, rest_select, upload_via_rest
-
-
-def _fake_elements(n: int = 2) -> list[ParsedElement]:
-    return [
-        ParsedElement(
-            element_type=ElementType.TEXT,
-            page_number=i + 1,
-            bbox=BBox(x0=0, y0=0, x1=100, y1=20),
-            content=f"fake element {i}",
-            element_id=f"#/texts/{i}",
-        )
-        for i in range(n)
-    ]
-
-
-class FakeParser:
-    def __init__(self, elements=None):
-        self.elements = elements if elements is not None else _fake_elements()
-
-    def parse(self, pdf_bytes: bytes) -> ParsedDocument:
-        return ParsedDocument(elements=self.elements, dropped_elements=0)
-
-
-class FakeChunker:
-    """Ignores its ParsedDocument argument and returns a fixed chunk list
-    if one was given, otherwise derives one chunk per input element —
-    keeps FakeParser/FakeChunker index-consistent by construction."""
-
-    def __init__(self, chunks=None):
-        self._chunks = chunks
-
-    def chunk(self, parsed_document: ParsedDocument) -> list[Chunk]:
-        if self._chunks is not None:
-            return self._chunks
-        return [
-            Chunk(
-                chunk_index=i,
-                element_type=ElementType.TEXT,
-                page_numbers=[e.page_number],
-                source_element_indices=[i],
-                content=e.content,
-            )
-            for i, e in enumerate(parsed_document.elements)
-        ]
-
-
-class FakeEmbedder:
-    """Returns real 1024-dim vectors (pgvector enforces exact dimension on
-    insert) with distinct values per chunk, matching FEAT-006's
-    correspondence-testing discipline. `fail_after` simulates the
-    scenario this task calls out explicitly: the embedder computes some
-    vectors internally, then fails — and the caller must still see zero
-    partial data, never the vectors that were already computed."""
-
-    def __init__(self, fail_after: int | None = None):
-        self.fail_after = fail_after
-
-    def embed(self, chunks):
-        if self.fail_after is not None:
-            partially_computed = [[0.5] * 1024 for _ in range(min(self.fail_after, len(chunks)))]
-            del partially_computed  # never returned — this is the point of the test
-            raise EmbedError(f"simulated embedder failure after computing {self.fail_after} of {len(chunks)} chunks")
-        return [[float(i) / 1000] * 1024 for i in range(len(chunks))]
-
-
-@pytest.fixture
-def app_client():
-    from fastapi.testclient import TestClient
-
-    return TestClient(app)
-
-
-@pytest.fixture
-def user_a(admin):
-    user_id, email = create_test_user(admin)
-    token = login(email)
-    yield user_id, token
-    delete_test_user(admin, user_id)
-
-
-@pytest.fixture
-def user_b(admin):
-    user_id, email = create_test_user(admin)
-    token = login(email)
-    yield user_id, token
-    delete_test_user(admin, user_id)
-
-
-def _upload_placeholder(user_id: str, token: str, filename: str = "placeholder.pdf") -> str:
-    storage_path = f"uploads/{user_id}/{filename}"
-    resp = upload_via_rest(token, "uploads", f"{user_id}/{filename}", b"placeholder bytes", "application/pdf")
-    assert resp.status_code in (200, 201), f"setup upload failed: {resp.status_code} {resp.text}"
-    return storage_path
-
-
-def _override_pipeline(parser=None, chunker=None, embedder=None):
-    import functools
-
-    fake_runner = functools.partial(
-        ingest.run_ingest_pipeline,
-        parser=parser or FakeParser(),
-        chunker=chunker or FakeChunker(),
-        embedder=embedder or FakeEmbedder(),
-    )
-    app.dependency_overrides[ingest.get_pipeline_runner] = lambda: fake_runner
-
-
-def _clear_override():
-    app.dependency_overrides.pop(ingest.get_pipeline_runner, None)
-
+from services.parser import ElementType
+from tests._local_supabase import rest_select, upload_via_rest
+from tests.conftest import (
+    FakeChunker,
+    FakeEmbedder,
+    FakeParser,
+    clear_pipeline_override,
+    fake_elements,
+    override_pipeline,
+    upload_placeholder,
+)
 
 # Acceptance criterion: POST /ingest with valid body returns 202 + document_id
 def test_post_ingest_with_valid_body_returns_202_document_id(app_client, admin, user_a):
     user_id, token = user_a
-    storage_path = _upload_placeholder(user_id, token)
-    _override_pipeline()
+    storage_path = upload_placeholder(user_id, token)
+    override_pipeline()
 
     try:
         response = app_client.post(
@@ -155,7 +53,7 @@ def test_post_ingest_with_valid_body_returns_202_document_id(app_client, admin, 
             headers={"Authorization": f"Bearer {token}"},
         )
     finally:
-        _clear_override()
+        clear_pipeline_override()
 
     assert response.status_code == 202
     body = response.json()
@@ -215,7 +113,7 @@ def test_unsupported_mime_type_returns_422(app_client, user_a):
 # Acceptance criterion: Background task: download -> parse -> chunk -> embed -> insert -> update status
 def test_background_task_download_parse_chunk_embed_insert_update_sta(admin, user_a):
     user_id, token = user_a
-    storage_path = _upload_placeholder(user_id, token, filename="pipeline.pdf")
+    storage_path = upload_placeholder(user_id, token, filename="pipeline.pdf")
 
     document = admin.table("documents").insert(
         {
@@ -229,7 +127,7 @@ def test_background_task_download_parse_chunk_embed_insert_update_sta(admin, use
     document_id = document["id"]
 
     figure_image = Image.new("RGB", (10, 10), color="red")
-    elements = _fake_elements(2)
+    elements = fake_elements(2)
     chunks = [
         Chunk(chunk_index=0, element_type=ElementType.TEXT, page_numbers=[1], source_element_indices=[0], content="hello world"),
         Chunk(
@@ -283,7 +181,7 @@ def test_background_task_download_parse_chunk_embed_insert_update_sta(admin, use
 # Acceptance criterion: Failure at any stage sets documents.status = 'failed' with error message
 def test_failure_at_any_stage_sets_documents_status_failed_with_error(admin, user_a):
     user_id, token = user_a
-    storage_path = _upload_placeholder(user_id, token, filename="fails.pdf")
+    storage_path = upload_placeholder(user_id, token, filename="fails.pdf")
 
     document = admin.table("documents").insert(
         {
@@ -323,7 +221,7 @@ def test_failure_at_any_stage_sets_documents_status_failed_with_error(admin, use
 # "some chunks already computed" is concretely true, not just claimed.
 def test_no_partial_chunk_rows_after_embedder_fails_partway(admin, user_a):
     user_id, token = user_a
-    storage_path = _upload_placeholder(user_id, token, filename="partial.pdf")
+    storage_path = upload_placeholder(user_id, token, filename="partial.pdf")
 
     document = admin.table("documents").insert(
         {
@@ -336,7 +234,7 @@ def test_no_partial_chunk_rows_after_embedder_fails_partway(admin, user_a):
     ).execute().data[0]
     document_id = document["id"]
 
-    elements = _fake_elements(5)
+    elements = fake_elements(5)
     ingest.run_ingest_pipeline(
         document_id=document_id,
         user_id=user_id,
@@ -359,8 +257,8 @@ def test_multi_tenant_isolation_user_a_cannot_see_user_b_s_document_v(app_client
     user_id_a, token_a = user_a
     _, token_b = user_b
 
-    storage_path = _upload_placeholder(user_id_a, token_a, filename="private.pdf")
-    _override_pipeline()
+    storage_path = upload_placeholder(user_id_a, token_a, filename="private.pdf")
+    override_pipeline()
     try:
         response = app_client.post(
             "/ingest",
@@ -373,7 +271,7 @@ def test_multi_tenant_isolation_user_a_cannot_see_user_b_s_document_v(app_client
             headers={"Authorization": f"Bearer {token_a}"},
         )
     finally:
-        _clear_override()
+        clear_pipeline_override()
     assert response.status_code == 202
     document_id = response.json()["document_id"]
 
@@ -459,7 +357,7 @@ def test_run_ingest_pipeline_refuses_mismatched_user_id_and_storage_path(admin, 
 
 def test_dependency_construction_failure_marks_document_failed(admin, user_a):
     user_id, token = user_a
-    storage_path = _upload_placeholder(user_id, token, filename="construction-fails.pdf")
+    storage_path = upload_placeholder(user_id, token, filename="construction-fails.pdf")
 
     document = admin.table("documents").insert(
         {
@@ -497,7 +395,7 @@ def test_dependency_construction_failure_marks_document_failed(admin, user_a):
 
 def test_cleanup_failure_is_logged_and_does_not_crash_pipeline(admin, user_a, caplog):
     user_id, token = user_a
-    storage_path = _upload_placeholder(user_id, token, filename="cleanup-fails.pdf")
+    storage_path = upload_placeholder(user_id, token, filename="cleanup-fails.pdf")
 
     document = admin.table("documents").insert(
         {
