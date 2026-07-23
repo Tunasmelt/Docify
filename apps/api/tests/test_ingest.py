@@ -21,6 +21,7 @@ from PIL import Image
 
 from main import app
 from routes import ingest
+from routes.ingest import StoragePathError, validate_storage_path
 from services.chunker import Chunk
 from services.embedder import EmbedError
 from services.parser import BBox, ElementType, ParsedDocument, ParsedElement
@@ -540,3 +541,250 @@ def test_cleanup_failure_is_logged_and_does_not_crash_pipeline(admin, user_a, ca
     assert any("delete_chunks_for_document itself failed" in m for m in error_messages)
     assert any("mark_failed itself failed" in m for m in error_messages)
     assert any(document_id in m for m in error_messages)
+
+
+# --- Security fix regression tests: path traversal, 2026-07-23 -------------
+#
+# See routes.ingest.validate_storage_path()'s docstring for the full
+# write-up. Two rounds of live testing against the real local Storage
+# stack found two independently-exploitable bypasses before landing on
+# the current whitelist-based check:
+#   Round 1: bare startswith() — beaten by a literal "../" segment.
+#   Round 2: reject literal ".." + require posixpath-canonical form —
+#            beaten by a percent-encoded "../" ("%2e%2e%2f"), which
+#            contains no literal ".." and normpath doesn't decode.
+# Both are covered below at three levels: the validator function
+# directly, the route (403), and — per this task's explicit requirement
+# — a live end-to-end re-run of the exact recon proof-of-concept in
+# reverse, not just trusting the unit tests.
+
+
+def _traversal_paths(attacker_id: str, victim_id: str) -> list[str]:
+    return [
+        f"uploads/{attacker_id}/../{victim_id}/legit.pdf",  # round-1 exploit
+        f"uploads/{attacker_id}/%2e%2e%2f{victim_id}/legit.pdf",  # round-2 exploit
+        f"uploads/{attacker_id}/..%2f{victim_id}/legit.pdf",  # mixed literal+encoded
+    ]
+
+
+@pytest.mark.parametrize(
+    "malicious_path",
+    _traversal_paths("22222222-2222-2222-2222-222222222222", "11111111-1111-1111-1111-111111111111"),
+)
+def test_validate_storage_path_rejects_traversal_variants(malicious_path):
+    with pytest.raises(StoragePathError):
+        validate_storage_path(malicious_path, "22222222-2222-2222-2222-222222222222")
+
+
+def test_validate_storage_path_rejects_absolute_path():
+    with pytest.raises(StoragePathError):
+        validate_storage_path("/etc/passwd", "22222222-2222-2222-2222-222222222222")
+
+
+def test_validate_storage_path_rejects_non_canonical_double_slash():
+    user_id = "22222222-2222-2222-2222-222222222222"
+    with pytest.raises(StoragePathError):
+        validate_storage_path(f"uploads/{user_id}//legit.pdf", user_id)
+
+
+def test_validate_storage_path_accepts_a_normal_canonical_path():
+    user_id = "22222222-2222-2222-2222-222222222222"
+    path = f"uploads/{user_id}/3f9e0a1b-1234-4567-89ab-cdef01234567.pdf"
+
+    assert validate_storage_path(path, user_id) == path
+
+
+@pytest.mark.parametrize(
+    "malicious_path",
+    _traversal_paths("22222222-2222-2222-2222-222222222222", "11111111-1111-1111-1111-111111111111"),
+)
+def test_ingest_route_rejects_path_traversal_storage_path(app_client, admin, user_a, malicious_path):
+    user_id, token = user_a
+    # Splice the attacker placeholder for the real logged-in user's id so
+    # the path still starts with *their own* real prefix, as it must to
+    # be an interesting test of the traversal specifically (not just a
+    # flatly-wrong-prefix rejection, already covered elsewhere).
+    malicious_path = malicious_path.replace("22222222-2222-2222-2222-222222222222", user_id)
+
+    response = app_client.post(
+        "/ingest",
+        json={
+            "storage_path": malicious_path,
+            "filename": "legit.pdf",
+            "mime_type": "application/pdf",
+            "size_bytes": 17,
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 403
+    rows = admin.table("documents").select("id").eq("storage_path", malicious_path).execute().data
+    assert rows == []
+
+
+@pytest.mark.parametrize(
+    "malicious_path",
+    _traversal_paths("22222222-2222-2222-2222-222222222222", "11111111-1111-1111-1111-111111111111"),
+)
+def test_run_ingest_pipeline_rejects_path_traversal_storage_path(admin, user_a, malicious_path):
+    user_id, _ = user_a
+    malicious_path = malicious_path.replace("22222222-2222-2222-2222-222222222222", user_id)
+
+    document = admin.table("documents").insert(
+        {
+            "user_id": user_id,
+            "filename": "legit.pdf",
+            "storage_path": malicious_path,
+            "mime_type": "application/pdf",
+            "size_bytes": 17,
+        }
+    ).execute().data[0]
+    document_id = document["id"]
+
+    ingest.run_ingest_pipeline(
+        document_id=document_id,
+        user_id=user_id,
+        storage_path=malicious_path,
+        client=admin,
+        parser=FakeParser(),
+        chunker=FakeChunker(),
+        embedder=FakeEmbedder(),
+    )
+
+    doc_row = admin.table("documents").select("status", "error").eq("id", document_id).execute().data[0]
+    assert doc_row["status"] == "failed"
+    assert "refusing" in doc_row["error"]
+
+    chunk_rows = admin.table("chunks").select("id").eq("document_id", document_id).execute().data
+    assert chunk_rows == []
+
+
+def test_path_traversal_exploit_is_closed_end_to_end(app_client, admin, user_a, user_b):
+    """Live re-run of the exact recon proof-of-concept, in reverse: a
+    real user A uploads a real file with real, identifiable content; a
+    real, unrelated user B attempts to ingest it via a crafted
+    storage_path that starts with B's own prefix but traverses into A's.
+    Before the fix, the equivalent raw request returned A's real content
+    (confirmed in the recon report via both the SDK and raw HTTP) and
+    would have been ingested into B's own chunks. Confirms both
+    traversal spellings proven independently exploitable during the fix
+    (literal ".." and percent-encoded) are now blocked before any
+    Storage access is attempted at all."""
+    user_id_a, token_a = user_a
+    user_id_b, token_b = user_b
+
+    secret_content = b"USER A CONFIDENTIAL CONTENT - regression test for closed path traversal"
+    upload_resp = upload_via_rest(token_a, "uploads", f"{user_id_a}/legit.pdf", secret_content, "application/pdf")
+    assert upload_resp.status_code in (200, 201)
+
+    try:
+        malicious_paths = [
+            f"uploads/{user_id_b}/../{user_id_a}/legit.pdf",
+            f"uploads/{user_id_b}/%2e%2e%2f{user_id_a}/legit.pdf",
+        ]
+
+        for malicious_path in malicious_paths:
+            response = app_client.post(
+                "/ingest",
+                json={
+                    "storage_path": malicious_path,
+                    "filename": "legit.pdf",
+                    "mime_type": "application/pdf",
+                    "size_bytes": len(secret_content),
+                },
+                headers={"Authorization": f"Bearer {token_b}"},
+            )
+            assert response.status_code == 403, f"traversal path {malicious_path!r} was not rejected"
+
+        # No document row was ever created for user B referencing A's
+        # file — the check happens before document creation, so there's
+        # nothing that could have carried A's content into B's account.
+        b_documents = admin.table("documents").select("id").eq("user_id", user_id_b).execute().data
+        assert b_documents == []
+    finally:
+        admin.storage.from_("uploads").remove([f"{user_id_a}/legit.pdf"])
+
+
+# --- Security fix regression tests: raw storage_path leaking into logs, --
+# --- 2026-07-23 -------------------------------------------------------------
+#
+# Security review found post_ingest() and run_ingest_pipeline() both
+# logged the full attacker-supplied storage_path on a rejected traversal
+# attempt — safe from the client's perspective (the 403 body stays
+# generic) but a real concern if logs are aggregated/hosted externally,
+# since the raw string can embed another user's UUID or arbitrary
+# attacker-chosen text. Fixed by giving StoragePathError a coarse
+# `reason` separate from its detailed message, and logging only that
+# (plus document_id/user_id) at both call sites. These tests use the
+# same targeted log-output pattern the security review itself used
+# (capture real log output after a triggered traversal attempt, inspect
+# it directly) rather than trusting the code change by inspection alone.
+
+
+def test_post_ingest_traversal_rejection_does_not_log_raw_storage_path(app_client, user_a, caplog):
+    user_id, token = user_a
+    malicious_path = f"uploads/{user_id}/../11111111-1111-1111-1111-111111111111/legit.pdf"
+
+    with caplog.at_level("WARNING"):
+        response = app_client.post(
+            "/ingest",
+            json={
+                "storage_path": malicious_path,
+                "filename": "legit.pdf",
+                "mime_type": "application/pdf",
+                "size_bytes": 17,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert response.status_code == 403
+
+    all_log_text = "\n".join(r.message for r in caplog.records)
+    assert malicious_path not in all_log_text, "raw storage_path leaked into logs"
+    assert ".." not in all_log_text, "a traversal fragment leaked into logs even if not the full path"
+
+    # The log line still fires with useful, non-sensitive context.
+    assert user_id in all_log_text
+    assert "traversal_segment" in all_log_text
+
+
+def test_run_ingest_pipeline_traversal_rejection_does_not_log_raw_storage_path(admin, user_a, caplog):
+    user_id, _ = user_a
+    malicious_path = f"uploads/{user_id}/../11111111-1111-1111-1111-111111111111/legit.pdf"
+
+    document = admin.table("documents").insert(
+        {
+            "user_id": user_id,
+            "filename": "legit.pdf",
+            "storage_path": malicious_path,
+            "mime_type": "application/pdf",
+            "size_bytes": 17,
+        }
+    ).execute().data[0]
+    document_id = document["id"]
+
+    with caplog.at_level("WARNING"):
+        ingest.run_ingest_pipeline(
+            document_id=document_id,
+            user_id=user_id,
+            storage_path=malicious_path,
+            client=admin,
+            parser=FakeParser(),
+            chunker=FakeChunker(),
+            embedder=FakeEmbedder(),
+        )
+
+    all_log_text = "\n".join(r.message for r in caplog.records)
+    assert malicious_path not in all_log_text, "raw storage_path leaked into logs"
+    assert ".." not in all_log_text, "a traversal fragment leaked into logs even if not the full path"
+
+    # document_id/user_id + coarse reason are exactly what should appear.
+    assert document_id in all_log_text
+    assert user_id in all_log_text
+    assert "traversal_segment" in all_log_text
+
+    # documents.error (RLS-scoped to this same user, not a "log" in the
+    # sense the security review meant) still gets the full detail — that
+    # part is deliberately unchanged.
+    doc_row = admin.table("documents").select("error").eq("id", document_id).execute().data[0]
+    assert malicious_path in doc_row["error"]

@@ -4,25 +4,87 @@ version = "0.1.0"
 description = "Docify FastAPI backend — ingestion, retrieval, generation"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "fastapi>=0.115,<0.116",
+    # fastapi/starlette bumped 2026-07-23 (security fix — see CHANGELOG).
+    # Two rounds: starlette>=0.49.1 was the initially-requested floor
+    # (fastapi==0.115.14 hard-caps starlette<0.47.0, so starlette
+    # couldn't move without fastapi moving too). But re-running pip-audit
+    # against 0.49.3 showed 7 CVEs still unresolved — every one of them
+    # only fixed in the 1.x line (1.0.1/1.1.0/1.3.0/1.3.1), never
+    # backported to 0.x. Since 1.3.1 resolves cleanly (verified via
+    # --resolution=lowest, not just installing latest) and the full test
+    # suite passes against it, extended the fix to starlette>=1.3.1 to
+    # actually reach zero remaining CVEs rather than stopping at a
+    # partially-patched version. 0.133.0 is the minimal fastapi version
+    # compatible with starlette>=1.3.1.
+    "fastapi>=0.133,<0.134",
+    # starlette wasn't previously declared here even though middleware/auth.py
+    # imports it directly (it only worked because fastapi pulled it in
+    # transitively) — declared explicitly now, both for the security floor
+    # and so this stops being an undeclared transitive import.
+    "starlette>=1.3.1,<1.4",
     "uvicorn[standard]>=0.30,<0.31",
-    "docling>=2.0,<3.0",
-    "voyageai>=0.3,<0.4",
-    "google-genai>=1.0,<2.0",
+    # docling bumped 2026-07-23 (security fix): 2.87.0 had multiple CVEs
+    # (PYSEC-2026-2142 through 2146), fixed in 2.91.0/2.94.0. Pinned to
+    # exactly the 2.94.0 minor line rather than latest (2.115.0 at time of
+    # writing) — latest pulls a major docling-parse bump (5.x -> 7.x) that
+    # 2.94.0 does not need, and this fix targets the specific patched
+    # version, not "whatever's newest".
+    "docling>=2.94.0,<2.95",
+    # floor raised to the exact version FEAT-006 was built/tested against
+    # (2026-07-23): a plain `uv lock` picked a langsmith-CVE fix by
+    # silently *downgrading* voyageai to 0.3.3 instead of upgrading the
+    # langchain/langsmith chain underneath it — the wrong direction for a
+    # security fix, and untested against FEAT-006's embedder. Pinning the
+    # floor here forces the resolver to fix langsmith without touching
+    # voyageai at all.
+    "voyageai>=0.3.7,<0.4",
+    # floor raised 2026-07-23: forced by the langsmith CVE fix below, not
+    # a change we wanted for its own sake. langsmith>=0.8.18 requires
+    # websockets>=15.0, but google-genai==1.2.0 caps websockets<15.0 —
+    # confirmed via `uv`'s resolver error, not guessed. 1.7.0 is the
+    # minimal google-genai version compatible with websockets>=15.0
+    # (verified via --resolution=lowest), not "latest" (1.75.0 at time
+    # of writing). Currently unused by any of our own code (Phase 2 not
+    # built yet), so this carries no practical behavior risk today.
+    "google-genai>=1.7,<1.8",
     "supabase>=2.7,<3.0",
     "pydantic>=2.8,<3.0",
     "python-dotenv>=1.0,<2.0",
     "pyjwt[crypto]>=2.9,<3.0",
-    "pillow>=11.0,<12.0",
+    # pillow bumped 2026-07-23 (security fix): 11.3.0 had multiple CVEs,
+    # fixed across 12.1.1/12.2.0/12.3.0.
+    "pillow>=12.3.0,<12.4",
 ]
 
 [dependency-groups]
 dev = [
-    "pytest>=8.3,<9.0",
-    "pytest-asyncio>=0.24,<0.25",
-    "httpx>=0.27,<0.28",
+    # pytest bumped 2026-07-23 (security fix, dev-only/low urgency):
+    # PYSEC-2026-1845, fixed in 9.0.3.
+    "pytest>=9.0.3,<9.1",
+    # bumped alongside pytest above: pytest-asyncio==0.24.0 caps
+    # pytest<9, so it had to move too. Not itself a flagged CVE, and not
+    # actually exercised by this project's test suite today (no async
+    # tests, no asyncio_mode config) — zero practical behavior risk.
+    "pytest-asyncio>=1.4,<1.5",
+    # httpx bumped 2026-07-23 as a forced transitive consequence of the
+    # docling/pillow bump above (not itself a flagged CVE) — the old
+    # httpx<0.28 pin is no longer satisfiable once docling/pillow move.
+    "httpx>=0.28,<0.29",
     "psycopg[binary]>=3.2,<4.0",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+
+[tool.uv]
+# langsmith is a transitive dependency (voyageai -> langchain-text-splitters
+# -> langchain-core -> langsmith), never imported by this project's own
+# code (confirmed via grep, 2026-07-23) — deliberately NOT added to
+# [project.dependencies], since we don't actually use it. But
+# langsmith==0.8.5 has a known CVE (GHSA-f4xh-w4cj-qxq8, fixed 0.8.18),
+# and a plain `uv lock` does not bump an untouched transitive package on
+# its own (confirmed: re-locked after the docling/pillow/fastapi/starlette
+# bumps above and langsmith stayed at 0.8.5). This constraint forces the
+# resolver to a patched version without misrepresenting it as something
+# we depend on directly.
+constraint-dependencies = ["langsmith>=0.8.18"]
