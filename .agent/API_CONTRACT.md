@@ -85,14 +85,14 @@ Kicks off document parsing + embedding for a file already uploaded to Supabase S
 ```json
 {
   "document_id": "3f9e...",
-  "status": "parsing",
+  "status": "uploaded",
   "created_at": "2026-07-22T14:30:00Z"
 }
 ```
 
 **Behaviour:**
-- Creates `documents` row with `status='uploaded'`, returns `202` immediately
-- Downloads file, parses with Docling, chunks, embeds, inserts chunks — this happens in a background task (FastAPI BackgroundTasks for v1; queue system if scale demands)
+- Creates `documents` row with `status='uploaded'`, returns `202` immediately — the response's `status` field reflects that literal, just-inserted DB value (**corrected 2026-07-23, FEAT-007**: an earlier draft of this example showed `"status": "parsing"`, which the endpoint never actually returns synchronously — `parsing` is set moments later, inside the background task, after the response has already gone out)
+- Downloads file, parses with Docling, chunks, embeds, uploads figures to Storage, inserts chunks — this happens in a background task (FastAPI BackgroundTasks for v1; queue system if scale demands). Status progresses `uploaded` → `parsing` → `embedded` → `ready` (or `failed` at any stage, with `documents.error` populated). `parsed_at`/`embedded_at` are stamped as milestones inside the `parsing` phase — there's no dedicated status value for "parsed, not yet embedded"
 - Client polls `GET /documents/{id}` or subscribes via Supabase Realtime to observe status transitions
 
 **Errors:**
