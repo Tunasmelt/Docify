@@ -47,11 +47,13 @@ All errors return this shape with the appropriate HTTP status:
 | `UNAUTHORIZED` | 401 | Missing or invalid JWT |
 | `FORBIDDEN` | 403 | Authenticated but not allowed (e.g. accessing another user's doc) |
 | `NOT_FOUND` | 404 | Resource doesn't exist or isn't visible to user |
+| `CONFLICT` | 409 | Action not allowed given the resource's current state (e.g. deleting a document that's still being parsed) — added 2026-07-23, FEAT-008, was missing despite `DELETE /documents/{id}`'s own spec already documenting a 409 |
 | `VALIDATION_ERROR` | 422 | Request body failed schema validation |
 | `RATE_LIMITED` | 429 | Free-tier ceiling hit on a downstream API |
 | `PARSE_FAILED` | 500 | Docling could not parse the document |
 | `EMBED_FAILED` | 502 | Voyage API call failed |
 | `GENERATE_FAILED` | 502 | Gemini API call failed |
+| `STORAGE_ERROR` | 500 | A Supabase Storage call failed (e.g. `DELETE /documents/{id}` couldn't remove a file) — transient infrastructure failure, not a client error; the resource being acted on is left unmodified and retrying is safe. Added 2026-07-23, FEAT-008 follow-up |
 | `INTERNAL` | 500 | Anything unexpected |
 
 ---

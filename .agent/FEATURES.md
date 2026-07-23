@@ -252,20 +252,38 @@ Rule: a feature is not `complete` until acceptance criteria pass AND `/gap-check
 
 ### [FEAT-008] `/documents` list + detail + delete
 **Phase:** 1
-**Status:** planned
+**Status:** complete
 **Owner:** claude-code
+**Depends on:** FEAT-007
 **Files:**
-- `apps/api/routes/documents.py`
+- `apps/api/routes/documents.py` — `list_documents`, `get_document`, `delete_document`
+- `apps/api/db/queries.py` — added `get_document`, `list_documents`, `list_figure_paths_for_document`, `delete_document`, `remove_document_from_conversations`
+- `apps/api/models/documents.py` — `DocumentResponse`, `DocumentListResponse`
+- `apps/api/main.py` — wired `documents.router` in
+- `apps/api/tests/conftest.py` — the `FakeParser`/`FakeChunker`/`FakeEmbedder`/`user_a`/`user_b`/`app_client` fixtures and helpers previously local to `test_ingest.py` moved here so both test files share one implementation (no duplication, no cross-file import); added `ingest_real_document()`, the shared "run a real document through the real /ingest endpoint" helper this feature's tests and future ones can reuse
 **Tests:**
-- `apps/api/tests/test_documents.py`
+- `apps/api/tests/test_documents.py` — 8 tests, every one ingests its document through the real `/ingest` endpoint first (never a hand-inserted row, except the one `status='parsing'` test — see below), real local Supabase Auth+DB+Storage throughout — includes two storage-failure-handling regression tests added in the self-verification follow-up (see below)
 **Acceptance criteria:**
-- [ ] GET /documents returns paginated list scoped to JWT user
-- [ ] GET /documents/{id} returns 404 for another user's doc
-- [ ] DELETE /documents/{id} cascades to chunks, conversations reference, storage files
-- [ ] DELETE while status='parsing' returns 409
+- [x] GET /documents returns paginated list scoped to JWT user — `test_get_documents_returns_paginated_list_scoped_to_jwt_user`; also verifies the response shape matches API_CONTRACT.md exactly, the `status` filter, and that invalid `status`/`cursor` query values get a clean 422 rather than surfacing a raw Postgres enum-cast error
+- [x] GET /documents/{id} returns 404 for another user's doc — `test_get_documents_id_returns_404_for_another_user_s_doc`; asserts the response for "belongs to another user" and "genuinely doesn't exist" are byte-identical (same status code, same body) — no 403-vs-404 distinction to leak existence, same discipline as FEAT-007's `storage_path` hardening. `get_document()`'s query scopes `user_id` in the query itself (`.eq("id", ...).eq("user_id", ...)`), not checked after fetching by id alone, so there's structurally nothing to leak
+- [x] DELETE /documents/{id} cascades to chunks, conversations reference, storage files — `test_delete_documents_id_cascades_to_chunks_conversations_referen`; ingests a document with a real figure chunk, inserts a synthetic `conversations` row referencing it (Phase 2 doesn't exist yet, so this is the only way to exercise that path), deletes, and confirms all four: `documents` row gone, `chunks` rows gone (DB-level FK cascade), the `conversations.document_ids` array no longer contains it (application-level cleanup — arrays aren't FK-cascadable), **and** both Storage objects (the uploaded PDF and the figure PNG) are confirmed actually gone by attempting to download them directly from the bucket afterward and asserting that raises — not inferred from "the delete call didn't error" (task's explicit item 5 requirement)
+- [x] DELETE while status='parsing' returns 409 — `test_delete_while_status_parsing_returns_409`. The one test in this file that inserts a document row directly rather than through `/ingest`: a document genuinely stuck mid-parse isn't reproducible through the real endpoint under `TestClient`, since the background task always runs to completion synchronously before the HTTP call returns — this is a deliberate, documented exception to the file's own rule, not an oversight
+
+**Multi-tenant isolation across all three endpoints (task item 4), same live-verification discipline as FEAT-007:** `test_multi_tenant_isolation_across_list_get_delete` — two real users, one real ingested document. Positive control first (user A can list/get their own document), then user B: absent from the list, 404 on direct GET, 404 on DELETE — **and** confirms user B's rejected DELETE did not actually remove user A's document (checked directly against the DB afterward, not assumed from the 404 response alone).
+
+**Design notes:**
+- Both `post_ingest`'s (FEAT-007) and every `/documents` endpoint's ownership checks use the service-role client with an explicit `.eq("user_id", user_id)` filter baked into the query itself, not RLS via a user-scoped client — consistent with FEAT-007's established pattern, and functionally equivalent to RLS for the non-leak guarantee since a query scoped this way returns zero rows for both "doesn't exist" and "wrong owner" cases identically.
+- Pagination cursor is `base64(created_at)` alone, not a full `(created_at, id)` keyset tiebreak — documented, accepted simplification: two documents sharing a byte-identical microsecond-precision timestamp isn't realistic given documents are created via separate sequential API calls, and a full compound-OR keyset filter would add real complexity for a case that doesn't occur in practice at this project's scale.
+- Storage cleanup happens *before* the DB delete in `delete_document`, deliberately the opposite order from `run_ingest_pipeline`'s figure uploads: a genuine Storage failure here propagates as an error with the document row still intact, rather than risking a split-brain state where the DB row is already gone but Storage objects are orphaned with no remaining record of which document they belonged to.
+- `API_CONTRACT.md` was missing a `CONFLICT`/409 error code entry despite `DELETE /documents/{id}`'s own spec already documenting a 409 response — added.
+
+**Self-verification follow-up, 2026-07-23 — Storage-failure error handling:** a live self-verification pass (re-running the feature's own claims rather than re-asserting them) found `delete_document`'s two Storage `.remove()` calls had no error handling — a simulated partial failure (figures removal throwing, uploads succeeding) confirmed the underlying retry-safety was already correct (document/chunks survive, a retry succeeds cleanly, removing an already-gone object doesn't itself error) but the first failure surfaced as a bare unhandled 500 with no envelope and no log line. Fixed: both `.remove()` calls now wrapped individually, returning the standard error envelope with a new `STORAGE_ERROR` (500) code whose message tells the caller the document wasn't modified and retrying is safe; the ERROR log records only `document_id`/`user_id`/which bucket failed, never the exception's own message (same coarse-reason discipline as FEAT-007's `StoragePathError` fix, since a Storage error's message isn't guaranteed path-free). Two new tests turn the live check into a permanent regression test: one reproducing the exact failure and asserting the envelope/log/survival, one continuing into a retry and asserting clean `204` completion. `API_CONTRACT.md` gained the `STORAGE_ERROR` entry. Full write-up: CHANGELOG.md 2026-07-23 "delete_document Storage failures..." entry.
 
 **Run:**
 - `curl -H "Authorization: Bearer <jwt>" http://localhost:8000/documents`
+- Tests: `cd apps/api && uv run pytest tests/test_documents.py -v`
+
+**Changelog:** See CHANGELOG.md 2026-07-23 "feature: `/documents` list + detail + delete (FEAT-008)"
 
 ---
 
