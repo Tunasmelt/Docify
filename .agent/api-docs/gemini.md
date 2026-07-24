@@ -68,3 +68,23 @@ types.Part.from_bytes(data=png_bytes, mime_type="image/png")   # in-memory bytes
 - `response.usage_metadata.prompt_token_count` / `.candidates_token_count` / `.total_token_count` (`types.py:2843`) — all `Optional[int]`
 
 **Errors** (`google/genai/errors.py`): `APIError` (base) → `ClientError` (4xx) / `ServerError` (5xx). No SDK-internal retry (unlike `voyageai.Client(max_retries=...)`) — confirmed by inspecting `client.py`/`types.py` for a retry-options field; none exists. A hand-rolled retry was judged out of scope for FEAT-010 per its "standard-depth, no new trust boundary" framing — errors are wrapped and surfaced, not retried.
+
+## Structured output / `response_schema` (FEAT-011, verified against installed SDK source — applies to the whole `generate_content` API surface, not a `gemini-3.5-flash-lite`-specific shape, and confirmed live against Flash-Lite specifically before relying on it)
+
+Used instead of free-text parsing for the citation verifier, since FEAT-010's `[N]`-marker regex needed three separate rounds of fixes (grouped brackets, delimiters, sign handling) precisely because it parsed free text — a schema-constrained response closes that whole failure class here rather than re-deriving the same lesson.
+
+```python
+import pydantic
+
+class MyResponse(pydantic.BaseModel):
+    field: str
+
+config = types.GenerateContentConfig(
+    response_mime_type="application/json",
+    response_schema=MyResponse,   # a pydantic.BaseModel subclass — accepted directly (SchemaUnion = dict | type | Schema | ...)
+)
+response = client.models.generate_content(model=MODEL, contents=contents, config=config)
+parsed: MyResponse | None = response.parsed
+```
+
+**Critical failure-mode detail, easy to miss** (`types.py:3018-3046`, `GenerateContentResponse._from_response`): if the model's JSON doesn't parse or doesn't validate against the schema, the SDK catches `pydantic.ValidationError`/`json.decoder.JSONDecodeError` **internally and silently** (`except ...: pass`) rather than raising — `response.parsed` is simply left `None`. Code that assumes `response.parsed` is populated whenever the API call itself succeeds will crash on `None` access, or worse, silently treat a malformed response as some falsy-but-valid state. Always explicitly check `response.parsed is None` as its own failure branch, separate from and in addition to catching `APIError` around the call itself.

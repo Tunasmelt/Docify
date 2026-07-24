@@ -354,20 +354,27 @@ All 4/4 found their expected chunk in the top-5; 2/4 at rank 1, 2/4 at rank 2 (b
 
 ### [FEAT-011] Citation verifier
 **Phase:** 2
-**Status:** planned
+**Status:** complete
 **Owner:** claude-code
 **Files:**
 - `apps/api/services/verifier.py`
 **Tests:**
 - `apps/api/tests/test_verifier.py` — supported / partial / unsupported fixtures
 **Acceptance criteria:**
-- [ ] `Verifier.verify(claim, chunk) -> Verdict{verdict, quote}` uses Gemini 3.5 Flash-Lite
-- [ ] Verdict enum: supported | partial | unsupported
-- [ ] Returns the supporting quote from the source (or null if unsupported)
-- [ ] Batches verifications per generate call
+- [x] `Verifier.verify(claim, chunk) -> Verdict{verdict, quote}` uses Gemini 3.5 Flash-Lite
+- [x] Verdict enum: supported | partial | unsupported
+- [x] Returns the supporting quote from the source (or null if unsupported) — enforced defensively (quote forced `None` for `unsupported` even if the model deviates and emits one), not just prompted
+- [x] Batches verifications per generate call — `Verifier.verify_batch(pairs)` runs one Gemini call per `(claim_text, chunk)` pair concurrently (`ThreadPoolExecutor`, same shape as FEAT-009's retriever), preserving input order regardless of completion order
+- [x] `verify()` takes an already-resolved `(claim_text, chunk: GeneratorChunk)` pair — it does not do `[N]`-to-chunk resolution itself; that mapping (`chunks[N-1].chunk_id`) is FEAT-012's job, same principle as FEAT-010's citation markers. Reuses `GeneratorChunk` rather than introducing a third near-identical chunk type, since by verification time FEAT-012 already has `GeneratorChunk`s (images already fetched) built for the `generate()` call.
+- [x] Structured output (`response_schema`/`response_mime_type="application/json"`, a pydantic model) is used instead of free-text regex parsing, closing the entire failure class FEAT-010's `[N]`-marker parsing needed three rounds of live fixes to close — verified against installed SDK source (`.agent/api-docs/gemini.md`).
+- [x] **Fails safe, proven not assumed:** any failure to verify a claim — a real Gemini API error (proven live against an actual invalid-API-key auth failure, not just a mock), a genuine transport-layer timeout/connection failure (`httpx.HTTPError`, a real gap this session's self-audit found: the SDK's own HTTP layer never wraps these into `APIError`, so a bare `except APIError` let a mocked `httpx.ReadTimeout` crash `verify()` uncaught before this was fixed), or a response that doesn't conform to the schema (the SDK silently sets `response.parsed = None` in this case rather than raising, confirmed via SDK source read) — is converted into a forced `Verdict(verdict=UNSUPPORTED, quote=None, error=<reason>)`, never an exception a caller could mishandle and never a silent pass-through as verified. A caller that only reads `.verdict` and never checks `.error` still gets the safe outcome by construction.
+- [x] **The returned quote is verified against the real chunk content, not trusted as-is** — a 2026-07-24 self-audit found this check was entirely missing at ship time: a mocked `verdict=SUPPORTED` response with a plausible-sounding but fabricated quote (never appearing in the source) passed straight through as "verified," with nothing catching it. `_quote_is_grounded()` normalizes whitespace (tolerating real markdown-table padding differences, not requiring byte-for-byte match) and confirms the quote is actually a substring of `chunk.content`; if not, `verify()` fails safe to `UNSUPPORTED` exactly like a broken API call — the verdict is only as trustworthy as the quote it's based on.
+- [x] `response_schema`'s enum enforcement is confirmed genuinely client-side (pydantic validating the raw JSON text locally, proven by constructing `_VerdictResponse.model_validate_json()` directly with an out-of-enum string and observing the real `ValidationError`), not merely "the API happens to behave" — a garbage verdict string from any future API version collapses into the same, already-handled `response.parsed is None` path, not a new unhandled shape.
 
 **Run:**
 - `pytest apps/api/tests/test_verifier.py -v`
+- Real API tests: `RUN_REAL_VERIFIER_TEST=1 pytest apps/api/tests/test_verifier.py -v -s` (single-claim smoke test, real-invalid-key fail-safe proof, adversarial `table_heavy.pdf` fixture, real 5-call concurrent batch latency)
+- Compound end-to-end: `RUN_VERIFICATION_QUALITY_TEST=1 pytest apps/api/tests/test_verifier.py -k verifies_a_real_generated -v -s` (real retrieval + generation + verification, confirms a FEAT-010 positionally-correct citation is also factually verified)
 
 ---
 
@@ -389,6 +396,7 @@ All 4/4 found their expected chunk in the top-5; 2/4 at rank 1, 2/4 at rank 2 (b
 - [ ] Cross-tenant document_ids in request → 403
 - [ ] `Retriever.retrieve()`'s `user_id` arg is passed `request.state.user_id` (JWT-verified, FEAT-003 middleware) — never a request-body/query-param value. `Retriever` has no HTTP/JWT awareness itself and does not re-validate this argument; `match_chunks_by_vector`/`match_chunks_by_fts`'s tenant isolation is real (WHERE-clause scoped, SQL-layer verified — see 2026-07-24 FEAT-009 self-audit) but trusts whatever `user_id` its caller supplies. This route is the first production caller of `Retriever.retrieve()` — get this wrong here and the SQL-layer scoping is moot.
 - [ ] Each of `Generator.generate()`'s `GenerateResult.cited_indices` (1-indexed positions into the `chunks` list, NOT chunk ids) is mapped back to a real `chunk_id` via `chunks[position - 1].chunk_id` — this route is the first production caller of `Generator.generate()`, and the mapping is `/query`'s responsibility, not something `Generator` does itself (see FEAT-010's acceptance criteria and 2026-07-24 FEAT-010 self-audit). Before calling `generate()`, `RetrievedChunk` rows (from `Retriever.retrieve()`, which carry no image data) must be adapted into `GeneratorChunk`s, fetching each figure chunk's image from Storage via `figure_path` first — `GeneratorChunk.__post_init__` will raise if a figure-typed chunk is constructed with no image, so a forgotten fetch fails loudly here rather than silently degrading to a text-only citation.
+- [ ] This route is the first production caller of `Verifier`. It owns claim-span extraction — splitting the generated answer into (claim_text, cited position) pairs around each `[N]` marker — since `Verifier.verify()` deliberately takes only already-resolved `(claim_text, chunk)` pairs and does no `[N]`-parsing itself. Call `verify_batch()` once per `generate()` answer with every extracted pair (reusing the SAME `GeneratorChunk`s already built for `generate()`, via `chunks[N-1]`), not one `verify()` call at a time. Per `.agent/ARCHITECTURE.md`'s verify flow: `supported` → citation chip renders normally; `partial` → citation chip renders with a warning icon, KEPT (not dropped); `unsupported` → citation dropped, marker stripped/tagged in answer text (this file's "Unsupported citations are dropped..." criterion above refers to this case specifically, not `partial`). A `Verdict.error` being set (a failed/unverifiable Gemini call, which `Verifier` itself already forces to `verdict=UNSUPPORTED`) must be treated exactly like a real unsupported verdict — dropped, never retried-and-assumed-fine or silently upgraded to `partial`/`supported`.
 
 **Run:**
 - `curl -X POST -H "Authorization: Bearer <jwt>" -d '{"question":"...","document_ids":["..."]}' http://localhost:8000/query`
