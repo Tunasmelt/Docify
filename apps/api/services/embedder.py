@@ -154,3 +154,31 @@ class Embedder:
             vectors.extend(result.embeddings)
 
         return vectors
+
+    def embed_query(self, text: str) -> Vector:
+        """Embeds a single natural-language query string for retrieval
+        (FEAT-009) — deliberately separate from embed(), which is for
+        ingestion-time Chunks and always uses input_type="document".
+        Voyage's embeddings are asymmetric: query-side and document-side
+        calls use different internal prefixes for better retrieval
+        quality (.agent/api-docs/voyage.md), so a query must never be
+        embedded with input_type="document". No batching needed — a
+        query is always exactly one input, never a list[Chunk]."""
+        try:
+            result = self._client.multimodal_embed(
+                inputs=[[text]],
+                model=MODEL,
+                input_type="query",
+                output_dimension=OUTPUT_DIMENSION,
+            )
+        except (RateLimitError, ServiceUnavailableError, Timeout) as exc:
+            raise EmbedError(f"Voyage query embedding failed after {MAX_RETRIES} attempts: {exc}") from exc
+        except VoyageError as exc:
+            raise EmbedError(f"Voyage query embedding failed: {exc}") from exc
+
+        if len(result.embeddings) != 1:
+            raise EmbedError(
+                f"Voyage returned {len(result.embeddings)} embeddings for a single query input — "
+                "refusing to return a mismatched result"
+            )
+        return result.embeddings[0]

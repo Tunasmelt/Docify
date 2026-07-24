@@ -291,21 +291,42 @@ Rule: a feature is not `complete` until acceptance criteria pass AND `/gap-check
 
 ### [FEAT-009] Retriever service (hybrid + RRF)
 **Phase:** 2
-**Status:** planned
+**Status:** complete
 **Owner:** claude-code
+**Depends on:** FEAT-001, FEAT-005, FEAT-006, FEAT-007
 **Files:**
-- `apps/api/services/retriever.py`
+- `apps/api/services/retriever.py` — `Retriever`, `RetrievedChunk`, `RRF_K` (=60), `DEFAULT_K` (=8), `_reciprocal_rank_fusion`
+- `apps/api/services/embedder.py` — new `Embedder.embed_query(text) -> Vector` method (query-side embedding, `input_type="query"`; distinct from `embed()`'s ingestion-side `input_type="document"` — Voyage's embeddings are asymmetric, see `.agent/api-docs/voyage.md`). Not in the original Files: list, but necessary — there was no existing way to embed a bare query string with the correct input_type.
+- `apps/api/migrations/20260724_001_hybrid_search_functions.sql` (new, not in the original Files: list either, same "necessary plumbing" class as FEAT-002/007/008's router wiring) — `match_chunks_by_vector` and `match_chunks_by_fts` Postgres functions. Neither pgvector cosine ranking (`embedding <=> query_embedding`) nor FTS ranking (`ts_rank`) is expressible through PostgREST's REST query builder (`.select()`/`.order()` only support plain column comparisons, not arbitrary SQL expressions in `ORDER BY`) — the standard, documented way to do this through Supabase's REST layer is a Postgres function called via `client.rpc(...)`, not raw SQL from app code. `EXECUTE` revoked from `PUBLIC` (Postgres's default), granted only to `service_role`.
 **Tests:**
-- `apps/api/tests/test_retriever.py`
+- `apps/api/tests/test_retriever.py` — 10 tests. 8 fast/structural (real local Postgres/pgvector/FTS, hand-crafted embeddings, no real Docling/Voyage — matches FEAT-006's own testing pattern) always run; 1 real end-to-end quality test gated behind `RUN_RETRIEVAL_QUALITY_TEST=1` (skipped by default — real Docling parse + real Voyage calls, slow, uses quota, same pattern as `test_ingest_e2e.py`)
 **Acceptance criteria:**
-- [ ] `Retriever.retrieve(question, document_ids, user_id, k) -> list[Chunk]`
-- [ ] Runs vector search (cosine) and BM25 (Postgres FTS) in parallel
-- [ ] Merges via Reciprocal Rank Fusion (k=60 default)
-- [ ] Returns top-k with metadata: chunk_id, content, page, document_name, element_type
-- [ ] user_id is included in every SQL WHERE clause explicitly
+- [x] `Retriever.retrieve(question, document_ids, user_id, k) -> list[RetrievedChunk]` — `test_retriever_retrieve_question_document_ids_user_id_k_list_chun`. Returns `RetrievedChunk`, not `chunker.Chunk` — deliberately a different type (ingestion-time chunk vs. a ranked search result with an id, fused score, and document name), documented in the dataclass's own docstring
+- [x] Runs vector search (cosine) and BM25 (Postgres FTS) in parallel — `test_runs_vector_search_cosine_and_bm25_postgres_fts_in_parallel`, proven via real wall-clock timing (two 0.4s-sleeping fake search methods complete in ~0.4s total, not ~0.8s), not just asserting both got called. Uses a `ThreadPoolExecutor` — the one place in this codebase that does real thread-level concurrency, since these are two genuinely independent read-only queries (see `.agent/reviews/2026-07-23-efficiency.md`'s note that most of this codebase's request handling is actually fully synchronous despite `async def`)
+- [x] Merges via Reciprocal Rank Fusion (k=60 default) — `RRF_K = 60`, verified distinct from `DEFAULT_K = 8` (the retrieval count) by name, by test, and by a doc-comment on `RRF_K` calling out the exact confusion risk this task flagged. `test_merges_via_reciprocal_rank_fusion_k_60_default` hand-computes expected fused scores for a case where vector search's own #1 pick and FTS's own #1 pick both individually lose to a chunk that ranked #2 (not #1) in *both* — the textbook demonstration of why fusion beats either single ranking
+- [x] Returns top-k with metadata: chunk_id, content, page, document_name, element_type — `test_returns_top_k_with_metadata_chunk_id_content_page_document_n`, asserts every field round-trips exactly and that top-k genuinely limits (a second, non-matching chunk is correctly excluded)
+- [x] user_id is included in every SQL WHERE clause explicitly — both `match_chunks_by_vector`/`match_chunks_by_fts` take `match_user_id` as an explicit function parameter and filter on it directly (see the migration), not relying on RLS (these functions are only ever called with the service-role client, which bypasses RLS entirely — the explicit filter is the actual tenant boundary, matching FEAT-007/008's established pattern). `test_user_id_is_included_in_every_sql_where_clause_explicitly` spies on the real `.rpc()` calls and asserts `match_user_id` is present in both
+
+**Multi-tenant isolation, same live-verification discipline as FEAT-007/008:** `test_multi_tenant_isolation_excludes_other_users_chunks` — two real users, **identical content and identical (maximally-matching) embedding** in both users' chunks (the strongest possible test: if scoping didn't work, user B's chunk would tie or beat user A's, not just "also show up"). Confirms user B's chunk never appears in user A's results, plus a positive control (user B can retrieve their own identical-looking chunk when correctly scoped to their own document/user_id) proving the absence is real scoping, not a broken query returning nothing for anyone. A second test (`test_document_ids_scoping_excludes_the_same_users_other_documents`) confirms `document_ids` scoping specifically — a second document owned by the *same* user is excluded when not named in `document_ids`.
+
+**Retrieval quality — the high-depth part, real results, not just pass/fail:** real `table_heavy.pdf` ingested through the real `Parser`/`Chunker`/`Embedder` (real Docling parse, real Voyage embeddings), 4 questions built from content read directly out of that real ingestion's actual chunk text (not assumed from memory of an earlier session), each with a manually-verified "this chunk should be in the top-k" expectation:
+
+| Question | Expected content | Result |
+|---|---|---|
+| What is Angola's Human Development Index value in 2010? | Table 19 (HDI), Angola row | **rank 1** of 5 |
+| Does Respondent C have a driving licence? | Table 14, "Do you have a driving licence?" row | **rank 1** of 5 |
+| What was the balance in the 2011 accounts? | Table 18 (accounts, 2011), "Balance" row | **rank 2** of 5 (Table 17, an earlier draft of the same accounts table sharing the same £-figures, ranked 1st — both are legitimately about the same balance) |
+| What courses does Institution X offer in Mathematics? | Table 15 (courses, Institution X), Mathematics row | **rank 2** of 5 (Table 16, "Masters courses offered by Institution X", ranked 1st — same institution, closely related table) |
+
+All 4/4 found their expected chunk in the top-5; 2/4 at rank 1, 2/4 at rank 2 (both times narrowly edged out by a genuinely closely-related table from the same document, not an irrelevant result). Full ranked output for all 4 questions is in the test's own `print()` output (`pytest tests/test_retriever.py::test_retrieval_quality_against_real_table_heavy_pdf -s`) and in CHANGELOG.md's entry for this feature.
+
+**A real infrastructure constraint hit and worked around honestly, not silently:** the quality test originally made 5 real Voyage calls in quick succession (1 document-embed for ingestion + 4 query-embeds) and hit a genuine `RateLimitError` — this Voyage account has no payment method on file, capping it at 3 RPM. Fixed by pacing real calls 25s apart in the test itself, with a comment explaining why — not a workaround for a bug in `Retriever` or `Embedder`, a real account-level constraint external to this code.
 
 **Run:**
-- `pytest apps/api/tests/test_retriever.py -v`
+- `pytest apps/api/tests/test_retriever.py -v` (fast, 8 structural tests)
+- `RUN_RETRIEVAL_QUALITY_TEST=1 pytest apps/api/tests/test_retriever.py::test_retrieval_quality_against_real_table_heavy_pdf -v -s` (slow, real Voyage calls, ~3.5 min due to rate-limit pacing)
+
+**Changelog:** See CHANGELOG.md 2026-07-24 "feature: Retriever service, hybrid search + RRF (FEAT-009)"
 
 ---
 
@@ -364,6 +385,7 @@ Rule: a feature is not `complete` until acceptance criteria pass AND `/gap-check
 - [ ] Creates conversation + message + citations rows atomically
 - [ ] Continuing an existing conversation appends messages correctly
 - [ ] Cross-tenant document_ids in request → 403
+- [ ] `Retriever.retrieve()`'s `user_id` arg is passed `request.state.user_id` (JWT-verified, FEAT-003 middleware) — never a request-body/query-param value. `Retriever` has no HTTP/JWT awareness itself and does not re-validate this argument; `match_chunks_by_vector`/`match_chunks_by_fts`'s tenant isolation is real (WHERE-clause scoped, SQL-layer verified — see 2026-07-24 FEAT-009 self-audit) but trusts whatever `user_id` its caller supplies. This route is the first production caller of `Retriever.retrieve()` — get this wrong here and the SQL-layer scoping is moot.
 
 **Run:**
 - `curl -X POST -H "Authorization: Bearer <jwt>" -d '{"question":"...","document_ids":["..."]}' http://localhost:8000/query`
@@ -468,4 +490,6 @@ Features here are placeholders until Phase 3 ships. Do not start unless Phase 3 
 
 Promoted from HANDOFF.md `## Agent Suggestions` inbox after review. Not yet scheduled into a phase.
 
-*(empty — populate as suggestions are promoted)*
+- **Embedder process-lifetime singleton** — safe per `.agent/reviews/2026-07-23-efficiency.md`'s concrete thread-safety assessment (tokenizer cache, Rust `tokenizers` backend, HTTP client all confirmed safe for concurrent use). Low risk, real win. Independent of Phase 5.
+- **Parser/DocumentConverter process-lifetime singleton + lock around `.parse()`** — captures the expensive model-loading reuse while sidestepping Docling's own unvalidated concurrent-`execute()` caveat (see the same review). Independent of Phase 5.
+- Both currently unimplemented — pick up opportunistically if/when this area is next touched, not urgent standalone work.
