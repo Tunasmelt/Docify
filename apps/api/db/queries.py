@@ -186,3 +186,69 @@ def remove_document_from_conversations(client, *, document_id: str, user_id: str
     for conversation in conversations:
         remaining = [d for d in conversation["document_ids"] if d != document_id]
         client.table("conversations").update({"document_ids": remaining}).eq("id", conversation["id"]).execute()
+
+
+def documents_owned_by_user(client, *, document_ids: list[str], user_id: str) -> set[str]:
+    """Returns the subset of `document_ids` that actually belong to
+    `user_id`. A caller comparing this against the full requested set
+    gets an identical result whether a given id doesn't exist at all or
+    belongs to someone else — same "don't give an attacker an oracle"
+    discipline as get_document()'s 404 handling (API_CONTRACT.md)."""
+    if not document_ids:
+        return set()
+    rows = client.table("documents").select("id").in_("id", document_ids).eq("user_id", user_id).execute().data
+    return {row["id"] for row in rows}
+
+
+def get_conversation(client, *, conversation_id: str, user_id: str) -> dict | None:
+    """Scoped to user_id in the query itself — same pattern as
+    get_document(). /query pre-checks conversation ownership with this
+    before calling create_query_turn() so an invalid conversation_id
+    gets a clean 404 without needing to inspect a Postgres exception
+    raised from inside the RPC function."""
+    rows = client.table("conversations").select("id,document_ids").eq("id", conversation_id).eq("user_id", user_id).execute().data
+    return rows[0] if rows else None
+
+
+def create_query_turn(
+    client,
+    *,
+    user_id: str,
+    conversation_id: str | None,
+    document_ids: list[str],
+    question: str,
+    answer_content: str,
+    answer_raw_content: str,
+    retrieved_chunk_ids: list[str],
+    answer_metadata: dict,
+    citations: list[dict],
+) -> dict:
+    """Wraps the create_query_turn RPC (migrations/20260724_002) — the
+    single atomic write for a /query turn: the conversation (if new),
+    both the user-question and assistant-answer message rows, and every
+    citation row (all verdicts, including unsupported — full audit
+    trail; /query itself filters the response, this stores everything).
+    Raises (via the underlying postgrest/RPC client) if the function
+    itself raises — conversation_id is expected to already be verified
+    as belonging to user_id by this point (get_conversation() above),
+    so that should only happen on a genuine race condition, not a normal
+    client error."""
+    result = (
+        client.rpc(
+            "create_query_turn",
+            {
+                "p_user_id": user_id,
+                "p_conversation_id": conversation_id,
+                "p_document_ids": document_ids,
+                "p_question": question,
+                "p_answer_content": answer_content,
+                "p_answer_raw_content": answer_raw_content,
+                "p_retrieved_chunk_ids": retrieved_chunk_ids,
+                "p_answer_metadata": answer_metadata,
+                "p_citations": citations,
+            },
+        )
+        .execute()
+        .data
+    )
+    return result[0]

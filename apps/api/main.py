@@ -5,7 +5,7 @@ load_dotenv()  # must run before any module below reads env vars at import/const
 from fastapi import FastAPI
 
 from middleware.auth import JWTAuthMiddleware
-from routes import documents, health, ingest
+from routes import documents, health, ingest, query
 
 app = FastAPI(title="docify-api")
 
@@ -14,3 +14,4 @@ app.add_middleware(JWTAuthMiddleware)
 app.include_router(health.router)
 app.include_router(ingest.router)
 app.include_router(documents.router)
+app.include_router(query.router)

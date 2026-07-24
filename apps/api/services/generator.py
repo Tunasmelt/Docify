@@ -49,14 +49,21 @@ SYSTEM_INSTRUCTION = (
 # still parses as its own bracket, but content preceding a nested `[`
 # is dropped rather than guessed at — judged reasonably out-of-scope,
 # not a shape Gemini has been observed producing.
-_CITATION_BRACKET = re.compile(r"\[([^\[\]]*)\]")
+#
+# Public (not `_`-prefixed): FEAT-012 needs the IDENTICAL bracket/number
+# parsing to extract claim spans and strip dropped-citation markers from
+# the answer text — reusing these constants directly guarantees claim
+# extraction and citation validation can never silently disagree on what
+# counts as a marker, rather than risking a second, independently
+# maintained regex drifting from this one over time.
+CITATION_BRACKET = re.compile(r"\[([^\[\]]*)\]")
 # `-?` matters: without it, `\d+` strips a leading minus sign from `[-1]`
 # and silently extracts "1" as a VALID citation to chunk 1 — a self-audit
 # found this treats `[-1]` differently from `[0]` (correctly flagged
 # hallucinated, since 0 is out of the 1-indexed range), when both should
 # fail the same way. Capturing the sign lets `int("-1") == -1` fail the
 # same `1 <= n <= num_chunks` range check `[0]` already fails.
-_CITATION_NUMBER = re.compile(r"-?\d+")
+CITATION_NUMBER = re.compile(r"-?\d+")
 
 
 class GenerationError(Exception):
@@ -146,8 +153,8 @@ def _parse_citations(answer: str, num_chunks: int) -> tuple[list[int], list[int]
     seen_cited: set[int] = set()
     seen_hallucinated: set[int] = set()
 
-    for bracket in _CITATION_BRACKET.finditer(answer):
-        for raw in _CITATION_NUMBER.finditer(bracket.group(1)):
+    for bracket in CITATION_BRACKET.finditer(answer):
+        for raw in CITATION_NUMBER.finditer(bracket.group(1)):
             n = int(raw.group())
             if 1 <= n <= num_chunks:
                 if n not in seen_cited:

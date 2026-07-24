@@ -173,7 +173,7 @@ Ask a question over one or more documents.
 {
   "conversation_id": "6c1a...",
   "message_id": "9f4d...",
-  "answer": "Q3 revenue was $4.2M [1], up 18% year-over-year [2].",
+  "answer": "Q3 revenue was $4.2M [1], up 18% year-over-year [2], driven by strong international demand [3].",
   "citations": [
     {
       "marker": 1,
@@ -196,13 +196,24 @@ Ask a question over one or more documents.
       "snippet": "| Q2 | $3.56M | | Q3 | $4.20M |",
       "verdict": "supported",
       "supporting_quote": "Q3 $4.20M"
+    },
+    {
+      "marker": 3,
+      "chunk_id": "d4a7...",
+      "document_id": "3f9e...",
+      "document_name": "annual-report-2025.pdf",
+      "page_number": 15,
+      "element_type": "text",
+      "snippet": "Growth was broad-based across all regions this quarter.",
+      "verdict": "partial",
+      "supporting_quote": "Growth was broad-based across all regions this quarter"
     }
   ],
   "metadata": {
     "model": "gemini-3.6-flash",
     "verifier_model": "gemini-3.5-flash-lite",
     "retrieved_count": 8,
-    "cited_count": 2,
+    "cited_count": 3,
     "latency_ms": 3420
   }
 }
@@ -212,7 +223,10 @@ Ask a question over one or more documents.
 - If `conversation_id` omitted, creates a new conversation
 - If `conversation_id` provided, appends to it (must belong to user)
 - Runs hybrid retrieval → generation → verification pipeline (see ARCHITECTURE.md)
-- Any citation with `verdict: 'unsupported'` is dropped from the returned array; the corresponding marker in the answer text is stripped
+- `verdict` is one of `supported` | `partial` | `unsupported` (see ARCHITECTURE.md's verify flow), and each is treated differently in this response:
+  - `supported` — citation is kept in the `citations` array as-is; the answer text keeps its `[N]` marker
+  - `partial` — citation is **kept** in the `citations` array (same as `supported`, never dropped); the client renders it with a warning indicator, since the source only partially backs the claim (e.g. the marker-3 example above: the source confirms broad-based growth but not specifically "international demand" — kept so the reader can judge the source themselves, not silently hidden)
+  - `unsupported` — citation is **dropped** from the `citations` array; the corresponding `[N]` marker is stripped from `answer`
 
 **Errors:**
 - `403 FORBIDDEN` if any `document_ids` don't belong to user

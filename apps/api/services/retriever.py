@@ -38,6 +38,7 @@ class RetrievedChunk:
     chunk_id: str
     content: str
     page: int
+    document_id: str
     document_name: str
     element_type: str
     score: float  # the fused RRF score — higher is more relevant
@@ -114,6 +115,7 @@ class Retriever:
                 chunk_id=row["id"],
                 content=row["content"],
                 page=row["page_number"],
+                document_id=row["document_id"],
                 document_name=row["document_name"],
                 element_type=row["element_type"],
                 score=score,
