@@ -526,23 +526,54 @@ caused a real timeout unrelated to the fix itself, see `playwright.config.ts`'s 
 
 ### [FEAT-014] Upload UI + document list
 **Phase:** 3
-**Status:** planned
-**Owner:** claude-design
+**Status:** tested
+**Owner:** claude-design (shell/UI, prior pass) + claude-code (real API wiring, this pass)
 **Files:**
-- `apps/web/app/(app)/documents/page.tsx`
-- `apps/web/components/documents/upload-zone.tsx`
-- `apps/web/components/documents/document-card.tsx`
-- `apps/web/lib/api/client.ts`
+- `apps/web/app/(app)/documents/page.tsx` — real `GET /documents` on load, generation-guarded polling (see race-condition fix below), real delete wiring, distinct loading/error/empty states
+- `apps/web/components/documents/upload-zone.tsx` — real direct-to-Storage upload + `POST /ingest`, honest indeterminate progress (no fabricated percentage — see Decision below)
+- `apps/web/components/documents/document-card.tsx` — unchanged; already purely presentational, no mocked internals to wire
+- `apps/web/components/documents/delete-confirm-dialog.tsx` — `error`/`deleting` props added for real 409/`STORAGE_ERROR` display
+- `apps/web/lib/api/documents.ts` (new) — `listDocuments`, `getDocument`, `deleteDocument`, `uploadDocument`, shared `apiFetch` with real `ApiError`/401 handling
+- `apps/web/lib/status-styles.ts` — verified unchanged (see below)
+- `apps/web/tailwind.config.ts` — `indeterminate`/`indeterminate-bar` keyframe+animation added for the honest upload-progress state
+- `apps/api/main.py` — **CORS middleware added; none existed at all** (see Gap below)
 **Tests:**
-- `apps/web/e2e/upload.e2e.ts`
+- `apps/web/e2e/upload.e2e.ts` (real `@playwright/test` suite — 6 tests, all against the local Supabase stack + a live local FastAPI backend, none mocked)
 **Acceptance criteria:**
-- [ ] Drag-drop or click-to-select PDF
-- [ ] Upload progress bar
-- [ ] Document appears in list immediately with status 'parsing'
-- [ ] Status updates via polling (initial: every 2s while not ready/failed, max 60s)
-- [ ] Delete confirmation modal
-- [ ] Empty state when no docs
-- [ ] Error state when upload fails
+- [x] Drag-drop or click-to-select PDF (click-path exercised in tests; both funnel through the same `handleFiles`)
+- [x] Upload progress bar — honest indeterminate state, not a fabricated percentage (see Decision)
+- [x] Document appears in list immediately with the **real** status, which is `'Uploaded'`, not `'parsing'` — the acceptance criterion's own wording was stale, matching the exact same correction API_CONTRACT.md already documented for FEAT-007 (an earlier draft example wrongly showed `"status": "parsing"`; the endpoint's 202 response always reflects the literal just-inserted `'uploaded'` row). Verified against real SCHEMA.md enum and live response, not assumed from the criterion text.
+- [x] Status updates via polling — implemented as 2s-base exponential backoff (×1.5, capped at 60s), never permanently gives up as long as any document is non-terminal (see Decision on interpreting "initial: every 2s... max 60s")
+- [x] Delete confirmation modal — real `DELETE /documents/{id}`, real 409 (`"still being parsed"`) and `STORAGE_ERROR` (`"safe to retry"`) copy, no raw error dump
+- [x] Empty state when no docs
+- [x] Error state when upload fails (client-side non-PDF rejection, real and tested; server-side pipeline failure confirmed live but not as a permanent CI test — see item 8 verification below)
+
+**Verified against real backend source, not assumed:** `lib/status-styles.ts`'s 5-status `DOCUMENT_STATUS_STYLES` map (`uploaded | parsing | embedded | ready | failed`) was checked directly against `SCHEMA.md`'s `document_status` enum and `routes/documents.py`'s own `_VALID_STATUSES` set — exact match, no fix needed. The earlier addition of `embedded` (ahead of the original 4-status mock) guessed correctly.
+
+**Decision — direct browser-to-backend calls, not a Next.js API proxy layer:** ARCHITECTURE.md's ingest-flow diagram describes a `Next.js API route /api/ingest` intermediary that validates the JWT and forwards to FastAPI. That layer was never built (`app/api/` is still an empty `.gitkeep`) and doesn't match what FEAT-013 actually wired (`NEXT_PUBLIC_API_URL`, a public env var, plus a direct `Authorization: Bearer` pattern already proven end-to-end in FEAT-013's priority JWT cross-stack check). Followed the real, already-proven pattern instead of the stale diagram — `lib/api/documents.ts` calls FastAPI directly from the browser.
+
+**Decision — honest indeterminate upload progress, not a fabricated percentage:** confirmed via the installed `@supabase/storage-js` source (`StorageFileApi.ts`) that `upload()` is fetch-based internally with no `onUploadProgress` option anywhere in its type signature or implementation — there is no real byte-level progress available. The prior mock's fake interval-driven percentage was actively misleading (implying real progress data that doesn't exist). Replaced with an indeterminate sliding-bar animation (`indeterminate-bar`, reusing the existing design system's animation-token pattern) and "UPLOADING…" text instead.
+
+**Decision — polling backoff interpretation:** the acceptance criterion "initial: every 2s while not ready/failed, max 60s" is ambiguous between "poll for at most 60s total then give up" and "back off up to a 60s ceiling, never giving up." Implemented the latter — a hard cutoff would permanently strand the UI on a stale status for any document whose real pipeline genuinely takes longer than 60s (confirmed this is a real, not just hypothetical, scenario — see the `table_heavy.pdf` verification below, which took several minutes under real Voyage rate-limit backoff and would have been abandoned by a hard 60s cutoff despite completing successfully).
+
+**Real gap found and fixed — no CORS middleware existed on the backend at all.** Confirmed via `Grep` across all of `apps/api`: zero matches for CORS/`allow_origin` anywhere. Every real cross-origin `fetch` from the browser (a different origin than the backend, always, regardless of hostname) would have been blocked before ever reaching a route — this would have made the entire wiring pass impossible to verify live, not just an edge case. Added `CORSMiddleware` to `apps/api/main.py`, ordered **after** `JWTAuthMiddleware` (Starlette wraps middlewares in reverse registration order — the last added is outermost and runs first, which is required so the browser's credential-less `OPTIONS` preflight is handled before `JWTAuthMiddleware` would otherwise reject it with 401). Confirmed live: `curl -X OPTIONS` preflight against `/documents` returns `200` with correct `Access-Control-Allow-*` headers and critically no 401.
+
+**Real bug found live and fixed — a stale in-flight poll response could resurrect a just-deleted document.** While live-testing the delete flow, a genuinely deleted document (confirmed via a real `204` response) reappeared in the UI moments later. Root cause, confirmed via network-response timestamps: `pollTick`'s `GET /documents` can still be in flight when the user deletes a document; if that stale response is applied after the fact via a bare `setDocs(result.documents)`, it silently overwrites the newer (post-delete) state with the pre-delete snapshot. Fixed with a generation counter (`docsGenerationRef`) — every authoritative docs update (`commitDocs`, used by initial load, retry, upload, delete) bumps it; `pollTick` captures the generation before its own network call and discards its result if the generation moved on while it was in flight. Live-reproduced with the buggy version reverted temporarily for contrast: without the guard, the deleted document visibly reappeared; with it, deletion holds.
+
+**PRIORITY verification (item 8) — real PDF through the real pipeline via the real UI, proven twice:**
+- `clean_digital.pdf` (small, fast): fully proven as a **permanent, passing e2e test** (`upload.e2e.ts`) — real upload → real status transitions observed via real polling (not a reload) → real `Ready` → real delete → confirmed gone, including after a page reload (rules out optimistic-only local state).
+- `table_heavy.pdf` (the fixture this task explicitly named): uploaded via the real UI, real Docling parse, hit a **real external constraint** — Voyage API's free-tier rate limit (`3 RPM`), exhausted from this session's cumulative testing — triggering the embedder's real retry-with-backoff path (`services/embedder.py`'s `MAX_RETRIES`). Took several minutes under that backoff, well past a naive 60s ceiling, but the document **did reach `ready`**, confirmed directly against the database (`status: ready`) after the UI's own polling window had been given up on by the test script (not by the app itself — the app's own uncapped backoff was still correctly polling). This is exactly why the "never give up" polling interpretation above was the right call, discovered empirically rather than assumed. Cleaned up the resulting test document afterward.
+- Also surfaced (not previously logged anywhere — checked `.agent/GAPS.md` before writing this, this is a new finding, not a re-confirmation) a real delete-vs-in-flight-pipeline race: a `chunks_document_id_fkey` violation when a document row is removed while its background task is still writing chunks. `DELETE /documents/{id}`'s `409` check only blocks `status == 'parsing'` — a document in `'embedded'` also still has an in-flight background task (figure upload + chunk insert + `mark_ready` haven't run yet) but isn't blocked. Surfaced here by this session's own aggressive test-cleanup (deleting a test user, which cascades to their documents via FK, while a pipeline was still mid-flight) — not exploitable the same way by a real user deleting their own single document through the normal UI (no cascade-via-user-deletion path is exposed there), but the underlying race is real and worth a dedicated look. Logged properly in `.agent/GAPS.md` rather than left as a one-line aside — out of scope to fix in this wiring-correctness pass.
+
+**Multi-tenant sanity check (item 9):** two real users, real separate browser contexts — user B (uploaded nothing) never sees user A's document, confirmed both before and after a reload. Structurally guaranteed by FEAT-008's `user_id`-scoped queries; this is the UI-layer confirmation.
+
+**401 mid-session verification — real, live-proven, not assumed.** This took significant live investigation to reproduce correctly: the Supabase JS client transparently auto-refreshes near-expiry access tokens inside `getSession()` (confirmed via the installed `@supabase/auth-js` source), and additionally preserves a still-real-time-valid session even after a *failed* refresh attempt (`__loadSession()`'s `accessTokenStillValid` fallback, also confirmed via source) — so a merely-expired access token alone never actually reaches the UI as a dead session in normal use. A genuinely dead session requires the refresh token itself to be invalid AND the access token's real (not just client-side-cached) expiry to have passed. Reproduced live by corrupting only the stored `refresh_token` (leaving the real, signed `access_token` untouched, avoiding both the "caught by `middleware.ts` first" false path from a corrupted signature and the "cascades away the test document" false path from deleting the underlying user) and waiting past real expiry: confirmed via console instrumentation that `getSession()` correctly returned `session: null`, `getAccessToken()` correctly detected it and called `forceReauth()`, `signOut()` resolved cleanly, and the browser genuinely navigated to `/login`. Debug instrumentation removed after confirming; not kept as a permanent test (requires temporarily shortening `jwt_expiry`, the same protocol already established in FEAT-013's middleware audit).
+
+**Full suite: 16/16 e2e tests passing** (7 auth + 3 password-reset + 6 upload/documents), single-worker (established in FEAT-013's audit — concurrent workers against the same real dev server/local Supabase instance caused real, non-representative timeouts). `tsc --noEmit` clean.
+
+**Run:** (from `apps/web`, with `apps/api`'s local-stack-pointed `uvicorn` also running — see FEAT-013's entry for the exact env-var-override invocation)
+- `pnpm dev`
+- `pnpm e2e` (requires `supabase start` and the backend both running first)
 
 ---
 
