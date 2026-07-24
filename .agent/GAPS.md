@@ -38,3 +38,43 @@ The Codex review above flagged (WARNING) that RLS enforcement had never been pro
 **RESOLVED on the live project as of the FEAT-004 session (2026-07-22).** `20260722_002_grant_table_privileges.sql` has been applied to the live Supabase project (`nbrfjbjjjhawscncshdz`) via the dashboard SQL editor, same as `001`. Not independently re-verified with the live-enforcement script from this entry (that was only run locally) — worth doing before FEAT-007+ (`/ingest`, `/query`) writes real data there for the first time.
 
 **Local Supabase stack:** left running (`http://127.0.0.1:54321`, DB on `:54322`) rather than torn down — useful for FEAT-004+ integration tests per STANDARDS.md ("No mocking of Supabase in integration tests — use `supabase start`"). Stop with `npx supabase stop` from `apps/api/` if not wanted.
+
+## FEAT-013 self-audit fixes (2026-07-24) — OAuth completion untestable in this environment
+
+The self-audit found `signInWithOAuth("google")` had no callback route at all (item 1) and
+`resetPasswordForEmail` links landed on a dead-end login form (item 2) — both share the exact
+same root cause (PKCE code-exchange), both fixed by `app/auth/callback/route.ts` +
+`app/account/update-password/page.tsx`. The password-recovery half is fully live-verified
+end-to-end (real Mailpit email → real link → real code exchange → real password update → real
+login with the new password — `apps/web/e2e/password-reset.e2e.ts`).
+
+- [ ] **NOT independently verifiable here: completing a real Google OAuth sign-in.** Two separate
+  blockers, neither fixable from this environment: (1) the local Supabase project has no
+  `[auth.external.google]` client configured at all — `curl .../authorize?provider=google` returns
+  `"Unsupported provider: provider is not enabled"` before ever reaching Google; (2) even with a
+  real client configured, completing Google's actual consent screen requires a real Google account
+  and can't be automated by an agent (Google actively blocks headless/scripted logins). What WAS
+  proven live: the callback route's PKCE code-exchange mechanism itself, using the identical
+  contract OAuth and password-recovery both share (confirmed via `flowType: "pkce"` in
+  `@supabase/ssr`'s installed source) — exercised end-to-end through the recovery flow, and the
+  callback route's error path was separately exercised with a bogus code
+  (`password-reset.e2e.ts`'s second test).
+  **Action needed before shipping OAuth:** once a real Google OAuth client is configured (likely
+  at deploy time, per FEAT-013's original scope), manually click through "Continue with Google" in
+  a real browser once and confirm: (a) Google's consent screen appears, (b) after approving, the
+  browser lands on `/documents` with a real session (check dev tools → Application → Cookies for
+  `sb-*-auth-token`), (c) a second visit to `/login` while that session is active redirects
+  straight back to `/documents` (proving the session persisted, not just the initial redirect).
+  Also add the deployed domain to `config.toml`'s (or the hosted project's)
+  `additional_redirect_urls` — the callback route's `next` param handling doesn't need changes for
+  this, only GoTrue's own allowlist does.
+
+**Also worth knowing (not a code bug, a local-dev-environment trap):** GoTrue's redirect-URL
+allowlist (`site_url`/`additional_redirect_urls` in `config.toml`) is pinned to `127.0.0.1:3000`.
+Accessing the local dev server via `http://localhost:3000` instead of `http://127.0.0.1:3000`
+causes GoTrue to silently reject the app's `redirectTo` and fall back to a bare `site_url`
+redirect with no path — this exact thing broke the password-reset e2e test the first time it ran,
+traced via the redirect chain's real `Location` headers, not guessed. `playwright.config.ts` now
+pins `baseURL`/`webServer.url` to `127.0.0.1:3000` for this reason. If accessing the app manually
+in a browser during local dev, use `http://127.0.0.1:3000`, not `http://localhost:3000`, or
+password-reset/OAuth redirects will silently misbehave.

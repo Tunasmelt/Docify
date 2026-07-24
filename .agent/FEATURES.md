@@ -428,22 +428,99 @@ All 4/4 found their expected chunk in the top-5; 2/4 at rank 1, 2/4 at rank 2 (b
 
 ### [FEAT-013] Next.js app shell + Supabase Auth
 **Phase:** 3
-**Status:** planned
-**Owner:** claude-design + gemini (auth wiring)
+**Status:** tested
+**Owner:** claude-design (shell/UI) + claude-code (auth wiring)
 **Files:**
 - `apps/web/app/layout.tsx`
-- `apps/web/app/(auth)/login/page.tsx`
-- `apps/web/app/(auth)/signup/page.tsx`
-- `apps/web/middleware.ts`
-- `apps/web/lib/supabase/browser.ts` + `server.ts`
+- `apps/web/app/(auth)/login/page.tsx` — real `signInWithPassword`, `signInWithOAuth("google")`, `resetPasswordForEmail`
+- `apps/web/app/(auth)/signup/page.tsx` — real `signUp`, password-confirmation validation, handles both immediate-session and email-confirmation-required outcomes
+- `apps/web/middleware.ts` — protects all `(app)/*` routes via `getClaims()`, redirects both directions ((un)authenticated ↔ `/login`/`/signup`); `/auth/*` exempted (see self-audit fixes below)
+- `apps/web/lib/supabase/browser.ts` + `server.ts` — `@supabase/ssr` client/server clients
+- `apps/web/components/layout/sidebar.tsx` (`onSignOut` affordance added — none existed pre-wiring; the reference screens this shell was translated from didn't show one)
+- `apps/web/app/(app)/documents/page.tsx`, `apps/web/app/(app)/chat/[conversation_id]/page.tsx` (sign-out handler wired: `supabase.auth.signOut()` + redirect)
+- `apps/web/app/auth/callback/route.ts` — PKCE code-exchange callback, added in the self-audit fix pass below
+- `apps/web/app/account/update-password/page.tsx` — added in the self-audit fix pass below
 **Tests:**
-- `apps/web/e2e/auth.e2e.ts`
+- `apps/web/e2e/auth.e2e.ts` (real `@playwright/test` suite — 8 tests, all against the local Supabase stack, none mocked)
+- `apps/web/e2e/password-reset.e2e.ts` (3 tests, added in the self-audit fix pass below)
 **Acceptance criteria:**
-- [ ] Login with email/password works
-- [ ] Signup creates a Supabase Auth user
-- [ ] Google OAuth flow works
-- [ ] Protected routes redirect unauthenticated users to /login
-- [ ] Layout has navigation shell (sidebar + top bar)
+- [x] Login with email/password works
+- [x] Signup creates a Supabase Auth user
+- [x] Google OAuth flow works (verified the button initiates the real redirect to Google's/GoTrue's `/auth/v1/authorize` endpoint; completing external Google consent isn't automatable without a real Google account, so that leg is unverified by design, not by oversight — see self-audit item 1 and `.agent/GAPS.md`)
+- [x] Protected routes redirect unauthenticated users to /login
+- [x] Layout has navigation shell (sidebar + top bar)
+
+**Decision — test runner:** `/test-scaffold` generated a jest-style `.e2e.ts` stub, but no test runner existed in `apps/web`. Added `@playwright/test` as a real, permanent dependency (`playwright.config.ts`, `testMatch: "**/*.e2e.ts"` to keep the scaffold's naming convention) rather than leaving an unusable stub — matches this project's real-infrastructure-testing discipline already established on the backend (`apps/api/tests/_local_supabase.py`); `apps/web/e2e/_local-supabase.ts` mirrors it for Node.
+
+**Decision — env var naming:** current live Supabase docs (fetched 2026-07-24, see `.agent/api-docs/supabase.md`) use `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` terminology now. Kept this repo's existing `NEXT_PUBLIC_SUPABASE_ANON_KEY` name instead of renaming an already-wired convention — both key formats work identically as the client's `apikey` header; no functional difference.
+
+**PRIORITY verification — real frontend JWT accepted by FEAT-003's backend middleware:** signed in through the real UI (Playwright, not mocked), captured the real session's `access_token` off the network response, decoded it (`alg: ES256`, `iss: http://127.0.0.1:54321/auth/v1`, `aud: authenticated`, `sub: <real user id>`), then called the live FastAPI dev server's `GET /documents` directly with it. Backend was pointed at the same local Supabase project via OS-env-var overrides (`SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY`, same `load_dotenv(override=False)` pattern `conftest.py` already used) — **200, `{"documents":[],"next_cursor":null}`**, the correct empty result for a brand-new user, proving both JWT acceptance and `user_id` scoping. This is the first time a real browser-issued token has been checked against FEAT-003's JWKS/ES256 middleware; confirmed, not assumed from separate correctness.
+
+**Verified live, local Supabase stack only (never production):** real signup creates a real, queryable local Auth user; real login with those credentials succeeds; unauthenticated → `/login` and authenticated-hitting-`/login` → `/documents` both redirect correctly (`middleware.ts`'s `getClaims()` branch, not just the client-side post-login `router.push`); sign-out terminates the session (`supabase.auth.signOut()`) such that a subsequent request to `/documents` redirects again. Visual regression: `/login` and `/signup` re-screenshotted post-wiring (light, dark, mobile, and a real invalid-credentials error state) — no layout disturbance from the new form-state/error/loading logic.
+
+**Run:** (from `apps/web`)
+- `pnpm dev` (reads `.env.development.local` for the local Supabase stack in dev mode, ahead of `.env.local`'s production values)
+- `pnpm e2e` (requires `supabase start` first)
+
+**2026-07-24/25 self-audit fixes — three confirmed dead ends, all fixed and live-verified:**
+
+A dedicated self-audit (same day as the wiring above) found two confirmed dead ends sharing one
+root cause, plus one real middleware bug:
+
+- [x] **Item 1 — no OAuth/PKCE callback route existed at all.** `signInWithOAuth("google")`
+  pointed `redirectTo` straight at `/documents`, never exchanging the returned `?code=` for a
+  session (`@supabase/ssr`'s browser client hardcodes `flowType: "pkce"`, confirmed via installed
+  source). **Fix:** `app/auth/callback/route.ts` — `exchangeCodeForSession(code)`, routes to
+  `next` (query param) on success, `/login?error=...` on failure. Cannot be fully live-tested:
+  the local Supabase project has no Google client configured
+  (`.../authorize?provider=google` → `"Unsupported provider"`), and completing Google's real
+  consent screen isn't automatable regardless — see `.agent/GAPS.md` and `.agent/MEMORY.md`'s
+  §Open questions for the manual verification checklist to run once a real client exists. The
+  shared PKCE mechanism itself IS fully proven, via item 2's live end-to-end test.
+- [x] **Item 2 — password reset had no completion page; a valid recovery code landed inertly on
+  the ordinary login form.** Same callback route fixes this (recovery links pass
+  `next=/account/update-password`). New `app/account/update-password/page.tsx` calls
+  `supabase.auth.updateUser({ password })`. **Live-verified fully end-to-end**
+  (`e2e/password-reset.e2e.ts`): real signup → real `resetPasswordForEmail` → real email
+  retrieved from the local Mailpit mail catcher (`INBUCKET_URL`/`MAILPIT_URL` point at the same
+  host — only Mailpit's own API works, not classic Inbucket's) → real link clicked → real PKCE
+  exchange → real password set → old password rejected, new password succeeds a completely
+  separate fresh login.
+  **Bonus bug found and fixed while verifying this live:** Next.js 14.2.35's dev server reports
+  `new URL(request.url).origin` as `http://localhost:3000` inside a Route Handler regardless of
+  which host the client actually connected with (confirmed via direct `curl` against
+  `127.0.0.1:3000`) — since GoTrue's redirect allowlist (`config.toml`'s `site_url`) is pinned to
+  `127.0.0.1:3000`, this silently broke the whole flow (browser lands on a different origin than
+  the one holding the session cookie). Fixed by preferring the real `Host`/`x-forwarded-host`
+  header over `request.url`'s own origin (`resolveOrigin()` in the callback route) — the official
+  Supabase example code doesn't account for this. Also required pinning
+  `playwright.config.ts`'s `baseURL`/`webServer.url` to `127.0.0.1:3000` (was `localhost:3000`) to
+  match. Full trace evidence and the exact fix are in `.agent/api-docs/supabase.md`.
+- [x] **Item 4 — middleware dropped refreshed session cookies on both redirect branches.**
+  `NextResponse.redirect(url)` was constructed fresh in both branches, structurally disconnected
+  from the `response` object `setAll` had mutated with any refreshed session cookies — a gotcha
+  this project's own doc cache had already flagged from the original wiring pass but the code
+  didn't follow. **Fix:** both branches now copy `response.cookies.getAll()` onto the redirect
+  response before returning (Next.js's `ResponseCookies` has no bulk `setAll` — the official
+  fetched pattern's exact method name didn't type-check; ground truth came from `tsc`, not the
+  doc summary — see `.agent/api-docs/supabase.md`). **Live A/B-verified, not just code-reviewed:**
+  temporarily set local `jwt_expiry` to 10s, signed in, waited past expiry, then hit `/login`
+  (the affected branch) with the now-expired-but-refresh-eligible session cookie via a raw
+  `fetch` — inspected the real `Set-Cookie` response headers directly. Buggy code: `0` Set-Cookie
+  headers (session silently dropped). Fixed code: `1` Set-Cookie header carrying a genuinely
+  rotated token value (confirmed different from the pre-wait cookie). Reverted `jwt_expiry` and
+  restarted the local stack (reapplied all four migrations) afterward.
+- [x] **Item 3 — login page silently rendered as normal for a stray/expired `?code=` or
+  `?error=`.** Now reads both via `useSearchParams()` (wrapped in `Suspense`, required by
+  Next.js) and shows a real message instead of a bare sign-in form — live-verified for both the
+  callback route's own forwarded error and a directly-bookmarked stale `?code=`
+  (`password-reset.e2e.ts`'s second and third tests).
+
+**Full suite after the fix pass: 10/10 e2e tests passing** (8 from the original wiring pass + 2
+new full-flow tests, run single-worker — `fullyParallel: false` alone wasn't enough once a second
+test file existed; concurrent workers contending for the same dev server/local Supabase instance
+caused a real timeout unrelated to the fix itself, see `playwright.config.ts`'s `workers: 1`).
+`tsc --noEmit` clean.
 
 ---
 

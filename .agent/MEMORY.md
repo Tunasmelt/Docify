@@ -79,6 +79,22 @@ Things that need human input before proceeding. Do not assume answers.
 **Leaning:** Polling (simpler, works everywhere, no websocket setup).
 **Blocking:** Not blocking; FEAT-014 defaults to polling.
 
+### 2026-07-24 [claude-code] — Google OAuth sign-in completion has never been verified end-to-end
+**Context:** FEAT-013 self-audit found the OAuth callback was entirely missing (fixed same day —
+`app/auth/callback/route.ts`, shares its PKCE code-exchange mechanism with password recovery,
+which IS fully live-verified end-to-end). Completing an actual Google sign-in could not be tested
+from this environment for two independent reasons: the local Supabase project has no
+`[auth.external.google]` client configured (`.../authorize?provider=google` returns `"Unsupported
+provider"` before ever reaching Google), and even with one configured, completing Google's real
+consent screen requires a real Google account and can't be automated by an agent regardless
+(Google blocks headless/scripted logins). See `.agent/GAPS.md`'s matching entry for the full
+mechanism proof and the manual verification checklist to run once a real client exists.
+**Leaning:** The shared code-exchange mechanism is proven; only Google's own consent screen and
+the resulting real session are unverified. Low risk, but not zero — do not assume it works.
+**Blocking:** Blocking for shipping OAuth specifically (not for the rest of FEAT-013). Needs a
+real Google OAuth client (likely at deploy time) and one manual click-through before considering
+OAuth sign-in done, not just "the code looks right."
+
 ---
 
 ## §Decision log
@@ -135,6 +151,12 @@ Every fork, what was chosen, why. Append-only.
 **Chosen:** Gemini — `gemini-3.6-flash` for generation, `gemini-3.5-flash-lite` for citation verification.
 **Reasoning:** Consolidating all LLM calls onto a single provider. Gemini was already in the stack for OCR fallback (`gemini-2.5-flash`), so this removes the Anthropic SDK dependency and the second API credential entirely rather than running two providers side by side. Verified current model IDs via `/api-check gemini` on 2026-07-22 (cached in `.agent/api-docs/gemini.md`). Voyage (embeddings) is unaffected — different provider, different decision.
 **Changed:** `AGENT.md`, `.agent/ARCHITECTURE.md`, `.agent/API_CONTRACT.md`, `.agent/FEATURES.md`, `.agent/MEMORY.md` (this entry), `.agent/api-docs/gemini.md` (new).
+
+### 2026-07-24 [claude-code] — Agent rotation: gemini dropped as of FEAT-013
+**Alternatives considered:** Keeping the four-agent rotation from the 2026-07-22 user override.
+**Chosen:** Two agents — claude-code, claude-design. gemini's row removed from AGENT.md's §AGENT ROLES table; FEAT-013's owner changed from `claude-design + gemini (auth wiring)` to `claude-design (shell/UI) + claude-code (auth wiring)`.
+**Reasoning:** Simplified to two agents based on how the project actually developed — claude-code absorbed everything gemini was scoped to own (frontend↔backend wiring, auth flows, integration glue).
+**Changed:** `AGENT.md` (§AGENT ROLES table), `.agent/FEATURES.md` (FEAT-013 owner), `.agent/MEMORY.md` (this entry).
 
 ---
 
