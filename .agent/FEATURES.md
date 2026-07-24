@@ -332,7 +332,7 @@ All 4/4 found their expected chunk in the top-5; 2/4 at rank 1, 2/4 at rank 2 (b
 
 ### [FEAT-010] Gemini generator wrapper
 **Phase:** 2
-**Status:** planned
+**Status:** complete
 **Owner:** claude-code
 **Files:**
 - `apps/api/services/generator.py`
@@ -340,10 +340,12 @@ All 4/4 found their expected chunk in the top-5; 2/4 at rank 1, 2/4 at rank 2 (b
 **Tests:**
 - `apps/api/tests/test_generator.py`
 **Acceptance criteria:**
-- [ ] `Generator.generate(question, chunks) -> GenerateResult` returns answer text + parsed citation markers
-- [ ] System prompt instructs Gemini 3.6 Flash to cite chunk IDs inline as `[N]`
-- [ ] Multimodal — figure chunks pass their image content to Gemini
-- [ ] Returns metadata: model, input_tokens, output_tokens, latency_ms
+- [x] `Generator.generate(question, chunks) -> GenerateResult` returns answer text + parsed citation markers
+- [x] System prompt instructs Gemini 3.6 Flash to cite chunk IDs inline as `[N]`
+- [x] Multimodal — figure chunks pass their image content to Gemini
+- [x] Returns metadata: model, input_tokens, output_tokens, latency_ms
+- [x] `[N]` markers are positions in the `chunks` list passed to `generate()` (1-indexed), NOT chunk_id — FEAT-012 must map `chunks[N-1].chunk_id` itself. `GeneratorChunk` is Generator's own input type (not FEAT-009's `RetrievedChunk`, which carries no image data); FEAT-012 must fetch each figure chunk's image from Storage via `figure_path` and adapt `RetrievedChunk` rows into `GeneratorChunk` before calling `generate()`.
+- [x] Hallucinated citation markers (out of `1..len(chunks)` range) never crash `generate()` — dropped from `cited_indices`, surfaced in `GenerateResult.hallucinated_markers` and logged.
 
 **Run:**
 - Before implementation: `/api-check gemini`
@@ -386,6 +388,7 @@ All 4/4 found their expected chunk in the top-5; 2/4 at rank 1, 2/4 at rank 2 (b
 - [ ] Continuing an existing conversation appends messages correctly
 - [ ] Cross-tenant document_ids in request → 403
 - [ ] `Retriever.retrieve()`'s `user_id` arg is passed `request.state.user_id` (JWT-verified, FEAT-003 middleware) — never a request-body/query-param value. `Retriever` has no HTTP/JWT awareness itself and does not re-validate this argument; `match_chunks_by_vector`/`match_chunks_by_fts`'s tenant isolation is real (WHERE-clause scoped, SQL-layer verified — see 2026-07-24 FEAT-009 self-audit) but trusts whatever `user_id` its caller supplies. This route is the first production caller of `Retriever.retrieve()` — get this wrong here and the SQL-layer scoping is moot.
+- [ ] Each of `Generator.generate()`'s `GenerateResult.cited_indices` (1-indexed positions into the `chunks` list, NOT chunk ids) is mapped back to a real `chunk_id` via `chunks[position - 1].chunk_id` — this route is the first production caller of `Generator.generate()`, and the mapping is `/query`'s responsibility, not something `Generator` does itself (see FEAT-010's acceptance criteria and 2026-07-24 FEAT-010 self-audit). Before calling `generate()`, `RetrievedChunk` rows (from `Retriever.retrieve()`, which carry no image data) must be adapted into `GeneratorChunk`s, fetching each figure chunk's image from Storage via `figure_path` first — `GeneratorChunk.__post_init__` will raise if a figure-typed chunk is constructed with no image, so a forgotten fetch fails loudly here rather than silently degrading to a text-only citation.
 
 **Run:**
 - `curl -X POST -H "Authorization: Bearer <jwt>" -d '{"question":"...","document_ids":["..."]}' http://localhost:8000/query`
