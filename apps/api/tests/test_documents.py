@@ -207,6 +207,45 @@ def test_delete_while_status_parsing_returns_409(app_client, admin, user_a):
     admin.table("documents").delete().eq("id", document["id"]).execute()
 
 
+# 'embedded' still has a real in-flight background task (figure upload +
+# the bulk chunks insert + mark_ready all happen strictly after
+# mark_embedded() sets this status — routes/ingest.py's run_ingest_pipeline)
+# — deleting the documents row out from under that window let the
+# still-running task's later insert_chunks() call fail with a dangling
+# chunks_document_id_fkey violation, confirmed live during FEAT-014's UI
+# wiring pass (.agent/GAPS.md). Same reasoning and the same TestClient
+# limitation as the 'parsing' test above (the real pipeline runs
+# synchronously to completion under TestClient, so 'embedded' is inserted
+# directly rather than reproduced through /ingest).
+def test_delete_while_status_embedded_returns_409(app_client, admin, user_a):
+    user_id, token = user_a
+    document = (
+        admin.table("documents")
+        .insert(
+            {
+                "user_id": user_id,
+                "filename": "mid-embed.pdf",
+                "storage_path": f"uploads/{user_id}/mid-embed.pdf",
+                "mime_type": "application/pdf",
+                "size_bytes": 17,
+                "status": "embedded",
+            }
+        )
+        .execute()
+        .data[0]
+    )
+
+    response = app_client.delete(f"/documents/{document['id']}", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "CONFLICT"
+
+    # Document must still exist — the delete was refused, not partially applied.
+    assert admin.table("documents").select("id").eq("id", document["id"]).execute().data != []
+
+    admin.table("documents").delete().eq("id", document["id"]).execute()
+
+
 # Multi-tenant isolation across all three endpoints (task item 4) — same
 # live-verification discipline as FEAT-007: two real users, confirm user
 # B cannot list, get, or delete user A's document via any of the three

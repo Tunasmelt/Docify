@@ -118,10 +118,19 @@ async def delete_document(document_id: str, request: Request):
         return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "document not found"))
     document = rows[0]
 
-    if document["status"] == "parsing":
+    if document["status"] in ("parsing", "embedded"):
+        # Both statuses still have a real in-flight background task
+        # (routes/ingest.py's run_ingest_pipeline): 'parsing' covers the
+        # download-through-embed stages, and 'embedded' covers figure
+        # upload + the bulk chunks insert + mark_ready, which all happen
+        # strictly after mark_embedded() sets this status. Deleting the
+        # documents row out from under either window lets that still-
+        # running task's later insert_chunks() call fail with a dangling
+        # chunks_document_id_fkey violation — confirmed live during
+        # FEAT-014's UI wiring pass (.agent/GAPS.md).
         return JSONResponse(
             status_code=409,
-            content=error_envelope("CONFLICT", "document is currently being parsed"),
+            content=error_envelope("CONFLICT", "document is currently being processed"),
         )
 
     # Figure paths must be read before delete_document() below — chunks
