@@ -2,22 +2,93 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * Canonical design tokens — reconciled from FEAT-013's three prototype
+ * files (UI Shell, Documents View, Chat View), which had slightly
+ * diverged CSS variable sets. Union of everything used across all
+ * three; verified the overlapping tokens (--accent, --amber, the
+ * status/verdict backgrounds) carried identical values in every file
+ * before collapsing them into one definition here.
+ */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --bg: #f7f4ee;
+  --surface: #ffffff;
+  --ink: #191714;
+  --muted: #6e675c;
+  --faint: #a79e8f;
+  --line: #e4ded2;
+  --border: #d8d1c2;
+  --panel: #f1ede3;
+  --panel-active: #e6e0d1;
+  --panel-hover: #eae5d8;
+  --accent: #2f6c4f;
+  --accent-hover: #275a42;
+  --on-accent: #ffffff;
+  --dashed: #c9c0ac;
+  --drop-bg: rgba(255, 255, 255, 0.55);
+  --drop-bg-hover: rgba(255, 255, 255, 0.9);
+  --focus-ring: rgba(47, 108, 79, 0.12);
+  --destructive: #a14b38;
+  --destructive-hover: #8c4030;
+  --destructive-bg: rgba(161, 75, 56, 0.1);
+  --amber: #8a6420;
+  --amber-bg: rgba(154, 111, 46, 0.14);
+  --green-bg: rgba(47, 108, 79, 0.1);
+  --muted-bg: rgba(110, 103, 92, 0.1);
+  --sk-grad-a: linear-gradient(90deg, #e6e0d1 25%, #efeadd 50%, #e6e0d1 75%);
+  --sk-grad-b: linear-gradient(90deg, #ebe6d9 25%, #f2eee3 50%, #ebe6d9 75%);
+  --sk-grad-c: linear-gradient(90deg, #fbf9f4 25%, #f2eee3 50%, #fbf9f4 75%);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+:root[data-theme="dark"] {
+  --bg: #14120f;
+  --surface: #221f1a;
+  --ink: #ede7db;
+  --muted: #9c9384;
+  --faint: #6e675c;
+  --line: #2e2a24;
+  --border: #3c372f;
+  --panel: #1b1815;
+  --panel-active: #2a2620;
+  --panel-hover: #26221c;
+  --accent: #4c9b75;
+  --accent-hover: #5faf88;
+  --on-accent: #10281c;
+  --dashed: #443e34;
+  --drop-bg: rgba(255, 255, 255, 0.03);
+  --drop-bg-hover: rgba(255, 255, 255, 0.06);
+  --focus-ring: rgba(76, 155, 117, 0.22);
+  --destructive: #c06a55;
+  --destructive-hover: #ce7b66;
+  --destructive-bg: rgba(192, 106, 85, 0.14);
+  --amber: #c99b4a;
+  --amber-bg: rgba(201, 155, 74, 0.14);
+  --green-bg: rgba(76, 155, 117, 0.14);
+  --muted-bg: rgba(156, 147, 132, 0.12);
+  --sk-grad-a: linear-gradient(90deg, #2a2620 25%, #332e27 50%, #2a2620 75%);
+  --sk-grad-b: linear-gradient(90deg, #26221c 25%, #2e2922 50%, #26221c 75%);
+  --sk-grad-c: linear-gradient(90deg, #1e1b17 25%, #2e2922 50%, #1e1b17 75%);
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
 }
 
 body {
-  color: var(--foreground);
-  background: var(--background);
-  font-family: Arial, Helvetica, sans-serif;
+  color: var(--ink);
+  font-family: var(--font-spline-sans), sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+::placeholder {
+  color: var(--faint);
 }
 
 @layer utilities {
