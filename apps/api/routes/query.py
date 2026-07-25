@@ -9,7 +9,7 @@ from db import queries
 from db.client import get_service_role_client
 from errors import error_envelope
 from models.query import CitationResponse, QueryMetadata, QueryRequest, QueryResponse
-from services.figure_fetcher import fetch_generator_chunks
+from services.figure_fetcher import fetch_generator_chunks, signed_figure_url
 from services.generator import CITATION_BRACKET, CITATION_NUMBER, GenerationError, Generator, GeneratorChunk
 from services.retriever import Retriever
 from services.verifier import Verdict, VerdictLabel, Verifier
@@ -94,7 +94,7 @@ def _strip_dropped_markers(answer: str, dropped_positions: set[int]) -> str:
     return stripped.strip()
 
 
-@router.post("/query", response_model=QueryResponse)
+@router.post("/query", response_model=QueryResponse, response_model_exclude_none=True)
 async def post_query(
     payload: QueryRequest,
     request: Request,
@@ -214,6 +214,7 @@ async def post_query(
         citations_to_persist.append(
             {
                 "chunk_id": chunk.chunk_id,
+                "marker": position,
                 "claim_span": claim_text,
                 "claim_start": None,
                 "claim_end": None,
@@ -227,6 +228,13 @@ async def post_query(
             dropped_positions.add(position)
             continue
 
+        # figure_path is only set on GeneratorChunk when figure_fetcher.py's
+        # download actually succeeded (FEAT-026) — reuses that resolution
+        # rather than a second chunks.select("figure_path") lookup.
+        figure_url = None
+        if chunk.element_type == "figure" and chunk.figure_path:
+            figure_url = signed_figure_url(client, chunk.figure_path)
+
         citation_responses.append(
             CitationResponse(
                 marker=position,
@@ -238,6 +246,7 @@ async def post_query(
                 snippet=chunk.content[:200],
                 verdict=verdict.verdict.value,
                 supporting_quote=verdict.quote,
+                figure_url=figure_url,
             )
         )
 

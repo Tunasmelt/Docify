@@ -78,3 +78,36 @@ traced via the redirect chain's real `Location` headers, not guessed. `playwrigh
 pins `baseURL`/`webServer.url` to `127.0.0.1:3000` for this reason. If accessing the app manually
 in a browser during local dev, use `http://127.0.0.1:3000`, not `http://localhost:3000`, or
 password-reset/OAuth redirects will silently misbehave.
+
+## FEAT-014 Documents UI wiring (2026-07-25) — delete does not block during 'embedded' status
+
+While live-testing the Documents UI's real delete flow, a genuine `chunks_document_id_fkey`
+foreign-key violation surfaced in the backend logs: `run_ingest_pipeline`'s background task tried
+to insert chunk rows for a `document_id` that no longer existed in `documents` — the row had
+already been deleted while the pipeline was still mid-flight.
+
+- [ ] **`DELETE /documents/{document_id}`'s 409 guard (`routes/documents.py`) only blocks
+  `status == 'parsing'`.** But `run_ingest_pipeline` (`routes/ingest.py`) still has real
+  in-flight work after the status flips to `'embedded'` — figure upload, the bulk `chunks`
+  insert, and `mark_ready` all happen strictly after `mark_embedded()`. A delete landing in that
+  window is not blocked, deletes the `documents` row (RLS/ownership checks pass — it's a real,
+  currently-existing row at the time of the check), and the still-running background task's
+  later `insert_chunks()` call then fails with a dangling foreign key. `_fail_document`'s cleanup
+  path doesn't help here either — there's no document row left for it to mark `failed`.
+  **How this was surfaced:** not through the normal single-document delete UI a real user would
+  use, but by this session's own test-cleanup pattern (deleting a test *user* via the admin API
+  immediately after starting an upload, to tear down test fixtures quickly) — `documents.user_id`
+  cascades on `auth.users` delete, so the user-delete removed the document out from under its
+  own still-running pipeline. A real user deleting one of their own documents through the normal
+  UI *can* hit the identical race if their click lands during the `'embedded'` window specifically
+  (a real, if narrow, timing window — not purely a test artifact), so this is worth fixing
+  properly, not dismissing as test-only.
+  **Suggested fix (not implemented — out of scope for a wiring-correctness pass):** broaden the
+  409 guard to `status in ('parsing', 'embedded')`, or — more robustly — have
+  `run_ingest_pipeline` re-check the document row still exists immediately before `insert_chunks`
+  and treat a missing row as a clean, silent abort rather than letting the FK violation surface
+  as an unhandled exception.
+- [x] **Confirmed NOT a regression from this pass** — `run_ingest_pipeline` and
+  `delete_document`'s code are both unchanged by FEAT-014 (a pure frontend wiring task); this gap
+  predates it, just not exercised live until real delete requests started flowing from a real UI
+  against real in-flight pipelines.

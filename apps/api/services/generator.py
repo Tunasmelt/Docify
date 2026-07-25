@@ -91,6 +91,11 @@ class GeneratorChunk:
     page_number: int
     document_name: str
     image: bytes | None = None  # PNG bytes; only meaningful when element_type == "figure"
+    figure_path: str | None = None  # Storage object path; only meaningful when element_type == "figure"
+    # (FEAT-026) figure_fetcher.py already resolves this per chunk to
+    # download the image above — carried through here so routes/query.py
+    # can reuse it to build a signed URL for figure citations without a
+    # second chunks.select("figure_path") lookup.
 
     def __post_init__(self):
         # A self-audit found this had no protection at all: a caller that

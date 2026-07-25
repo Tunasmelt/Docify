@@ -151,7 +151,7 @@ Deletes the document, its chunks, its figures in storage, and all references fro
 
 **Errors:**
 - `404 NOT_FOUND`
-- `409 CONFLICT` if document is currently being parsed
+- `409 CONFLICT` if document is currently being processed — `status in ('parsing', 'embedded')` (**corrected 2026-07-25**: originally only checked `'parsing'`; `'embedded'` still has a real in-flight background task too — figure upload, chunk insert, and `mark_ready()` all happen strictly after `mark_embedded()` — found via FEAT-014's live UI testing, see `.agent/GAPS.md`)
 
 ---
 
@@ -227,6 +227,7 @@ Ask a question over one or more documents.
   - `supported` — citation is kept in the `citations` array as-is; the answer text keeps its `[N]` marker
   - `partial` — citation is **kept** in the `citations` array (same as `supported`, never dropped); the client renders it with a warning indicator, since the source only partially backs the claim (e.g. the marker-3 example above: the source confirms broad-based growth but not specifically "international demand" — kept so the reader can judge the source themselves, not silently hidden)
   - `unsupported` — citation is **dropped** from the `citations` array; the corresponding `[N]` marker is stripped from `answer`
+- **`figure_url`** (added FEAT-026): present only on a citation with `element_type: "figure"` — a signed, time-limited Storage URL (600s) for that figure's image. **Omitted entirely** (not sent as `null`) on `text`/`table` citations, and on a `figure` citation whose image fetch itself failed server-side (that citation's `element_type` degrades to `"text"` in that case — see `services/figure_fetcher.py` — so `figure_url` never appears alongside a lie about what the citation actually is). Not persisted anywhere — built fresh from the citation's `chunk_id` → `figure_path` on every read, live or historical (`GET /conversations/{id}/messages` below produces byte-identical citation shapes from stored data, including a freshly-signed `figure_url` each time it's read, not a cached/expired one).
 
 **Errors:**
 - `403 FORBIDDEN` if any `document_ids` don't belong to user

@@ -424,6 +424,46 @@ All 4/4 found their expected chunk in the top-5; 2/4 at rank 1, 2/4 at rank 2 (b
 
 ---
 
+### [FEAT-026] `GET /conversations` + `GET /conversations/{id}/messages` + citation figure URLs
+**Phase:** 2
+**Status:** tested
+**Owner:** claude-code
+**Depends on:** FEAT-008 (list/detail/404 pattern), FEAT-012 (`/query`, citations, `create_query_turn`)
+**Files:**
+- `apps/api/routes/conversations.py` (new)
+- `apps/api/routes/_pagination.py` (new — `encode_cursor`/`decode_cursor` extracted out of `documents.py`, now shared by both routers rather than duplicated a second time)
+- `apps/api/models/conversations.py` (new)
+- `apps/api/models/query.py` (`CitationResponse.figure_url` added)
+- `apps/api/db/queries.py` (`list_conversations`, `get_conversation_detail`, `list_messages_for_conversation`, `list_citations_for_messages` added)
+- `apps/api/services/figure_fetcher.py` (`signed_figure_url()` added — shared by `/query` and the new messages route, not duplicated)
+- `apps/api/services/generator.py` (`GeneratorChunk.figure_path` added — carries `figure_fetcher.py`'s already-resolved figure path through to the citation-building step, avoiding a second `chunks.select("figure_path")` lookup)
+- `apps/api/routes/query.py` (`marker` now persisted; `figure_url` populated for figure citations; `response_model_exclude_none=True` added)
+- `apps/api/migrations/20260725_001_citation_marker_column.sql` (new)
+- `apps/api/migrations/20260725_002_query_persistence_function_marker.sql` (new — `create_query_turn` now stores `marker`)
+**Tests:**
+- `apps/api/tests/test_conversations.py`
+**Acceptance criteria:**
+- [x] `GET /conversations` — paginated list, scoped to JWT user, matching FEAT-008's list pattern (keyset cursor on `updated_at desc`, `+1`-row has-more-page probe)
+- [x] `GET /conversations/{id}/messages` — full message history including citations, matching API_CONTRACT.md's documented shape
+- [x] Non-leaking 404 for another user's conversation (same status + body whether nonexistent or someone else's — FEAT-008's `get_document()` discipline, reused verbatim via `get_conversation_detail()`)
+- [x] Citation figure URLs: signed, 600s-expiring Storage URL added to `element_type: "figure"` citations in both `POST /query` and the new messages route; omitted (not `null`) on non-figure citations
+
+**Real gap found before either route could be built correctly: `citations` had no `marker` column at all.** `POST /query`'s response `marker` field (the inline `[N]` position) was purely ephemeral — computed in Python from `Generator`'s in-memory `cited_indices`, never part of `citations_to_persist`. This wasn't just a missing field: a message's stored `content` text keeps the *original*, non-renumbered `[N]` markers (`_strip_dropped_markers` removes dropped positions but never renumbers survivors), so reconstructing `marker` at read time by renumbering the kept citations sequentially (1, 2, 3...) would silently mismatch whatever `[N]` the stored text actually contains whenever an earlier citation had been dropped as unsupported. Confirmed this precisely by reading `create_query_turn`'s RPC body directly, not assumed from the model shape. Fixed at the source — a real column (`20260725_001`), the RPC updated to store it (`20260725_002`), `routes/query.py` passes `position` through — rather than a read-time workaround that would have been silently wrong in exactly the case (a dropped citation) that matters most for a citation-verification product.
+
+**Verified empirically before writing the queries, not assumed:** PostgREST's embedded-count (`select=...,messages(count)`) and multi-level embed (`citations` → `chunks` → `documents`, three FK hops) syntax were both probed live against the real local stack with throwaway data before committing to the design — confirmed exact response shapes (`{"messages": [{"count": N}]}`, nested `chunks.documents.filename`), not guessed from PostgREST documentation.
+
+**Decision — direct signed URL, not a cached/persisted one:** `figure_url` is built fresh on every read (live `/query` response or historical `/conversations/{id}/messages` read) from the citation's `chunk_id` → `figure_path`, never stored. A persisted URL would eventually be served already-expired; building it at read time means it's always valid for a fresh 600s window from the moment it's actually handed to a client. Confirmed live: the same figure citation produces two different (both genuinely fetchable) signed URLs when read once from `/query` and again later from `/conversations/{id}/messages`.
+
+**Decision — FEAT number.** This was scoped verbally as a standalone task without an assigned number; `FEAT-016` through `FEAT-025` were already reserved in this file's Phase 4/5 placeholder lists (SSE streaming, OCR fallback, reranker, deploy tasks, etc.) before this work started — confirmed by reading this file first, not assumed free. Used `FEAT-026`, the next actually-unused number, and placed the entry in Phase 2 (immediately after FEAT-012) since this is a direct continuation of `/query`'s own conversation/citation model, not a Phase 4 polish item.
+
+**Live-verified, real data throughout (`tests/test_conversations.py`):** a real `POST /query` call (real retrieval/generation/verification fakes, exactly `routes/query.py`'s own dependency-override pattern — never a hand-inserted conversation/message/citation row) persists a real conversation; `GET /conversations` lists it correctly with the right `message_count`; `GET /conversations/{id}/messages` returns the real message history with the real `marker` value (asserted equal to what `POST /query` itself returned, not just present); unsupported citations are correctly absent from history, matching what `POST /query` itself dropped; a real figure citation's `figure_url` — both the live one from `POST /query` and the one read back later from history — was fetched over real HTTP and its bytes compared against the real uploaded PNG.
+
+**Run:**
+- `curl -H "Authorization: Bearer <jwt>" http://localhost:8000/conversations`
+- `curl -H "Authorization: Bearer <jwt>" http://localhost:8000/conversations/<id>/messages`
+
+---
+
 ## Phase 3 — Frontend + Auth
 
 ### [FEAT-013] Next.js app shell + Supabase Auth

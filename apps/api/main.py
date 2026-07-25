@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from middleware.auth import JWTAuthMiddleware
-from routes import documents, health, ingest, query
+from routes import conversations, documents, health, ingest, query
 
 app = FastAPI(title="docify-api")
 
@@ -40,3 +40,4 @@ app.include_router(health.router)
 app.include_router(ingest.router)
 app.include_router(documents.router)
 app.include_router(query.router)
+app.include_router(conversations.router)

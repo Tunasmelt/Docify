@@ -1,4 +1,3 @@
-import base64
 import logging
 
 from fastapi import APIRouter, Query, Request
@@ -8,6 +7,7 @@ from db import queries
 from db.client import get_service_role_client
 from errors import error_envelope
 from models.documents import DocumentListResponse, DocumentResponse
+from routes._pagination import decode_cursor, encode_cursor
 
 logger = logging.getLogger(__name__)
 
@@ -19,14 +19,6 @@ router = APIRouter()
 # PostgREST would otherwise try to cast the string straight into the
 # enum column and let Postgres reject it.
 _VALID_STATUSES = {"uploaded", "parsing", "embedded", "ready", "failed"}
-
-
-def _encode_cursor(created_at: str) -> str:
-    return base64.urlsafe_b64encode(created_at.encode()).decode()
-
-
-def _decode_cursor(cursor: str) -> str:
-    return base64.urlsafe_b64decode(cursor.encode()).decode()
 
 
 @router.get("/documents", response_model=DocumentListResponse)
@@ -45,7 +37,7 @@ async def list_documents(
     cursor_created_at = None
     if cursor is not None:
         try:
-            cursor_created_at = _decode_cursor(cursor)
+            cursor_created_at = decode_cursor(cursor)
         except (ValueError, UnicodeDecodeError):
             return JSONResponse(status_code=422, content=error_envelope("VALIDATION_ERROR", "invalid cursor"))
 
@@ -57,7 +49,7 @@ async def list_documents(
     # separate count query — the probe row itself is never returned.
     has_more = len(rows) > limit
     page = rows[:limit]
-    next_cursor = _encode_cursor(page[-1]["created_at"]) if has_more and page else None
+    next_cursor = encode_cursor(page[-1]["created_at"]) if has_more and page else None
 
     return DocumentListResponse(documents=[DocumentResponse(**row) for row in page], next_cursor=next_cursor)
 

@@ -5,6 +5,33 @@ from services.retriever import RetrievedChunk
 
 logger = logging.getLogger(__name__)
 
+# 10 minutes — long enough that a user reading a response and clicking
+# through a citation's figure doesn't race an expiring URL mid-read; short
+# enough that a leaked/logged URL isn't a long-lived credential. No prior
+# convention existed to match (first signed-URL use in this codebase —
+# .agent/api-docs/supabase-storage-py.md).
+FIGURE_URL_EXPIRY_SECONDS = 600
+
+
+def signed_figure_url(client, figure_path: str) -> str | None:
+    """Shared by routes/query.py (live citations) and
+    routes/conversations.py (historical citations) — one place for
+    building a citation's figure URL, same reuse-not-duplicate reasoning
+    as fetch_generator_chunks() below being the one place that resolves
+    chunk -> figure_path at all. Best-effort: a Storage hiccup here must
+    not fail the whole response (same discipline as fetch_generator_chunks'
+    own per-figure download try/except — a failure degrades to no
+    figure_url, not a 500)."""
+    try:
+        result = client.storage.from_("figures").create_signed_url(figure_path, FIGURE_URL_EXPIRY_SECONDS)
+        return result.get("signedURL")
+    except Exception:
+        logger.warning(
+            "figure_fetcher: failed to create signed URL for figure_path=%s — citation will omit figure_url",
+            figure_path,
+        )
+        return None
+
 
 def fetch_generator_chunks(client, retrieved_chunks: list[RetrievedChunk]) -> list[GeneratorChunk]:
     """Adapts Retriever's output into Generator's input, fetching each
@@ -72,6 +99,12 @@ def fetch_generator_chunks(client, retrieved_chunks: list[RetrievedChunk]) -> li
                 page_number=chunk.page,
                 document_name=chunk.document_name,
                 image=image,
+                # Only carried through when the download above actually
+                # succeeded and element_type is still "figure" — a chunk
+                # degraded to "text" (failed download) must not claim a
+                # figure_path a citation-URL builder would then treat as
+                # viewable, since the image fetch for it just failed.
+                figure_path=path if element_type == "figure" else None,
             )
         )
     return generator_chunks

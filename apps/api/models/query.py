@@ -18,6 +18,16 @@ class CitationResponse(BaseModel):
     snippet: str
     verdict: str
     supporting_quote: str | None
+    # Only set for element_type == "figure" (a signed, time-limited Storage
+    # URL — the "figures" bucket is private, RLS-scoped to the owning
+    # user's own JWT, which the service-role client doesn't have). Routes
+    # returning this must set response_model_exclude_none=True so a
+    # non-figure citation OMITS this key entirely rather than sending
+    # "figure_url": null — easy to mishandle client-side (a naive
+    # `if (citation.figure_url)` guard is fine either way, but omission
+    # is the less surprising, more standard REST shape for "not
+    # applicable" versus "applicable but empty").
+    figure_url: str | None = None
 
 
 class QueryMetadata(BaseModel):

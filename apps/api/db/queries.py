@@ -252,3 +252,95 @@ def create_query_turn(
         .data
     )
     return result[0]
+
+
+# FEAT-026: GET /conversations, GET /conversations/{id}/messages
+
+CONVERSATION_LIST_COLUMNS = "id,title,document_ids,updated_at,messages(count)"
+
+
+def list_conversations(client, *, user_id: str, limit: int, cursor_updated_at: str | None) -> list[dict]:
+    """Keyset pagination on updated_at desc (conversations_user_idx already
+    indexes (user_id, updated_at desc) — SCHEMA.md), same +1-row
+    has-more-page pattern as list_documents(). message_count comes from
+    PostgREST's embedded count aggregate (`messages(count)`) rather than a
+    second per-conversation query — confirmed live this returns each row
+    shaped as `{..., "messages": [{"count": N}]}`; the caller
+    (routes/conversations.py) flattens that, since Pydantic can't consume
+    the nested shape directly as a plain int field."""
+    query = client.table("conversations").select(CONVERSATION_LIST_COLUMNS).eq("user_id", user_id)
+    if cursor_updated_at is not None:
+        query = query.lt("updated_at", cursor_updated_at)
+    return query.order("updated_at", desc=True).limit(limit + 1).execute().data
+
+
+def get_conversation_detail(client, *, conversation_id: str, user_id: str) -> dict | None:
+    """Scoped to user_id in the query itself — same pattern as
+    get_document()/get_conversation(). Fuller column set than
+    get_conversation() (id,document_ids only — used for /query's
+    ownership pre-check) since this backs GET /conversations/{id}/messages'
+    `conversation` object, which also needs title/created_at/updated_at."""
+    rows = (
+        client.table("conversations")
+        .select("id,title,document_ids,created_at,updated_at")
+        .eq("id", conversation_id)
+        .eq("user_id", user_id)
+        .execute()
+        .data
+    )
+    return rows[0] if rows else None
+
+
+def list_messages_for_conversation(client, *, conversation_id: str, user_id: str) -> list[dict]:
+    """Ordered oldest-first (messages_conv_idx already indexes
+    (conversation_id, created_at) ascending — SCHEMA.md), matching a
+    conversation's natural reading order. conversation_id ownership is
+    already verified by the caller via get_conversation_detail() before
+    this ever runs (same check-once-then-trust-the-id pattern
+    create_query_turn's RPC uses) — the user_id filter here is
+    defense-in-depth on top of that, not the primary check, same
+    "costs nothing to also filter" reasoning as
+    remove_document_from_conversations()."""
+    return (
+        client.table("messages")
+        .select("id,role,content,created_at")
+        .eq("conversation_id", conversation_id)
+        .eq("user_id", user_id)
+        .order("created_at", desc=False)
+        .execute()
+        .data
+    )
+
+
+CITATION_JOIN_COLUMNS = (
+    "id,message_id,marker,verdict,supporting_quote,chunk_id,"
+    "chunks(document_id,page_number,element_type,content,figure_path,documents(filename))"
+)
+
+
+def list_citations_for_messages(client, *, message_ids: list[str], user_id: str) -> dict[str, list[dict]]:
+    """Citations for a batch of message ids in one query, grouped by
+    message_id — avoids an N+1 query per message. Filters out
+    'unsupported' verdicts to match exactly what /query's own response
+    (and therefore each message's stored `content` text — see
+    routes/query.py's _strip_dropped_markers) actually contains;
+    'unsupported' citations ARE persisted (create_query_turn's own
+    full-audit-trail comment) but were never meant to be user-facing.
+    Ordered by marker so a message's citations come back in the same
+    order they appear inline in its content text."""
+    if not message_ids:
+        return {}
+    rows = (
+        client.table("citations")
+        .select(CITATION_JOIN_COLUMNS)
+        .in_("message_id", message_ids)
+        .eq("user_id", user_id)
+        .neq("verdict", "unsupported")
+        .order("marker")
+        .execute()
+        .data
+    )
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        grouped.setdefault(row["message_id"], []).append(row)
+    return grouped
