@@ -84,7 +84,6 @@ Read only the file relevant to your current task.
 |----------------|-------------------------------------------------------------------------|--------------------------------------------------|
 | claude-code    | API design, schema, ingestion, retrieval, verification prompts, ARCH/SCHEMA/API_CONTRACT | Frontend visuals                                |
 | claude-design  | Frontend UI, components, styling, page layouts                          | Business logic, DB queries                       |
-| gemini         | Frontend↔backend wiring, auth flows, user CRUD, integration glue        | API contract changes, schema changes             |
 | codex          | Bug hunting, test coverage audits, refactor suggestions, pre-merge review| Feature implementation outside bug-fix scope    |
 
 Cross-lane work → write suggestion to HANDOFF.md `## Agent Suggestions` section, not silent expansion.

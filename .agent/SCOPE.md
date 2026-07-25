@@ -46,7 +46,7 @@ Source of truth for what is and is not in scope, per phase. The agent checks her
 - [ ] Failure handling: parse failures write to `documents.error` and set status to `failed`, no partial-ingest data left in `chunks`
 
 ### Explicitly out of scope
-- Background-task durability (timeouts, dead-letter, crash recovery) deferred to Phase 5 — FastAPI BackgroundTasks has no durability guarantee; a genuinely hung or crashed task is currently invisible beyond ordinary log output. Revisit as part of deploy architecture, not patched incrementally here. (Flagged by Codex review of FEAT-007, 2026-07-23 — confirmed real, deliberately not fixed in that pass.)
+- Background-task durability, worker-pool/queue architecture, and rate-limiting — three facets of one decision (FastAPI `BackgroundTasks` is deliberately not a production job system for Phase 1). Consolidated under Phase 5's "Production job execution" entry below rather than scattered across phases — see that entry for the full reasoning and evidence.
 - OCR fallback for scanned PDFs (Phase 4 — add Gemini Flash route only when Docling low-confidence pages appear in real usage)
 - DOCX/PPTX/HTML inputs (Phase 4)
 - Streaming upload progress to frontend (Phase 3)
@@ -136,7 +136,11 @@ Source of truth for what is and is not in scope, per phase. The agent checks her
 - [ ] Custom domain (if user has one)
 - [ ] Landing page with demo video / gif and "try with sample doc" flow
 - [ ] README.md at repo root: architecture diagram, tech decisions, how to run locally
-- [ ] Rate-limiting on `/ingest` and `/query` to protect free tiers
+- [ ] **Production job execution for `/ingest` (and `/query` once built)** — FastAPI `BackgroundTasks` is not a production job system: no queue, no worker pool, no timeout/backpressure, no per-user concurrency cap, and a hung or crashed task is invisible beyond ordinary log output (a process restart silently loses in-flight work). Three facets of the same underlying decision, tracked together here rather than as separate scattered bullets across phases:
+  - **Durability** — timeouts, dead-letter handling, crash recovery for in-flight ingests
+  - **Worker-pool/queue architecture** — move heavy Docling/Voyage work off the request-serving process entirely
+  - **Rate-limiting** on `/ingest` and `/query`, to protect free-tier quotas from concurrent or abusive load
+  Evidence: `.agent/reviews/2026-07-23-perf.md` (measured 86.55s parse time for one 11-page fixture locally; no per-stage timing exists to explain that number after the fact) and `.agent/reviews/2026-07-23-efficiency.md` (reconfirms this is unchanged as of FEAT-008; separately assesses Parser/Embedder process-lifetime reuse as an independent, smaller change that does *not* need to wait for this).
 - [ ] Sentry or equivalent lightweight error tracking (free tier)
 - [ ] Basic uptime monitor (UptimeRobot free)
 
