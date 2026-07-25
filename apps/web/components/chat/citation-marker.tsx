@@ -26,9 +26,20 @@ export function CitationMarker({ citation, active, onOpen }: CitationMarkerProps
     <sup>
       <button
         type="button"
+        data-testid={`citation-marker-${citation.id}`}
+        data-verdict={citation.verdict}
         onClick={() => onOpen(citation)}
         title={tip}
-        className="min-w-[15px] rounded-[3px] px-[3px] font-mono text-[0.74em] font-medium transition-colors"
+        // Tailwind's Preflight reset sets `sup { line-height: 0 }` (the
+        // standard typographic sub/sup reset) — this button inherits
+        // that (Preflight also resets `button { line-height: inherit }`),
+        // collapsing it to zero height and making it genuinely
+        // unclickable in a real browser despite looking fine in a static
+        // screenshot. leading-[1.4] overrides the inherited 0 directly on
+        // the element, restoring real, clickable height. Caught live via
+        // Playwright (`element is not visible`, computed height: 0px) —
+        // not visible from reading the JSX/CSS alone.
+        className="min-w-[15px] rounded-[3px] px-[3px] font-mono text-[0.74em] font-medium leading-[1.4] transition-colors"
         style={{
           color: style.fg,
           background: active ? style.bg : "transparent",

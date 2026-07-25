@@ -619,24 +619,55 @@ caused a real timeout unrelated to the fix itself, see `playwright.config.ts`'s 
 
 ### [FEAT-015] Chat UI + citation source panel
 **Phase:** 3
-**Status:** planned
-**Owner:** claude-design
+**Status:** tested — UI translation (2026-07-25) + real wiring (2026-07-25) both complete
+**Owner:** claude-design (UI), claude-code (wiring)
 **Files:**
 - `apps/web/app/(app)/chat/[conversation_id]/page.tsx`
+- `apps/web/app/(app)/chat/page.tsx` — conversation list (new; see placeholder note below)
 - `apps/web/components/chat/message-bubble.tsx`
-- `apps/web/components/chat/citation-chip.tsx`
+- `apps/web/components/chat/citation-marker.tsx` (renamed from the originally-planned `citation-chip.tsx` during the UI translation pass)
 - `apps/web/components/chat/source-panel.tsx`
 - `apps/web/components/chat/question-input.tsx`
+- `apps/web/components/chat/loading-stages.tsx`
+- `apps/web/components/documents/document-card.tsx` — added optional selection checkbox
+- `apps/web/app/(app)/documents/page.tsx` — added selection state + "Ask about these" bar (placeholder, see below)
+- `apps/web/lib/api/client.ts` (new) — shared `apiFetch`/`ApiError`/token-refresh, extracted from `lib/api/documents.ts` when `query.ts`/`conversations.ts` needed the identical logic a second and third time
+- `apps/web/lib/api/query.ts` (new) — real `POST /query`
+- `apps/web/lib/api/conversations.ts` (new) — real `GET /conversations`, `GET /conversations/{id}/messages`
+- `apps/web/lib/api/types.ts` (new) — shared `ApiCitation` wire type
+- `apps/web/lib/chat/parse-message.ts` (new) — shared `[N]`-marker → citation segment parser, used by both `query.ts` and `conversations.ts` so a live and a reloaded answer can never parse differently
+- `apps/web/lib/types/chat.ts` — added `Citation.figureUrl`
 **Tests:**
-- `apps/web/e2e/chat.e2e.ts`
+- `apps/web/e2e/chat.e2e.ts` — 3 real Playwright tests (one full real Docling/Voyage/Gemini pipeline run through the actual UI, two seeded via the real `create_query_turn` RPC for deterministic citation/figure/isolation assertions)
+- `apps/web/e2e/_seed.ts` (new) — direct-REST seeding helpers (documents/chunks/figures/conversation turns), mirroring `test_conversations.py`'s own seeding pattern on the Python side
 **Acceptance criteria:**
-- [ ] Question input at bottom, messages scroll above
-- [ ] Assistant messages render inline citation chips
-- [ ] Click citation → source panel opens with chunk content + page image (if figure)
-- [ ] Verdict-based citation styling (supported = solid, partial = dashed warning, no unsupported shown)
-- [ ] Loading state during retrieval + generation
-- [ ] Auto-scroll to newest message
-- [ ] Mobile-responsive (source panel becomes bottom sheet)
+- [x] Question input at bottom, messages scroll above
+- [x] Assistant messages render inline citation markers
+- [x] Click citation → source panel opens with chunk content + page image (if figure)
+- [x] Verdict-based citation styling (supported = solid, partial = dashed warning, no unsupported shown)
+- [x] Loading state during retrieval + generation
+- [x] Auto-scroll to newest message
+- [x] Mobile-responsive (source panel becomes a full-width overlay below `sm`; not a literal bottom sheet — see note)
+
+**Real wiring pass (2026-07-25), replacing all mocked handlers/data:**
+
+**Real bug found and fixed, only visible in an actual browser — not from reading the code:** every citation marker was genuinely unclickable. Tailwind's Preflight reset sets `sup { line-height: 0 }` (the standard typographic sub/sup reset) and separately resets `button { line-height: inherit }` — so `citation-marker.tsx`'s `<button>`, nested inside a `<sup>`, inherited a computed `line-height: 0` and collapsed to zero height (`getComputedStyle` confirmed `height: 0px` exactly). This is invisible in a static screenshot or in the original (non-Tailwind) design-tool mockup, and would have shipped silently — Playwright's real click-actionability check (`element is not visible`, retried for 60s) is what caught it, not a visual review. Fixed with an explicit `leading-[1.4]` directly on the button, which overrides the inherited value (inheritance always loses to any rule matching the element itself, regardless of specificity). Confirms this project's "use the feature in a browser before calling it done" discipline is load-bearing, not procedural — this bug would have passed every prior check (typecheck, unit-level reasoning, a static screenshot) and only surfaced under real interaction.
+
+**Citation marker parsing, shared not duplicated:** `content`/`answer` text contains literal `[N]` markers (possibly grouped — `services/generator.py`'s own comment notes Gemini has been observed emitting `[2, 3]`); a bracket with no matching citation (a hallucinated marker `_strip_dropped_markers` doesn't touch, since only *dropped-but-otherwise-valid* positions are stripped) renders as inert plain text rather than crashing. One parser (`lib/chat/parse-message.ts`) is shared by both `POST /query`'s live response and `GET /conversations/{id}/messages`' historical read, so the two can never silently disagree on how a marker maps to a citation.
+
+**Marker persistence proven at the UI layer, not just the API layer:** the real end-to-end e2e test asks a real question, records the rendered citation marker numbers, reloads the page (forcing a real `GET /conversations/{id}/messages` fetch), and asserts the markers are byte-identical — the one place FEAT-026's marker-persistence fix (persisting `marker` at write time rather than re-deriving it at read time) is actually exercised by a real user action, not just a backend test.
+
+**Two explicit placeholders, not a full Claude Design pass (flagged per this task's own instruction, not silently shipped as "done"):**
+1. `apps/web/app/(app)/chat/page.tsx` — a plain conversation list (title, message count, updated-at) for the sidebar's already-existing `/chat` nav link. No pagination UI, no search/filter/delete/rename.
+2. `apps/web/app/(app)/documents/page.tsx`'s selection checkboxes + floating "Ask about these" bar — a native `<button role of a styled div>` checkbox, not shadcn's Radix-based `Checkbox` (no `@radix-ui/react-checkbox` dependency added for this), loosely matching tokens.
+
+Both are real, functionally complete, and covered by the e2e suite — just not run through a dedicated design pass. Revisit if/when chat gets its own UI iteration.
+
+**figure_url end-to-end, real bytes:** the seeded e2e test uploads a real PNG to the real (local) `figures` Storage bucket, then fetches the rendered `<img>`'s `src` over real HTTP and compares bytes exactly against the source PNG — not just checking a URL-shaped string is present.
+
+**Excerpt fallback:** `supporting_quote` is `null` for every figure citation (chunks have no text to quote verbatim) and can also be `null` for a `partial` verdict — `source-panel.tsx` falls back to the chunk's `snippet` rather than rendering an empty blockquote; covered by a real (seeded, deterministic) test.
+
+**Verification:** `pnpm e2e -- e2e/chat.e2e.ts` — 3/3 passing (one real full-pipeline run ~22s, two seeded ~3-8s each). Re-ran `pnpm e2e -- e2e/upload.e2e.ts` (FEAT-014) afterward — still 6/6 passing, confirming the `document-card.tsx`/`documents/page.tsx` selection-checkbox additions caused no regression. Full `tsc --noEmit` clean throughout.
 
 ---
 

@@ -6,7 +6,10 @@ import type { AssistantMessage, Citation, UserMessage } from "@/lib/types/chat";
 export function UserMessageBubble({ message }: { message: UserMessage }) {
   return (
     <div className="flex justify-end">
-      <div className="max-w-[70%] rounded-[12px_12px_4px_12px] bg-panel-active px-4 py-3 text-[15px] leading-relaxed">
+      <div
+        data-testid="user-message"
+        className="max-w-[70%] rounded-[12px_12px_4px_12px] bg-panel-active px-4 py-3 text-[15px] leading-relaxed"
+      >
         {message.text}
       </div>
     </div>
@@ -27,7 +30,7 @@ export function AssistantMessageBubble({
   const citationsById = Object.fromEntries(message.citations.map((c) => [c.id, c]));
 
   return (
-    <div className="max-w-[85%]">
+    <div data-testid="assistant-message" className="max-w-[85%]">
       <p className="m-0 text-[15px] leading-[1.75]">
         {message.segments.map((seg, i) => {
           if (seg.type === "text") return <span key={i}>{seg.text}</span>;

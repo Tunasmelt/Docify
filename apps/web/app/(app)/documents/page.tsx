@@ -56,6 +56,7 @@ export default function DocumentsPage() {
   const [deleteError, setDeleteError] = React.useState<string | null>(null);
   const [deleting, setDeleting] = React.useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = React.useState(false);
+  const [selectedIds, setSelectedIds] = React.useState<string[]>([]);
 
   const pollTimeoutRef = React.useRef<ReturnType<typeof setTimeout>>();
   const pollIntervalRef = React.useRef(POLL_BASE_INTERVAL_MS);
@@ -141,6 +142,23 @@ export default function DocumentsPage() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // A selected document can stop being valid to select without the user
+  // touching the checkbox themselves — deleted by this same session, or
+  // (less likely mid-poll) no longer 'ready'. Prune rather than let a
+  // stale id silently ride along into the next "Ask about these".
+  React.useEffect(() => {
+    const readyIds = new Set(docs.filter((d) => d.status === "ready").map((d) => d.id));
+    setSelectedIds((prev) => prev.filter((id) => readyIds.has(id)));
+  }, [docs]);
+
+  function toggleSelect(id: string) {
+    setSelectedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  }
+
+  function askAboutSelected() {
+    router.push(`/chat/new?docs=${selectedIds.join(",")}`);
+  }
 
   async function handleSignOut() {
     await supabase.auth.signOut();
@@ -313,7 +331,13 @@ export default function DocumentsPage() {
                 </h2>
                 <div className="overflow-hidden rounded-lg border border-line bg-drop-bg">
                   {cardDocs.map((doc) => (
-                    <DocumentCard key={doc.id} doc={doc} onDelete={setDeleteId} />
+                    <DocumentCard
+                      key={doc.id}
+                      doc={doc}
+                      onDelete={setDeleteId}
+                      selected={selectedIds.includes(doc.id)}
+                      onToggleSelect={toggleSelect}
+                    />
                   ))}
                 </div>
                 <p className="m-0 mt-4 px-[18px] font-mono text-[11px] tracking-[0.04em] text-faint">
@@ -337,6 +361,22 @@ export default function DocumentsPage() {
           setDeleteError(null);
         }}
       />
+
+      {selectedIds.length > 0 ? (
+        <div className="pointer-events-none fixed inset-x-0 bottom-6 z-40 flex justify-center">
+          <div className="pointer-events-auto flex items-center gap-4 rounded-full border border-line bg-panel py-2 pl-5 pr-2 shadow-[0_12px_40px_rgba(25,23,20,0.16)]">
+            <span className="font-mono text-[11px] tracking-[0.08em] text-muted">
+              {selectedIds.length} SELECTED
+            </span>
+            <Button type="button" variant="ghost" size="sm" onClick={() => setSelectedIds([])}>
+              Clear
+            </Button>
+            <Button type="button" size="sm" className="rounded-full" onClick={askAboutSelected}>
+              Ask about these
+            </Button>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

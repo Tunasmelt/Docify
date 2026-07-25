@@ -12,6 +12,11 @@ export interface Citation {
   excerpt: string;
   isFigure?: boolean;
   figureCaption?: string;
+  /** Signed Storage URL for a figure citation's image (API_CONTRACT.md,
+   * FEAT-026) — absent on non-figure citations and on a figure citation
+   * whose image fetch failed server-side. Never persisted client-side
+   * beyond the current render; a fresh one is fetched on every reload. */
+  figureUrl?: string;
 }
 
 export type MessageSegment =
