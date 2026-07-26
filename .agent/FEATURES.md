@@ -673,14 +673,44 @@ Both are real, functionally complete, and covered by the e2e suite — just not 
 
 ## Phase 4 — Polish (see SCOPE.md for full list)
 
-Features here are placeholders until Phase 3 ships. Do not start unless Phase 3 is `complete`.
+Features here are placeholders until Phase 3 ships. Phase 3 shipped 2026-07-25 (FEAT-013/014/015,
+closed out with a full real end-to-end browser pass — see FEAT-015's entry and that day's
+CHANGELOG "Phase 3 close-out" entry) — FEAT-017 below is the first Phase 4 feature actually
+started.
 
 - [FEAT-016] Streaming responses via SSE — planned
-- [FEAT-017] OCR fallback via Gemini Flash — planned
-  - **Trigger (updated 2026-07-22, FEAT-004 session):** *not* "low Docling confidence" — no such signal exists. `Parser.parse()` (FEAT-004) exposes no confidence score to threshold on; Docling just silently returns fewer/zero elements for pages it can't read, indistinguishable from a legitimately blank page. Confirmed against the `scanned.pdf` fixture: with OCR off, a fully-scanned 3-page PDF returned 2 elements total, 0 on 2 of the 3 pages, no error. The trigger must be a positive heuristic evaluated over `ParsedDocument`, e.g.:
-    - Element count for a page falls below some threshold relative to what a page with real content typically produces, or
-    - Zero elements on a page that isn't the last page of a short document (near-certain sign of missed content, not a genuinely blank page)
-  - Original wording ("for low-confidence Docling pages," still in SCOPE.md and ARCHITECTURE.md as of this edit) assumed a confidence signal that doesn't exist — see CHANGELOG.md 2026-07-22 "feature: Docling parser service (FEAT-004)" for the full finding.
+
+### [FEAT-017] OCR fallback via Gemini Flash
+**Phase:** 4
+**Status:** tested
+**Owner:** claude-code
+**Files:**
+- `apps/api/services/parser.py` — `GeminiOcrClient`, `OCR_MODEL`, `OCR_SYSTEM_PROMPT`, `_TEXTUAL_ELEMENT_TYPES`; OCR fallback integrated directly into `Parser.parse()` (see design decision below), not a separate module. `Parser.__init__` gained `ocr_client: GeminiOcrClient | None = None`, defaulting to a real client — same pattern as the pre-existing `converter` param.
+**Tests:**
+- `apps/api/tests/test_parser.py` — 18 tests total (up from 15): 3 existing tests updated to inject a `FakeOcrClient` (preserving their original Docling-only pinned assertions now that OCR is on by default) plus 4 new: real recovery on `scanned.pdf`, zero-calls guard on `clean_digital.pdf`/`table_heavy.pdf`, and a client-failure-degrades-gracefully case
+**Acceptance criteria:**
+- [x] Trigger is a positive heuristic over already-extracted elements (zero text-bearing elements on a page), never a Docling confidence score (none exists — FEAT-004 finding)
+- [x] OCR fires per low-yield page using that page's own rendered image, not the whole document
+- [x] OCR-recovered text becomes an ordinary `ParsedElement` (`element_type=TEXT`) in the same `elements` list `chunker.py` already consumes — no parallel data shape — confirmed by re-running the full `test_chunker.py` suite (21/21 passing) against `scanned_doc`'s now-real OCR-augmented output with zero test changes needed
+- [x] `scanned.pdf`: real recovered content reported for every previously-zero-element page (real output required, not a pass/fail assertion per the task brief) — see real output below
+- [x] `clean_digital.pdf` and `table_heavy.pdf` (already high-yield): zero OCR calls — no regression in API call volume for normal digital PDFs
+- [x] A Gemini call failure during OCR degrades that one page gracefully (stays low-yield, no crash) — never taken down the whole parse
+
+**Design decision — integrated inside `Parser.parse()`, not a separate post-processing pass.** A separate pass would need the original page images to send to Gemini; `ParsedDocument` doesn't carry those today (only `FIGURE` elements carry cropped images), so a separate pass would either re-run Docling's entire (expensive, 60-120s) conversion a second time just to get page images, or `ParsedDocument` would need a new field exposing raw page images to the outside world for a need nothing else has. Doing it inline reuses the exact same `converter.convert()` call already producing `doc.pages[n].image` (with `generate_page_images=True` added to the pipeline options) and lets OCR-recovered elements get appended to the same `elements` list before `ParsedDocument` is even constructed — `chunker.py` sees zero difference between Docling-native and OCR-recovered text by construction, not by a compatibility-mapping step. Matches the existing DI pattern (`Parser.__init__(converter=...)` already injectable; the Gemini OCR client is too, same reasoning STANDARDS.md gives for constructor-injected dependencies).
+
+**Design decision — trigger heuristic deviates from the plan's own suggested example, based on real fixture evidence.** The original scoping note (above, now superseded) offered two illustrative options: a relative element-count threshold, or "zero elements on a page that isn't the document's last page." Implemented as: zero elements of type `TEXT`/`HEADING`/`TABLE`/`LIST` on a page (a lone `FIGURE` doesn't count as "the page has content" — a stray image with no caption/text is still consistent with an unread scanned page). The "not the last page" exemption from the original note is deliberately **not** implemented: `scanned.pdf`'s actual last page (page 3) is itself unread scanned content, not a genuine blank page — exempting it would leave real recoverable content silently unrecovered on exactly the document shape this feature exists for. A wasted OCR call on a genuinely blank last page (rare, low cost, free-tier-covered) is a better failure mode than silently repeating the exact data-loss bug FEAT-004 found.
+
+**Design decision — applies to new ingests only; existing documents are not automatically reprocessed.** OCR fallback lives entirely inside `Parser.parse()`, which only ever runs during the ingest pipeline for a document actively being uploaded (`routes/ingest.py`'s `parser or Parser()`) — there is no scheduled or triggered re-parse of an already-`ready` document anywhere in this codebase. A document ingested before this feature existed keeps whatever chunks it already has; benefiting from OCR fallback after the fact would require re-fetching its original bytes from Storage and re-running the full ingest pipeline, which is exactly the job of `POST /reindex/{document_id}` — already listed in `API_CONTRACT.md`'s "Not-yet-defined endpoints" as planned, Phase 4+, currently unbuilt. Building that reindex mechanism (safe chunk replacement, avoiding orphaned citations pointing at deleted chunks) is real, separate work, out of scope here — stated explicitly rather than left implicit, per the task brief.
+
+**Real recovered content (`scanned.pdf`, real Gemini call, 2026-07-25) — quoted, not paraphrased:**
+- Page 1: unchanged — Docling's own real embedded heading ("SAMPLE LETTER") + the uncaptioned logo figure. **Zero OCR calls on this page** (it already has textual content — the trigger correctly does not fire here).
+- Page 2 (previously 0 elements): *"o the materials inventory that systems were required to complete under the LCR, including the locations of lead service lines and lead plumbing in the system; and o LCR compliance sampling results collected by the system, as well as justifications for invalidation of LCR samples; and (5) Enhance ef[fforts...]"*
+- Page 3 (previously 0 elements, and the document's actual last page — see the trigger-heuristic decision above): *"Thank you in advance for your support to ensure that we are fulfilling our joint responsibility for the protection of public health and to restore public confidence in our shared work to ensure safe drinking water for the American people. Sincerely, Joel Beauvais, Deputy Assistant Administrator, En[closure...]"*
+
+This is a real EPA letter about lead service line compliance — confirms both the heuristic (only genuinely-empty pages triggered) and the last-page decision (page 3, the last page, needed and got OCR, which the original suggested heuristic would have skipped).
+
+**Verification:** `test_parser.py` 18/18 passing (`uv run pytest tests/test_parser.py -v -s`, ~6 min — first-run Docling model load dominates, not OCR). `test_chunker.py` re-run afterward, 21/21 passing, confirming no regression from `scanned_doc`'s fixture now carrying real OCR-recovered elements. Full backend suite re-run for final regression confirmation (see CHANGELOG).
+
 - [FEAT-018] Reranker step — planned
 - [FEAT-019] Conversation memory in prompt — planned
 - [FEAT-020] DOCX/PPTX ingestion — planned

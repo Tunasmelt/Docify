@@ -1,13 +1,17 @@
-# Tests for [FEAT-004] Docling parser service
+# Tests for [FEAT-004] Docling parser service + [FEAT-017] OCR fallback
 #
 # Fixtures (apps/api/tests/fixtures/): clean_digital.pdf (plain formatted
 # doc, one table), table_heavy.pdf (29 tables across 11 pages), scanned.pdf
 # (3-page scan, no text layer except a real-text title on page 1).
 #
 # No single fixture exercises all six element types, so coverage is spread
-# across fixtures rather than asserted on one. OCR is intentionally off
-# (FEAT-017, Phase 4, out of scope) — see the scanned.pdf tests below for
-# what that means in practice.
+# across fixtures rather than asserted on one. Most tests below inject a
+# FakeOcrClient (always returns None) even though FEAT-017's real OCR
+# fallback is now on by default (Parser()'s bare constructor uses a real
+# Gemini client, matching the existing `converter` default) — this keeps
+# Docling-only regression guards deterministic and fast. The OCR-specific
+# tests near the end of this file are the ones that actually exercise
+# real/fake OCR recovery on purpose.
 #
 # Extended 2026-07-22 per Codex review of parser.py: the try/except around
 # converter.convert() didn't cover the element-iteration loop, so a failure
@@ -16,7 +20,9 @@
 # no signal at all. See ParsedDocument.dropped_elements and the WARN logs
 # added for both silent-drop cases (missing provenance, get_image() -> None).
 
+import httpx
 from docling_core.types.doc import DocItemLabel
+from google.genai.errors import ClientError
 from PIL import Image
 
 from services.parser import BBox, ElementType, ParseError, Parser
@@ -29,9 +35,40 @@ def load(name: str) -> bytes:
         return f.read()
 
 
+def _fake_client_error(code: int, message: str) -> ClientError:
+    # Matches test_verifier.py's own helper exactly — same real exception
+    # type (google.genai.errors.ClientError) FEAT-017's live 429 quota
+    # exhaustion (2026-07-26, .agent/MEMORY.md) actually raised, not a
+    # generic stand-in.
+    response = httpx.Response(code, json={"error": {"message": message, "status": "SIMULATED"}})
+    return ClientError(code, response)
+
+
+class FakeOcrClient:
+    """Always returns None (simulates 'OCR unavailable / found nothing')
+    — used by every test below that isn't specifically about FEAT-017's
+    OCR behavior, so those tests keep proving exactly what they always
+    proved (Docling's own extraction) without a real, non-deterministic
+    Gemini call on every run. Also counts calls (and confirms a real
+    image was passed each time), for the cost/scope-guard test — a
+    normal digital PDF must trigger zero of them."""
+
+    def __init__(self):
+        self.call_count = 0
+
+    def transcribe_page(self, image):
+        self.call_count += 1
+        assert isinstance(image, Image.Image)
+        return None
+
+
 # Acceptance criterion: `Parser.parse(pdf_bytes) -> ParsedDocument` returns typed elements: text, heading, table, figure, caption, list
 def test_parse_returns_expected_element_types_across_fixtures():
-    parser = Parser()
+    # FakeOcrClient here: this test is about Docling's own type coverage,
+    # not FEAT-017's OCR behavior (which has its own dedicated tests below)
+    # — a real OCR call would add TEXT elements to scanned.pdf and make
+    # the pinned scanned_types assertion below meaningless noise.
+    parser = Parser(ocr_client=FakeOcrClient())
 
     clean = parser.parse(load("clean_digital.pdf"))
     clean_types = {e.element_type for e in clean.elements}
@@ -266,6 +303,8 @@ def test_element_with_missing_provenance_is_counted_and_logged(caplog):
         prov = []  # missing provenance — this is the exact case Codex flagged
 
     class FakeDoc:
+        pages = {}  # FEAT-017's OCR-fallback pass reads doc.pages — none here, none expected
+
         def iterate_items(self):
             yield FakeItem(), 0
 
@@ -292,7 +331,13 @@ def test_element_with_missing_provenance_is_counted_and_logged(caplog):
 # a no-op on well-formed input. Pin exact counts so any future change to
 # these three fixtures' output is caught immediately.
 def test_element_counts_unchanged_on_well_formed_fixtures():
-    parser = Parser()
+    # FakeOcrClient (returns None): this pins Docling's OWN extraction —
+    # FEAT-017's OCR fallback has its own separate pinned-output test below
+    # (test_ocr_fallback_recovers_real_text_on_scanned_pdf) using the real
+    # client. Without the fake here, scanned.pdf's real OCR recovery would
+    # make this specific regression guard non-deterministic and conflate
+    # two different things it's supposed to catch independently.
+    parser = Parser(ocr_client=FakeOcrClient())
 
     clean = parser.parse(load("clean_digital.pdf"))
     assert len(clean.elements) == 21
@@ -307,21 +352,138 @@ def test_element_counts_unchanged_on_well_formed_fixtures():
     assert scanned.dropped_elements == 0
 
 
-# --- Scanned-PDF degradation behavior (informs FEAT-017 scoping) -----------
+# --- Scanned-PDF degradation behavior, OCR unavailable/found-nothing path --
 #
-# With OCR off, scanned.pdf (3 pages, no text layer) does NOT crash, but
-# produces almost nothing: 1 heading (real embedded text on page 1's title,
-# not OCR'd — this specific PDF has a hybrid layer) and 1 tiny figure (a
-# logo). Pages 2 and 3 produce zero elements each. This is "graceful" in
-# that it doesn't raise, but it's a near-total, silent data loss on a
-# fully-scanned document — FEAT-017 needs a trigger heuristic (e.g. very
-# low element count relative to page count) since nothing here signals
-# that anything went wrong.
-def test_scanned_pdf_degrades_gracefully_without_crashing():
-    parser = Parser()
+# This pins Docling's OWN behavior with OCR fallback present but not
+# recovering anything (FakeOcrClient always returns None) — the real
+# recovery case is test_ocr_fallback_recovers_real_text_on_scanned_pdf
+# below. Docling alone still produces almost nothing on this fixture: 1
+# heading (real embedded text on page 1's title, not OCR'd — this specific
+# PDF has a hybrid layer) and 1 tiny figure (a logo); pages 2 and 3 produce
+# zero elements each from Docling. The invariant this test actually
+# guards: OCR finding nothing on every low-yield page must still degrade
+# gracefully (no crash, no fabricated content) rather than being FEAT-017
+# scoping information about a since-fixed gap.
+def test_scanned_pdf_degrades_gracefully_when_ocr_recovers_nothing():
+    parser = Parser(ocr_client=FakeOcrClient())
 
     doc = parser.parse(load("scanned.pdf"))
 
     assert len(doc.elements) == 2
     pages_with_content = {e.page_number for e in doc.elements}
-    assert pages_with_content == {1}  # pages 2-3 produced nothing at all
+    assert pages_with_content == {1}  # pages 2-3: Docling found nothing, OCR recovered nothing either
+
+
+# --- FEAT-017: OCR fallback ---------------------------------------------
+
+
+# Acceptance criterion: real scanned.pdf, real recovered content per page —
+# real output required, not a pass/fail assertion (task brief, item 6). Uses
+# the REAL Gemini client (Parser()'s bare-constructor default) — the one
+# true integration proof for this feature, same discipline as every other
+# real-Gemini-call test elsewhere in this suite (test_generator.py,
+# test_verifier.py).
+def test_ocr_fallback_recovers_real_text_on_scanned_pdf(capsys):
+    parser = Parser()  # real converter AND real Gemini OCR client — no fakes
+
+    doc = parser.parse(load("scanned.pdf"))
+
+    by_page: dict[int, list] = {}
+    for element in doc.elements:
+        by_page.setdefault(element.page_number, []).append(element)
+
+    with capsys.disabled():
+        print("\n" + "=" * 90)
+        print("FEAT-017 real OCR fallback — actual recovered content, scanned.pdf")
+        print("=" * 90)
+        for page_number in sorted(by_page):
+            print(f"\n--- page {page_number} ---")
+            for element in by_page[page_number]:
+                if isinstance(element.content, str):
+                    print(f"  [{element.element_type.value}] {element.content[:300]!r}")
+                else:
+                    print(f"  [{element.element_type.value}] <image {element.content.size}>")
+
+    # Page 1 has real embedded text (the title) — Docling already extracted
+    # it, so this page must NOT trigger OCR at all (no ocr-page-1 element).
+    assert not any(e.element_id == "ocr-page-1" for e in doc.elements)
+
+    # Pages 2 and 3 (zero elements pre-FEAT-017 — the actual bug this
+    # feature fixes) must now carry real, non-trivial recovered text.
+    page_2_ocr = [e for e in by_page.get(2, []) if e.element_id == "ocr-page-2"]
+    page_3_ocr = [e for e in by_page.get(3, []) if e.element_id == "ocr-page-3"]
+    assert len(page_2_ocr) == 1
+    assert len(page_3_ocr) == 1
+    assert page_2_ocr[0].element_type == ElementType.TEXT
+    assert page_3_ocr[0].element_type == ElementType.TEXT
+    assert len(page_2_ocr[0].content.strip()) > 50
+    assert len(page_3_ocr[0].content.strip()) > 50
+
+    # OCR-recovered elements are ordinary ParsedElements — chunker.py
+    # consumes them identically to Docling-native text, no parallel shape.
+    for element in (page_2_ocr[0], page_3_ocr[0]):
+        assert isinstance(element.content, str)
+        assert isinstance(element.bbox, BBox)
+        assert element.associated_caption_ids == []
+        assert element.association_method is None
+
+
+# Acceptance criterion: cost/scope guard — a normal digital PDF must
+# trigger zero OCR calls, not one per page of every document.
+def test_ocr_fallback_never_fires_on_high_yield_fixtures():
+    ocr_client = FakeOcrClient()
+    parser = Parser(ocr_client=ocr_client)
+
+    parser.parse(load("clean_digital.pdf"))
+    assert ocr_client.call_count == 0
+
+    parser.parse(load("table_heavy.pdf"))
+    assert ocr_client.call_count == 0
+
+
+# A Gemini call failure during OCR degrades that one page gracefully —
+# logged, no crash, page stays unrecovered, parse completes for the rest
+# of the document — never taken down the whole parse (acceptance
+# criterion). Same class of check FEAT-011's audit required for
+# Verifier's own fail-safe behavior (test_verifier.py's
+# test_verify_fails_safe_to_unsupported_when_gemini_api_call_raises):
+# raises the REAL exception type and shape a Gemini quota/rate-limit
+# failure actually takes (google.genai.errors.ClientError, 429) — not a
+# generic stand-in — and this is now a PERMANENT, deterministic
+# regression test for exactly the failure FEAT-017 hit for real
+# (.agent/MEMORY.md, 2026-07-26): a real 429 must never be the only
+# proof this path works.
+def test_ocr_fallback_call_failure_degrades_gracefully_not_a_crash(caplog):
+    class RaisingOcrClient:
+        def __init__(self):
+            self.calls = 0
+
+        def transcribe_page(self, image):
+            self.calls += 1
+            raise _fake_client_error(429, "quota exceeded — simulated")
+
+    ocr_client = RaisingOcrClient()
+    parser = Parser(ocr_client=ocr_client)
+
+    with caplog.at_level("WARNING"):
+        doc = parser.parse(load("scanned.pdf"))
+
+    # No crash: parse() returned normally with the pre-existing page-1
+    # elements intact — a raised OCR call did not propagate out of parse().
+    assert len(doc.elements) == 2
+    assert {e.page_number for e in doc.elements} == {1}
+
+    # Page stays unrecovered: no fabricated content for either page OCR
+    # failed on.
+    assert not any(e.element_id.startswith("ocr-page-") for e in doc.elements)
+
+    # Parse completes for the REST of the document: both low-yield pages
+    # (2 and 3) were independently attempted — one page's failure didn't
+    # abort the loop early and skip the other.
+    assert ocr_client.calls == 2
+
+    # Logged warning: the real failure must be visible in logs, not just
+    # silently swallowed — checked for content, not just presence.
+    warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+    assert any("OCR" in w and ("raised" in w.lower() or "fail" in w.lower()) for w in warnings)
+    assert sum(1 for w in warnings if "page" in w.lower()) >= 2  # one per low-yield page

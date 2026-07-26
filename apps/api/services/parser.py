@@ -1,4 +1,5 @@
 import logging
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from io import BytesIO
@@ -8,20 +9,73 @@ from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling_core.types.doc import DocItemLabel
 from docling_core.types.io import DocumentStream
+from google import genai
+from google.genai import types
 from PIL import Image
 
 logger = logging.getLogger(__name__)
 
+# FEAT-017: gemini-2.5-flash, not the 3.6/3.5 models used for generation/
+# verification — this is Flash proper (vision-native, free tier 1,500
+# req/day), unrelated to the generate/verify model choice. Live-confirmed
+# callable against the real API before use (2026-07-25), not assumed from
+# .agent/api-docs/gemini.md's model table alone.
+OCR_MODEL = "gemini-2.5-flash"
+
+OCR_SYSTEM_PROMPT = (
+    "Transcribe all readable text from this scanned document page, in reading "
+    "order, as plain text. Do not describe the image or add commentary — output "
+    "only the transcribed text. If the page has no readable text at all, output "
+    "nothing."
+)
+
 
 def _default_converter() -> DocumentConverter:
-    # do_ocr=False: OCR fallback for scanned/low-confidence pages is FEAT-017
-    # (Phase 4), deliberately out of scope here. Without this, Docling probes
-    # every page for OCR need and downloads OCR models on first use even for
-    # fully digital PDFs.
+    # do_ocr=False: Docling's own OCR probes every page and downloads OCR
+    # models on first use even for fully digital PDFs — both slow and
+    # redundant now that low-yield pages get a targeted Gemini fallback
+    # instead (FEAT-017) rather than Docling attempting OCR everywhere.
     # generate_picture_images=True: PictureItem.get_image() returns None
     # unless this is set — needed to satisfy "figures as PIL Image objects".
-    options = PdfPipelineOptions(do_ocr=False, generate_picture_images=True)
+    # generate_page_images=True (FEAT-017): the OCR fallback below needs each
+    # low-yield page's own rendered image to send to Gemini — this is the
+    # only way to get it without a second, separate Docling conversion.
+    options = PdfPipelineOptions(do_ocr=False, generate_picture_images=True, generate_page_images=True)
     return DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)})
+
+
+class GeminiOcrClient:
+    """FEAT-017's OCR fallback — a page whose Docling parse yielded
+    suspiciously little gets sent here as a rendered image, once, for a
+    real vision-model transcription. Never raises: a failed OCR call
+    degrades that one page back to "still low-yield," matching this
+    project's established fail-safe discipline elsewhere (Verifier's
+    fail-to-unsupported pattern) rather than taking down the whole parse
+    over one page's bad luck."""
+
+    def __init__(self, client: genai.Client | None = None):
+        self._client = client or genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+    def transcribe_page(self, image: Image.Image) -> str | None:
+        try:
+            buf = BytesIO()
+            image.save(buf, format="PNG")
+            response = self._client.models.generate_content(
+                model=OCR_MODEL,
+                contents=[
+                    types.Part.from_text(text=OCR_SYSTEM_PROMPT),
+                    types.Part.from_bytes(data=buf.getvalue(), mime_type="image/png"),
+                ],
+            )
+            text = response.text
+            return text.strip() if text and text.strip() else None
+        except Exception:
+            logger.warning("parser: OCR fallback call failed for a page — page remains unrecovered", exc_info=True)
+            return None
+
+
+def _default_ocr_client() -> GeminiOcrClient:
+    return GeminiOcrClient()
 
 
 class ElementType(str, Enum):
@@ -31,6 +85,14 @@ class ElementType(str, Enum):
     FIGURE = "figure"
     CAPTION = "caption"
     LIST = "list"
+
+
+# FEAT-017's trigger set: a page with zero elements of these types is
+# "low-yield" regardless of how many FIGURE/CAPTION elements it has. A lone
+# figure with no text around it is still consistent with an unread scanned
+# page — CAPTION is excluded too since a caption never appears without a
+# table/figure it belongs to, so it carries no independent signal either.
+_TEXTUAL_ELEMENT_TYPES = {ElementType.TEXT, ElementType.HEADING, ElementType.TABLE, ElementType.LIST}
 
 
 # Matches .agent/SCHEMA.md's `element_type` enum exactly. Docling labels not
@@ -104,8 +166,14 @@ class ParsedDocument:
 
 
 class Parser:
-    def __init__(self, converter: DocumentConverter | None = None):
+    def __init__(self, converter: DocumentConverter | None = None, ocr_client: GeminiOcrClient | None = None):
         self._converter = converter or _default_converter()
+        # Real by default, same as `converter` — OCR fallback is production
+        # behavior, not an opt-in extra a caller has to remember to wire up.
+        # routes/ingest.py constructs Parser() with no arguments and gets it
+        # automatically. Tests that don't want a real Gemini call inject a
+        # fake here explicitly (see test_parser.py).
+        self._ocr_client = ocr_client or _default_ocr_client()
 
     def parse(self, pdf_bytes: bytes) -> ParsedDocument:
         stream = DocumentStream(name="document.pdf", stream=BytesIO(pdf_bytes))
@@ -200,5 +268,57 @@ class Parser:
             raise ParseError(
                 f"Failed while processing document elements: {exc}", page_number=last_page_number
             ) from exc
+
+        # FEAT-017: OCR fallback for low-yield pages. Runs after Docling's
+        # own extraction is fully done (elements above are final) and
+        # outside the try/except above on purpose — a failed OCR call must
+        # never become a ParseError for the whole document (GeminiOcrClient
+        # itself never raises; this loop only needs to survive a page whose
+        # rendered image is unexpectedly missing).
+        pages_with_textual_content = {
+            e.page_number for e in elements if e.element_type in _TEXTUAL_ELEMENT_TYPES
+        }
+        for page_number, page in doc.pages.items():
+            if page_number in pages_with_textual_content:
+                continue
+            page_image = page.image.pil_image if page.image else None
+            if page_image is None:
+                logger.warning(
+                    "parser: page %s has no textual elements and no rendered page image "
+                    "(generate_page_images produced nothing) — cannot attempt OCR fallback",
+                    page_number,
+                )
+                continue
+
+            # The try/except here is deliberate, on top of GeminiOcrClient's
+            # own internal one: ocr_client is an injectable dependency (any
+            # object with transcribe_page), so this loop can't assume every
+            # possible implementation fails safe on its own. One page's OCR
+            # call blowing up must never take down the rest of the parse.
+            try:
+                recovered_text = self._ocr_client.transcribe_page(page_image)
+            except Exception:
+                logger.warning(
+                    "parser: OCR client raised for page %s — page remains low-yield", page_number, exc_info=True
+                )
+                continue
+            if not recovered_text:
+                logger.warning(
+                    "parser: OCR fallback found no recoverable text on page %s — page remains low-yield",
+                    page_number,
+                )
+                continue
+
+            width, height = page_image.size
+            elements.append(
+                ParsedElement(
+                    element_type=ElementType.TEXT,
+                    page_number=page_number,
+                    bbox=BBox(x0=0.0, y0=0.0, x1=float(width), y1=float(height)),
+                    content=recovered_text,
+                    element_id=f"ocr-page-{page_number}",
+                )
+            )
+            logger.info("parser: OCR fallback recovered text on page %s", page_number)
 
         return ParsedDocument(elements=elements, dropped_elements=dropped_elements)
