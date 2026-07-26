@@ -18,12 +18,24 @@
 #    Voyage calls — slow, costs quota), same pattern as
 #    test_ingest_e2e.py. Run explicitly and reported, not just asserted.
 
+import logging
 import os
 import time
 
 import pytest
+from voyageai.error import RateLimitError
 
-from services.retriever import DEFAULT_K, RRF_K, RetrievedChunk, Retriever, _reciprocal_rank_fusion
+from services.retriever import (
+    DEFAULT_K,
+    RERANK_MODEL,
+    RERANK_POOL_SIZE,
+    RRF_K,
+    Reranker,
+    RetrievedChunk,
+    Retriever,
+    _candidate_pool_size,
+    _reciprocal_rank_fusion,
+)
 
 
 class FakeQueryEmbedder:
@@ -37,6 +49,52 @@ class FakeQueryEmbedder:
 
     def embed_query(self, text: str):
         return self._vector
+
+
+class FakeReranker:
+    """Records every rerank() call (query, candidates, k) for wiring/
+    cost-guard assertions. With no rerank_fn injected, returns None on
+    every call — doubling as both "reranker not wired at all" (calls
+    stays empty) and "reranker was attempted but failed" (calls records
+    it, return value simulates a real Voyage failure) depending on which
+    the test cares about."""
+
+    def __init__(self, rerank_fn=None):
+        self._rerank_fn = rerank_fn
+        self.calls = []
+
+    def rerank(self, query, candidates, k):
+        self.calls.append((query, candidates, k))
+        if self._rerank_fn is None:
+            return None
+        return self._rerank_fn(query, candidates, k)
+
+
+class _FakeRerankResult:
+    def __init__(self, index, relevance_score):
+        self.index = index
+        self.relevance_score = relevance_score
+
+
+class _FakeRerankResponse:
+    def __init__(self, results):
+        self.results = results
+
+
+class _FakeVoyageRerankClient:
+    """Stands in for voyageai.Client for Reranker-level unit tests — no
+    real network call, no real API key needed."""
+
+    def __init__(self, response=None, exception=None):
+        self._response = response
+        self._exception = exception
+        self.calls = []
+
+    def rerank(self, query, documents, model, top_k=None, truncation=True):
+        self.calls.append({"query": query, "documents": documents, "model": model, "top_k": top_k})
+        if self._exception is not None:
+            raise self._exception
+        return self._response
 
 
 def _vector_along_dimension(dim_index: int, size: int = 1024) -> list[float]:
@@ -361,6 +419,181 @@ def test_document_ids_scoping_excludes_the_same_users_other_documents(admin, use
     assert results[0].chunk_id == included_chunk_id
 
 
+# --- Reranking (FEAT-009 follow-up): Reranker unit tests --------------------
+
+
+def test_reranker_maps_relevance_scores_back_to_original_rows_in_returned_order():
+    row_a = {"id": "a", "content": "alpha"}
+    row_b = {"id": "b", "content": "beta"}
+    # RRF scores deliberately opposite of the rerank order below, so the
+    # assertion can only pass if Reranker actually used Voyage's order,
+    # not silently kept RRF's.
+    candidates = [(row_a, 0.01), (row_b, 0.02)]
+
+    fake_client = _FakeVoyageRerankClient(
+        response=_FakeRerankResponse(
+            [
+                _FakeRerankResult(index=1, relevance_score=0.9),  # row_b, Voyage's #1 pick
+                _FakeRerankResult(index=0, relevance_score=0.3),
+            ]
+        )
+    )
+    reranker = Reranker(client=fake_client)
+
+    result = reranker.rerank("question", candidates, k=2)
+
+    assert result == [(row_b, 0.9), (row_a, 0.3)]
+    call = fake_client.calls[0]
+    assert call["documents"] == ["alpha", "beta"]
+    assert call["model"] == RERANK_MODEL
+    assert call["top_k"] == 2
+
+
+def test_reranker_returns_empty_list_immediately_for_empty_candidates():
+    fake_client = _FakeVoyageRerankClient()
+    reranker = Reranker(client=fake_client)
+
+    result = reranker.rerank("question", [], k=5)
+
+    assert result == []
+    assert fake_client.calls == []
+
+
+def test_reranker_returns_none_on_voyage_error_not_a_crash(caplog):
+    fake_client = _FakeVoyageRerankClient(exception=RateLimitError("simulated rate limit"))
+    reranker = Reranker(client=fake_client)
+
+    with caplog.at_level(logging.WARNING):
+        result = reranker.rerank("question", [({"id": "a", "content": "x"}, 0.1)], k=1)
+
+    assert result is None
+    assert "falling back to RRF ranking" in caplog.text
+
+
+def test_reranker_returns_none_on_malformed_response_shape_not_a_crash(caplog):
+    class _ResponseWithNoResultsAttribute:
+        pass
+
+    fake_client = _FakeVoyageRerankClient(response=_ResponseWithNoResultsAttribute())
+    reranker = Reranker(client=fake_client)
+
+    with caplog.at_level(logging.WARNING):
+        result = reranker.rerank("question", [({"id": "a", "content": "x"}, 0.1)], k=1)
+
+    assert result is None
+    assert "falling back to RRF ranking" in caplog.text
+
+
+def test_reranker_construction_never_touches_network_or_requires_api_key(monkeypatch):
+    # Same lazy-credential discipline as FEAT-017's OCR tiers: constructing
+    # a Reranker must not eagerly build a real voyageai.Client (which was
+    # confirmed live to raise AuthenticationError immediately if
+    # VOYAGE_API_KEY is absent) — only an actual rerank() call may do that.
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    Reranker()  # must not raise
+
+
+# --- Reranking (FEAT-009 follow-up): Retriever.retrieve(rerank=...) wiring ---
+
+
+def test_rerank_is_opt_in_reranker_never_called_when_rerank_not_requested(admin, user_a):
+    user_id, _token = user_a
+    document_id = _create_document(admin, user_id, "rerank-off.pdf")
+    _insert_chunk(
+        admin,
+        document_id=document_id,
+        user_id=user_id,
+        chunk_index=0,
+        content="some retrievable content",
+        embedding=_vector_along_dimension(0),
+    )
+
+    fake_reranker = FakeReranker()
+    retriever = Retriever(
+        client=admin, embedder=FakeQueryEmbedder(_vector_along_dimension(0)), reranker=fake_reranker
+    )
+    retriever.retrieve("some question", [document_id], user_id, k=5)  # rerank defaults to False
+
+    assert fake_reranker.calls == [], "reranker must not be invoked unless rerank=True is explicitly passed"
+
+
+def test_rerank_true_uses_the_rerankers_result_ordering_when_it_succeeds(admin, user_a):
+    user_id, _token = user_a
+    document_id = _create_document(admin, user_id, "rerank-order.pdf")
+    vector = _vector_along_dimension(0)
+    _insert_chunk(
+        admin, document_id=document_id, user_id=user_id, chunk_index=0, content="alpha content", embedding=vector
+    )
+    _insert_chunk(
+        admin, document_id=document_id, user_id=user_id, chunk_index=1, content="beta content", embedding=vector
+    )
+
+    # Reverses whatever RRF handed it — reuses the exact real row dicts
+    # the retriever passed in, so this is agnostic to Postgres's own
+    # tie-breaking order between the two identically-embedded chunks.
+    def reversing_rerank_fn(query, candidates, k):
+        return list(reversed(candidates))[:k]
+
+    fake_reranker = FakeReranker(rerank_fn=reversing_rerank_fn)
+    retriever = Retriever(client=admin, embedder=FakeQueryEmbedder(vector), reranker=fake_reranker)
+
+    results = retriever.retrieve("question", [document_id], user_id, k=2, rerank=True)
+
+    assert len(fake_reranker.calls) == 1
+    _query, candidates_received, k_received = fake_reranker.calls[0]
+    assert k_received == 2
+    expected_order = [row["id"] for row, _score in reversed(candidates_received)]
+    assert [r.chunk_id for r in results] == expected_order
+
+
+def test_rerank_true_falls_back_to_rrf_ranking_when_reranker_fails(admin, user_a):
+    user_id, _token = user_a
+    document_id = _create_document(admin, user_id, "rerank-fallback.pdf")
+    vector = _vector_along_dimension(0)
+    _insert_chunk(
+        admin, document_id=document_id, user_id=user_id, chunk_index=0, content="alpha content", embedding=vector
+    )
+    _insert_chunk(
+        admin, document_id=document_id, user_id=user_id, chunk_index=1, content="beta content", embedding=vector
+    )
+
+    fake_reranker = FakeReranker()  # no rerank_fn -> returns None, simulating a real Voyage failure
+
+    retriever_rerank_on = Retriever(client=admin, embedder=FakeQueryEmbedder(vector), reranker=fake_reranker)
+    retriever_rerank_off = Retriever(client=admin, embedder=FakeQueryEmbedder(vector))
+
+    results_with_failed_rerank = retriever_rerank_on.retrieve(
+        "question", [document_id], user_id, k=5, rerank=True
+    )
+    results_baseline = retriever_rerank_off.retrieve("question", [document_id], user_id, k=5, rerank=False)
+
+    assert len(fake_reranker.calls) == 1, "rerank must have been attempted, not skipped"
+    assert [r.chunk_id for r in results_with_failed_rerank] == [r.chunk_id for r in results_baseline]
+
+
+def test_rerank_true_sends_the_rerank_pool_not_just_the_final_k(admin, user_a):
+    user_id, _token = user_a
+    document_id = _create_document(admin, user_id, "rerank-pool.pdf")
+    vector = _vector_along_dimension(0)
+    for i in range(3):
+        _insert_chunk(
+            admin, document_id=document_id, user_id=user_id, chunk_index=i, content=f"content {i}", embedding=vector
+        )
+
+    fake_reranker = FakeReranker(rerank_fn=lambda query, candidates, k: candidates[:k])
+    retriever = Retriever(client=admin, embedder=FakeQueryEmbedder(vector), reranker=fake_reranker)
+
+    retriever.retrieve("question", [document_id], user_id, k=2, rerank=True)
+
+    _query, candidates_received, k_received = fake_reranker.calls[0]
+    assert k_received == 2
+    # All 3 fused candidates are handed to the reranker, not just the
+    # final k=2 — reranking can only promote a lower-ranked chunk if it's
+    # actually given the chance to see it.
+    assert len(candidates_received) == 3
+    assert RERANK_POOL_SIZE == 20  # documents this test's "give it more than k" premise
+
+
 # --- Part 2: quality (slow, real) --------------------------------------------
 
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -470,3 +703,138 @@ def test_retrieval_quality_against_real_table_heavy_pdf(admin, user_a):
     admin.table("documents").delete().eq("id", document_id).execute()
 
     assert all_passed
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_RETRIEVAL_QUALITY_TEST") != "1",
+    reason="set RUN_RETRIEVAL_QUALITY_TEST=1 to run real Docling+Voyage rerank quality/latency checks (slow, uses Voyage quota)",
+)
+def test_reranking_effect_on_real_table_heavy_pdf_quality_questions(admin, user_a):
+    """FEAT-009 rerank follow-up, task item 4/5: re-run the EXACT same 4
+    quality questions above, paired same-run against both RRF-only and
+    RRF+rerank, to report (a) whether reranking actually moves the
+    expected chunk's rank and (b) reranking's own real added latency.
+
+    Reuses the already-computed RRF-fused candidate pool for both the
+    baseline and reranked comparison per question (embed_query() is
+    called exactly once per question, matching FEAT-009's own original
+    call budget) rather than calling retrieve() twice, which would
+    double real Voyage embedding calls against this account's already-
+    tight 3 RPM free-tier cap for no benefit — the baseline is byte-for-
+    byte what retrieve(rerank=False) would return (identical fused[:k]
+    slice), so nothing about the comparison's validity is lost.
+    """
+    from services.chunker import Chunker
+    from services.embedder import Embedder
+    from services.parser import Parser
+
+    user_id, _token = user_a
+
+    with open(os.path.join(FIXTURES, "table_heavy.pdf"), "rb") as f:
+        pdf_bytes = f.read()
+
+    parsed = Parser().parse(pdf_bytes)
+    chunks = Chunker().chunk(parsed)
+    embedder = Embedder()
+    vectors = embedder.embed(chunks)
+
+    document_id = _create_document(admin, user_id, "table_heavy_rerank.pdf")
+    rows = []
+    for chunk, vector in zip(chunks, vectors, strict=True):
+        rows.append(
+            {
+                "document_id": document_id,
+                "user_id": user_id,
+                "chunk_index": chunk.chunk_index,
+                "element_type": chunk.element_type.value,
+                "page_number": min(chunk.page_numbers),
+                "content": chunk.content,
+                "embedding": vector,
+            }
+        )
+    admin.table("chunks").insert(rows).execute()
+
+    for image in (c.image for c in chunks if c.image is not None):
+        image.close()
+
+    retriever = Retriever(client=admin)  # real Embedder, real Reranker
+
+    # Same 3 RPM free-tier pacing FEAT-009's own quality test hit and
+    # documented — this test makes 4 real embed_query calls (one per
+    # question, same as the original) plus 4 real rerank calls (a
+    # separate Voyage endpoint; not confirmed to share the same
+    # rate-limit bucket, see .agent/api-docs/voyage.md's rerank section).
+    time.sleep(25)
+
+    k = 5
+    print("\n" + "=" * 90)
+    print("FEAT-009 rerank follow-up — real quality + latency comparison, table_heavy.pdf")
+    print("=" * 90)
+
+    rerank_latencies_ms = []
+    summary_rows = []
+
+    for i, spec in enumerate(QUALITY_QUESTIONS):
+        if i > 0:
+            time.sleep(25)
+
+        query_vector = retriever._embedder.embed_query(spec["question"])
+        pool_size = _candidate_pool_size(k)
+        vector_results = retriever._vector_search(query_vector, [document_id], user_id, pool_size)
+        fts_results = retriever._fts_search(spec["question"], [document_id], user_id, pool_size)
+        fused = _reciprocal_rank_fusion(vector_results, fts_results, rrf_k=RRF_K)
+
+        def rank_of_expected(rows_with_scores, substring=spec["expect_substring"]):
+            return next(
+                (rank for rank, (row, _score) in enumerate(rows_with_scores, start=1) if substring.lower() in row["content"].lower()),
+                None,
+            )
+
+        baseline = fused[:k]
+        baseline_rank = rank_of_expected(baseline)
+
+        candidate_pool = fused[: max(RERANK_POOL_SIZE, k)]
+        started = time.perf_counter()
+        reranked = retriever._reranker.rerank(spec["question"], candidate_pool, k)
+        rerank_latency_ms = (time.perf_counter() - started) * 1000
+        rerank_latencies_ms.append(rerank_latency_ms)
+
+        print(f"\nQ: {spec['question']}")
+        print(f"   (expecting a chunk containing {spec['expect_substring']!r} — {spec['why']})")
+        print(f"   rerank call latency: {rerank_latency_ms:.1f}ms")
+
+        if reranked is None:
+            print("   RERANK CALL FAILED (see WARNING log above) — reporting real degradation, not hiding it")
+            reranked_rank = baseline_rank
+            delta = "N/A (rerank call failed, fell back to RRF)"
+        else:
+            reranked_rank = rank_of_expected(reranked)
+            if baseline_rank is None or reranked_rank is None:
+                delta = "N/A (not found in candidate pool by one or both methods)"
+            elif reranked_rank < baseline_rank:
+                delta = "IMPROVED"
+            elif reranked_rank > baseline_rank:
+                delta = "WORSE"
+            else:
+                delta = "SAME"
+
+        print(f"   baseline (RRF only) rank of expected chunk: {baseline_rank}")
+        print(f"   reranked rank of expected chunk:            {reranked_rank}")
+        print(f"   -> {delta}")
+        summary_rows.append((spec["question"], baseline_rank, reranked_rank, delta))
+
+    print("\n" + "=" * 90)
+    print("Summary — baseline (RRF) rank vs reranked rank, real table_heavy.pdf:")
+    for question, baseline_rank, reranked_rank, delta in summary_rows:
+        print(f"  {delta:45s} baseline={baseline_rank} reranked={reranked_rank}  {question}")
+    successful_latencies = [ms for ms in rerank_latencies_ms if ms is not None]
+    if successful_latencies:
+        print(
+            f"\nReal rerank call latency — mean {sum(successful_latencies) / len(successful_latencies):.1f}ms, "
+            f"min {min(successful_latencies):.1f}ms, max {max(successful_latencies):.1f}ms "
+            f"(n={len(successful_latencies)} calls, k={k}, pool size <= {RERANK_POOL_SIZE})"
+        )
+    print("=" * 90)
+
+    admin.table("chunks").delete().eq("document_id", document_id).execute()
+    admin.table("documents").delete().eq("id", document_id).execute()

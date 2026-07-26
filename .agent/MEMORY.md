@@ -70,11 +70,6 @@ Things tried and failed, or explicitly rejected during design. Do not retry with
 
 Things that need human input before proceeding. Do not assume answers.
 
-### 2026-07-22 [claude-code] — Rerank in Phase 2 or Phase 4
-**Context:** Voyage rerank-2 or a cross-encoder could improve retrieval precision.
-**Leaning:** Defer to Phase 4. Measure quality without it first — if RRF alone is sufficient, rerank adds latency without value.
-**Blocking:** Not blocking; can start Phase 2 without rerank.
-
 ### 2026-07-22 [claude-code] — Chunking granularity
 **Context:** ~500-token target chosen. Could be smaller (finer citations) or larger (more context per chunk).
 **Leaning:** Start at 500 tokens with element-boundary respect. Revisit after real documents are ingested.
@@ -126,6 +121,11 @@ Every fork, what was chosen, why. Append-only.
 **Alternatives considered:** Ship single-user v1, retrofit multi-tenancy later.
 **Chosen:** Multi-tenant schema from day 1, tested single-user until Phase 3.
 **Reasoning:** Retrofitting is painful (touches every query). RLS at schema is a one-time cost that closes an entire class of bugs permanently.
+
+### 2026-07-27 [claude-code] — Reranking: opt-in (`rerank=True`), not default-on (resolves the 2026-07-22 open question)
+**Alternatives considered:** Always-on reranking for every `retrieve()` call; opt-in caller-toggled parameter.
+**Chosen:** Opt-in — `retrieve(..., rerank: bool = False)`, Voyage `rerank-2.5`, default off.
+**Reasoning:** The original open question's leaning ("measure quality without it first") was followed: FEAT-009's real quality fixture already found RRF alone lands the expected chunk in the top-5 4/4 times. Re-running the exact same 4 questions with reranking enabled found real added latency (mean 380.8ms) but zero rank improvement in that run (baseline already sat at rank 1 for all 4 — a ceiling this particular run couldn't test past) and, importantly, zero regression either. Given real cost with no demonstrated benefit yet, opt-in stands; revisit if/when a caller with a harder real question set shows RRF alone falling short. Full write-up: `.agent/FEATURES.md`'s FEAT-009 entry, CHANGELOG.md 2026-07-27.
 
 ### 2026-07-22 [claude-code] — Repo shape: monorepo
 **Alternatives considered:** Two separate repos (apps/web, apps/api).

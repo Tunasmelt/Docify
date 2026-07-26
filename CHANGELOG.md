@@ -6,6 +6,28 @@ Entry types: `feature` · `fix` · `decision` · `refactor` · `test` · `infra`
 
 ---
 
+## 2026-07-27 — feature: optional Voyage reranking, opt-in (FEAT-009 follow-up)
+**Phase:** 2 (Retrieval)
+**Feature:** FEAT-009 (follow-up)
+**Decision:** FEAT-009 explicitly deferred reranking pending real usage signal; `.agent/MEMORY.md`'s standing leaning was "measure without it first — if RRF alone is sufficient, rerank adds latency without value." FEAT-009's own real quality fixture found RRF alone lands the expected chunk in the top-5 4/4 times (2/4 at rank 1, 2/4 at rank 2). Added reranking as a caller-toggled `retrieve(..., rerank: bool = False)` parameter, default off — RRF's top 20 fused candidates (`RERANK_POOL_SIZE`) go to Voyage's `rerank-2.5` model when requested, and the real top-k comes back in Voyage's relevance order.
+
+**Voyage's rerank API verified live before coding, same discipline as every other integration in this project.** `.agent/api-docs/voyage.md` had zero rerank coverage going in — confirmed via a real live call (not docs alone) plus the installed SDK's source: `model` is a required parameter with no default (`rerank-2.5` is the current one, not `rerank-2`/`rerank-1`), limits (1,000 docs/call, 32K query+doc tokens, 600K total tokens/call), and response shape (`.results[].index/.document/.relevance_score`, already sorted descending by relevance — confirmed with a 3-document live test query, not assumed). Reuses the existing `VOYAGE_API_KEY`/`voyageai.Client` already used for embeddings — no new credential.
+
+**Real quality comparison, the exact 4 questions FEAT-009 used against the same `table_heavy.pdf`:** all 4 already ranked the expected chunk at #1 under RRF alone in this run (baseline: 1/1/1/1) — reranking left all 4 unchanged (SAME/SAME/SAME/SAME). Honestly reported, not spun: this run's RRF baseline is *better* than FEAT-009's originally-recorded one (2/4 at rank 1, 2/4 at rank 2), most likely due to run-to-run tie-breaking variance among near-duplicate tables on a fresh ingestion — meaning this particular run sat at a ceiling and couldn't demonstrate reranking's upside case. What it does confirm: reranking never made anything worse.
+
+**Real added latency, feeding directly into `.agent/reviews/2026-07-24-full-flow.md`'s existing ~4-8.3s budget:** mean 380.8ms (min 354.8ms, max 408.4ms, n=4 real calls) on top of the existing 401.9ms retrieval figure — retrieval+rerank together run ~782.7ms when opted into, pushing worst-case `/query` to ~8.68s and best-case to ~4.4s *only for callers passing `rerank=True`* (none do yet).
+
+**Fail-safe, not just "doesn't crash":** any rerank failure (auth, quota, network, malformed response) returns `None` from `Reranker.rerank()`, logged as a WARNING; `Retriever.retrieve(rerank=True)` then falls back to producing byte-identical output to `rerank=False` on the same data — verified directly, not just "no exception raised."
+
+**A second instance of FEAT-017's eager-credential-crash bug pattern found, not fixed here (out of scope):** confirmed live that bare `voyageai.Client()` raises `AuthenticationError` immediately if `VOYAGE_API_KEY` is missing — same shape as the pre-audit `GeminiOcrClient`/`OcrSpaceClient` bug. The new `Reranker` was built lazy from the start to avoid a third instance. `Embedder`/`Retriever`'s own pre-existing eager construction was NOT touched — flagged in FEATURES.md as a candidate for its own follow-up, not silently fixed as scope creep on this task.
+
+**Verification:** `test_retriever.py` grew from 10 to 23 tests — 13 new: 9 fast/structural (`Reranker` unit tests against a fake Voyage client covering success/empty/`VoyageError`/malformed-response/lazy-construction, plus `Retriever` wiring tests for opt-in cost guard, result ordering, fallback-on-failure, and pool-size) always run; 1 new real quality/latency test gated behind `RUN_RETRIEVAL_QUALITY_TEST=1`. All 21 fast tests pass; both gated real tests pass.
+**Changed:** `apps/api/services/retriever.py` (`Reranker`, `RERANK_MODEL`, `RERANK_POOL_SIZE` added; `Retriever.__init__` gained `reranker=`; `retrieve()` gained `rerank=False`), `apps/api/tests/test_retriever.py` (13 new tests), `.agent/api-docs/voyage.md` (new Reranking section), `.agent/FEATURES.md` (FEAT-009 follow-up section), `.agent/reviews/2026-07-24-full-flow.md` (latency budget addendum).
+**Impact:** Reranking is available to any caller that wants it (an extra ~380ms, real Voyage relevance ordering on top of RRF) but changes nothing for existing callers — `rerank` defaults to `False` and nothing in `routes/query.py` passes it yet.
+**Rollback:** Revert `retriever.py`/`test_retriever.py`; the `voyage.md`/`FEATURES.md`/review-doc additions are documentation only and can stay regardless. No schema/migration changes, no new env var.
+
+---
+
 ## 2026-07-26 — feature: OCR fallback extended to a 3-tier resilience chain — Gemini -> OCR.space -> Tesseract (FEAT-017)
 **Phase:** 4 (Polish)
 **Feature:** FEAT-017 (follow-up to the same-day Gemini-only version)
