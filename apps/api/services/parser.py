@@ -1,9 +1,12 @@
+import base64
 import logging
 import os
 from dataclasses import dataclass, field
 from enum import Enum
 from io import BytesIO
 
+import httpx
+import pytesseract
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
@@ -44,23 +47,49 @@ def _default_converter() -> DocumentConverter:
     return DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)})
 
 
+# Audit finding (2026-07-26): with no explicit http_options.timeout, the
+# genai SDK passes timeout=None straight through to httpx — confirmed
+# directly against the installed SDK source (_api_client.py), not
+# assumed — which httpx treats as "no timeout at all," not "use a
+# default." A hung connection would block this call, and therefore the
+# whole per-page OCR step (and the pages after it), indefinitely. Same
+# reasoning as OcrSpaceClient's explicit 60s below.
+OCR_TIMEOUT_MS = 60_000
+
+
 class GeminiOcrClient:
-    """FEAT-017's OCR fallback — a page whose Docling parse yielded
-    suspiciously little gets sent here as a rendered image, once, for a
-    real vision-model transcription. Never raises: a failed OCR call
-    degrades that one page back to "still low-yield," matching this
-    project's established fail-safe discipline elsewhere (Verifier's
-    fail-to-unsupported pattern) rather than taking down the whole parse
-    over one page's bad luck."""
+    """Tier 1 of FEAT-017's OCR fallback chain — a page whose Docling
+    parse yielded suspiciously little gets sent here first, as a rendered
+    image, for a real vision-model transcription. Never raises: a failed
+    call returns None so the chain (in Parser.parse()) moves on to tier
+    2, matching this project's established fail-safe discipline elsewhere
+    (Verifier's fail-to-unsupported pattern)."""
 
     def __init__(self, client: genai.Client | None = None):
-        self._client = client or genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        # Deliberately NOT resolved here (audit finding, 2026-07-26): the
+        # original eager `client or genai.Client(api_key=os.environ[...])`
+        # read GEMINI_API_KEY at Parser()-construction time — meaning a
+        # missing key crashed the whole Parser(), even for a document that
+        # would never once trigger OCR. Resolved lazily instead, inside
+        # transcribe_page()'s own try/except below, so a missing/bad key
+        # becomes an ordinary per-call tier failure (logged, chain moves
+        # to tier 2) — never a Parser()-construction-time crash.
+        self._client = client
+
+    def _get_client(self) -> genai.Client:
+        if self._client is None:
+            self._client = genai.Client(
+                api_key=os.environ["GEMINI_API_KEY"],
+                http_options=types.HttpOptions(timeout=OCR_TIMEOUT_MS),
+            )
+        return self._client
 
     def transcribe_page(self, image: Image.Image) -> str | None:
         try:
+            client = self._get_client()
             buf = BytesIO()
             image.save(buf, format="PNG")
-            response = self._client.models.generate_content(
+            response = client.models.generate_content(
                 model=OCR_MODEL,
                 contents=[
                     types.Part.from_text(text=OCR_SYSTEM_PROMPT),
@@ -70,12 +99,107 @@ class GeminiOcrClient:
             text = response.text
             return text.strip() if text and text.strip() else None
         except Exception:
-            logger.warning("parser: OCR fallback call failed for a page — page remains unrecovered", exc_info=True)
+            logger.warning("parser: Gemini OCR tier call failed for a page", exc_info=True)
             return None
 
 
-def _default_ocr_client() -> GeminiOcrClient:
-    return GeminiOcrClient()
+# Tier 2: OCR.space — a plain REST API, not an SDK (.agent/api-docs/ocrspace.md,
+# verified live 2026-07-26). Deliberately a second, independent vendor: a
+# Gemini-side outage or quota exhaustion (a real, hit-live constraint —
+# see .agent/MEMORY.md's 2026-07-26 entry) has zero chance of also taking
+# out this tier, since it's a different company's infrastructure entirely.
+OCR_SPACE_URL = "https://api.ocr.space/parse/image"
+OCR_SPACE_ENGINE = 2  # the newer/more-accurate of OCR.space's two engines — see ocrspace.md
+
+
+class OcrSpaceClient:
+    """Tier 2. Same never-raises contract as GeminiOcrClient — a failure
+    here (network, auth, or the API's own IsErroredOnProcessing flag,
+    which can come back on a 200 OK) returns None so the chain falls
+    through to tier 3."""
+
+    def __init__(self, api_key: str | None = None, http_client: httpx.Client | None = None):
+        # api_key resolution deliberately deferred to transcribe_page()'s
+        # own try/except (same reasoning as GeminiOcrClient, audit finding
+        # 2026-07-26) — os.environ["OCR_SPACE_API_KEY"] here at
+        # construction time would crash Parser() itself if unset, not just
+        # this one tier. The httpx.Client itself is safe to build eagerly;
+        # it doesn't need the key.
+        self._api_key = api_key
+        self._http = http_client or httpx.Client(timeout=OCR_TIMEOUT_MS / 1000.0)
+
+    def _get_api_key(self) -> str:
+        if self._api_key is None:
+            self._api_key = os.environ["OCR_SPACE_API_KEY"]
+        return self._api_key
+
+    def transcribe_page(self, image: Image.Image) -> str | None:
+        try:
+            api_key = self._get_api_key()
+            buf = BytesIO()
+            image.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            response = self._http.post(
+                OCR_SPACE_URL,
+                headers={"apikey": api_key},
+                data={"base64Image": f"data:image/png;base64,{b64}", "OCREngine": OCR_SPACE_ENGINE},
+            )
+            response.raise_for_status()
+            body = response.json()
+            # A processing failure comes back as a normal 200 OK with this
+            # flag set — raise_for_status() above does not catch it.
+            if body.get("IsErroredOnProcessing"):
+                logger.warning("parser: OCR.space reported a processing error: %s", body.get("ErrorMessage"))
+                return None
+            parsed_results = body.get("ParsedResults") or []
+            if not parsed_results:
+                return None
+            text = parsed_results[0].get("ParsedText")
+            return text.strip() if text and text.strip() else None
+        except Exception:
+            logger.warning("parser: OCR.space tier call failed for a page", exc_info=True)
+            return None
+
+
+class TesseractOcrClient:
+    """Tier 3, the last resort: self-hosted, no network call, no vendor
+    quota of any kind to exhaust — always available as long as the
+    container has the tesseract-ocr system binary installed (Docker-only
+    on Render; see ARCHITECTURE.md's deploy constraint). TESSERACT_CMD
+    lets local dev point at a binary that isn't on PATH (e.g. a Windows
+    install) without affecting the Docker/Linux production path, where
+    `tesseract` is already on PATH after the apt-get install."""
+
+    def __init__(self, tesseract_cmd: str | None = None):
+        cmd = tesseract_cmd or os.environ.get("TESSERACT_CMD")
+        if cmd:
+            pytesseract.pytesseract.tesseract_cmd = cmd
+
+    def transcribe_page(self, image: Image.Image) -> str | None:
+        try:
+            # timeout=0 (pytesseract's own default) means "no timeout at
+            # all" — confirmed directly against the installed source
+            # (pytesseract.py's timeout_manager: a falsy value skips
+            # subprocess.communicate()'s own timeout entirely). A hung
+            # tesseract process (a real, documented failure mode on
+            # certain pathological images) would otherwise block this
+            # call, and the rest of the parse, indefinitely.
+            text = pytesseract.image_to_string(image, timeout=OCR_TIMEOUT_MS // 1000)
+            return text.strip() if text and text.strip() else None
+        except RuntimeError as exc:
+            logger.warning("parser: Tesseract OCR tier timed out for a page: %s", exc)
+            return None
+        except Exception:
+            logger.warning("parser: Tesseract OCR tier call failed for a page", exc_info=True)
+            return None
+
+
+def _default_ocr_tiers() -> list[tuple[str, object]]:
+    return [
+        ("gemini", GeminiOcrClient()),
+        ("ocrspace", OcrSpaceClient()),
+        ("tesseract", TesseractOcrClient()),
+    ]
 
 
 class ElementType(str, Enum):
@@ -166,14 +290,17 @@ class ParsedDocument:
 
 
 class Parser:
-    def __init__(self, converter: DocumentConverter | None = None, ocr_client: GeminiOcrClient | None = None):
+    def __init__(self, converter: DocumentConverter | None = None, ocr_tiers: list[tuple[str, object]] | None = None):
         self._converter = converter or _default_converter()
-        # Real by default, same as `converter` — OCR fallback is production
-        # behavior, not an opt-in extra a caller has to remember to wire up.
-        # routes/ingest.py constructs Parser() with no arguments and gets it
-        # automatically. Tests that don't want a real Gemini call inject a
-        # fake here explicitly (see test_parser.py).
-        self._ocr_client = ocr_client or _default_ocr_client()
+        # Real 3-tier chain by default, same reasoning as `converter` — OCR
+        # fallback is production behavior, not an opt-in extra a caller has
+        # to remember to wire up. routes/ingest.py constructs Parser() with
+        # no arguments and gets all three tiers automatically. Tests that
+        # don't want real calls inject their own (name, fake) tier list
+        # (see test_parser.py) — each tier is just anything with a
+        # transcribe_page(image) -> str | None method, same contract
+        # GeminiOcrClient/OcrSpaceClient/TesseractOcrClient all share.
+        self._ocr_tiers = ocr_tiers if ocr_tiers is not None else _default_ocr_tiers()
 
     def parse(self, pdf_bytes: bytes) -> ParsedDocument:
         stream = DocumentStream(name="document.pdf", stream=BytesIO(pdf_bytes))
@@ -290,22 +417,50 @@ class Parser:
                 )
                 continue
 
-            # The try/except here is deliberate, on top of GeminiOcrClient's
-            # own internal one: ocr_client is an injectable dependency (any
-            # object with transcribe_page), so this loop can't assume every
-            # possible implementation fails safe on its own. One page's OCR
-            # call blowing up must never take down the rest of the parse.
-            try:
-                recovered_text = self._ocr_client.transcribe_page(page_image)
-            except Exception:
+            # Walk the tier chain in order — each tier only attempted if
+            # every prior one failed (raised, returned nothing, or returned
+            # only whitespace — a "successful" call that recovered nothing
+            # useful is treated exactly like a failure, not a valid
+            # recovery), never in parallel and never speculatively. The
+            # try/except here is deliberate, on top of each tier client's
+            # own internal one: a tier is an injectable dependency (anything
+            # with transcribe_page), so this loop can't assume every
+            # possible implementation fails safe — or normalizes
+            # empty/whitespace results — on its own. `text and text.strip()`
+            # (not bare `text`) is deliberate defense-in-depth: every real
+            # client here already self-normalizes empty/whitespace text to
+            # None before returning, but a bare truthiness check would
+            # silently accept a raw whitespace-only string as "recovered"
+            # from any tier that didn't (a real gap, found live during
+            # audit — a plain `if text:` treats a non-empty whitespace
+            # string as truthy). One tier blowing up must never take down
+            # the rest of the chain, let alone the rest of the parse.
+            recovered_text: str | None = None
+            recovered_tier = "none"
+            for tier_name, tier_client in self._ocr_tiers:
+                try:
+                    text = tier_client.transcribe_page(page_image)
+                except Exception:
+                    logger.warning(
+                        "parser: OCR tier=%s raised for page %s — trying next tier",
+                        tier_name,
+                        page_number,
+                        exc_info=True,
+                    )
+                    continue
+                if text and text.strip():
+                    recovered_text = text.strip()
+                    recovered_tier = tier_name
+                    break
                 logger.warning(
-                    "parser: OCR client raised for page %s — page remains low-yield", page_number, exc_info=True
+                    "parser: OCR tier=%s found no recoverable text on page %s — trying next tier",
+                    tier_name,
+                    page_number,
                 )
-                continue
+
             if not recovered_text:
                 logger.warning(
-                    "parser: OCR fallback found no recoverable text on page %s — page remains low-yield",
-                    page_number,
+                    "parser: OCR fallback exhausted all tiers for page %s — page remains low-yield", page_number
                 )
                 continue
 
@@ -319,6 +474,10 @@ class Parser:
                     element_id=f"ocr-page-{page_number}",
                 )
             )
-            logger.info("parser: OCR fallback recovered text on page %s", page_number)
+            # Which tier recovered this page — established as necessary
+            # for debugging retrieval quality (a page recovered by
+            # Tesseract, the weakest tier, may need a closer look if
+            # something downstream looks off).
+            logger.info("parser: OCR fallback recovered text on page %s via tier=%s", page_number, recovered_tier)
 
         return ParsedDocument(elements=elements, dropped_elements=dropped_elements)

@@ -1,4 +1,6 @@
 # Tests for [FEAT-004] Docling parser service + [FEAT-017] OCR fallback
+# (Gemini tier 1, extended with OCR.space tier 2 + Tesseract tier 3 —
+# 2026-07-26 follow-up)
 #
 # Fixtures (apps/api/tests/fixtures/): clean_digital.pdf (plain formatted
 # doc, one table), table_heavy.pdf (29 tables across 11 pages), scanned.pdf
@@ -6,12 +8,14 @@
 #
 # No single fixture exercises all six element types, so coverage is spread
 # across fixtures rather than asserted on one. Most tests below inject a
-# FakeOcrClient (always returns None) even though FEAT-017's real OCR
-# fallback is now on by default (Parser()'s bare constructor uses a real
-# Gemini client, matching the existing `converter` default) — this keeps
-# Docling-only regression guards deterministic and fast. The OCR-specific
-# tests near the end of this file are the ones that actually exercise
-# real/fake OCR recovery on purpose.
+# single-tier `ocr_tiers=[("gemini", FakeOcrClient())]` (always returns
+# None) even though FEAT-017's real OCR fallback is a real 3-tier chain
+# by default (Parser()'s bare constructor uses real Gemini -> OCR.space ->
+# Tesseract clients, matching the existing `converter` default) — this
+# keeps Docling-only regression guards deterministic and fast. The
+# OCR-specific tests near the end of this file are the ones that actually
+# exercise real/fake OCR recovery, and the full tier-chain behavior, on
+# purpose.
 #
 # Extended 2026-07-22 per Codex review of parser.py: the try/except around
 # converter.convert() didn't cover the element-iteration loop, so a failure
@@ -25,7 +29,7 @@ from docling_core.types.doc import DocItemLabel
 from google.genai.errors import ClientError
 from PIL import Image
 
-from services.parser import BBox, ElementType, ParseError, Parser
+from services.parser import BBox, ElementType, GeminiOcrClient, OcrSpaceClient, ParseError, Parser, TesseractOcrClient
 
 FIXTURES = "tests/fixtures"
 
@@ -68,7 +72,7 @@ def test_parse_returns_expected_element_types_across_fixtures():
     # not FEAT-017's OCR behavior (which has its own dedicated tests below)
     # — a real OCR call would add TEXT elements to scanned.pdf and make
     # the pinned scanned_types assertion below meaningless noise.
-    parser = Parser(ocr_client=FakeOcrClient())
+    parser = Parser(ocr_tiers=[("gemini", FakeOcrClient())])
 
     clean = parser.parse(load("clean_digital.pdf"))
     clean_types = {e.element_type for e in clean.elements}
@@ -337,7 +341,7 @@ def test_element_counts_unchanged_on_well_formed_fixtures():
     # client. Without the fake here, scanned.pdf's real OCR recovery would
     # make this specific regression guard non-deterministic and conflate
     # two different things it's supposed to catch independently.
-    parser = Parser(ocr_client=FakeOcrClient())
+    parser = Parser(ocr_tiers=[("gemini", FakeOcrClient())])
 
     clean = parser.parse(load("clean_digital.pdf"))
     assert len(clean.elements) == 21
@@ -365,7 +369,7 @@ def test_element_counts_unchanged_on_well_formed_fixtures():
 # gracefully (no crash, no fabricated content) rather than being FEAT-017
 # scoping information about a since-fixed gap.
 def test_scanned_pdf_degrades_gracefully_when_ocr_recovers_nothing():
-    parser = Parser(ocr_client=FakeOcrClient())
+    parser = Parser(ocr_tiers=[("gemini", FakeOcrClient())])
 
     doc = parser.parse(load("scanned.pdf"))
 
@@ -379,23 +383,33 @@ def test_scanned_pdf_degrades_gracefully_when_ocr_recovers_nothing():
 
 # Acceptance criterion: real scanned.pdf, real recovered content per page —
 # real output required, not a pass/fail assertion (task brief, item 6). Uses
-# the REAL Gemini client (Parser()'s bare-constructor default) — the one
-# true integration proof for this feature, same discipline as every other
-# real-Gemini-call test elsewhere in this suite (test_generator.py,
-# test_verifier.py).
-def test_ocr_fallback_recovers_real_text_on_scanned_pdf(capsys):
-    parser = Parser()  # real converter AND real Gemini OCR client — no fakes
+# the REAL 3-tier chain (Parser()'s bare-constructor default: real Gemini
+# -> real OCR.space -> real Tesseract) — the one true integration proof for
+# this feature, same discipline as every other real-API-call test
+# elsewhere in this suite. Which tier actually recovers each page is
+# reported, not assumed — if Gemini's daily quota (.agent/MEMORY.md,
+# 2026-07-26) is still exhausted from earlier same-day testing, this is
+# real, live proof the chain itself is what recovers the content, not a
+# specific tier succeeding.
+def test_ocr_fallback_recovers_real_text_on_scanned_pdf(capsys, caplog):
+    parser = Parser()  # real converter and the real 3-tier chain — no fakes
 
-    doc = parser.parse(load("scanned.pdf"))
+    with caplog.at_level("INFO"):
+        doc = parser.parse(load("scanned.pdf"))
 
     by_page: dict[int, list] = {}
     for element in doc.elements:
         by_page.setdefault(element.page_number, []).append(element)
 
+    tier_log_lines = [r.message for r in caplog.records if "via tier=" in r.message]
+
     with capsys.disabled():
         print("\n" + "=" * 90)
         print("FEAT-017 real OCR fallback — actual recovered content, scanned.pdf")
         print("=" * 90)
+        print("\nWhich tier recovered each page (real, not assumed):")
+        for line in tier_log_lines:
+            print(f"  {line}")
         for page_number in sorted(by_page):
             print(f"\n--- page {page_number} ---")
             for element in by_page[page_number]:
@@ -429,16 +443,19 @@ def test_ocr_fallback_recovers_real_text_on_scanned_pdf(capsys):
 
 
 # Acceptance criterion: cost/scope guard — a normal digital PDF must
-# trigger zero OCR calls, not one per page of every document.
+# trigger zero OCR calls, not one per page of every document. Now covers
+# all THREE tiers explicitly (not just tier 1) — the trigger heuristic
+# lives above the tier loop, so if it correctly never fires, none of the
+# three tiers should ever see a call either.
 def test_ocr_fallback_never_fires_on_high_yield_fixtures():
-    ocr_client = FakeOcrClient()
-    parser = Parser(ocr_client=ocr_client)
+    tier1, tier2, tier3 = FakeOcrClient(), FakeOcrClient(), FakeOcrClient()
+    parser = Parser(ocr_tiers=[("gemini", tier1), ("ocrspace", tier2), ("tesseract", tier3)])
 
     parser.parse(load("clean_digital.pdf"))
-    assert ocr_client.call_count == 0
+    assert (tier1.call_count, tier2.call_count, tier3.call_count) == (0, 0, 0)
 
     parser.parse(load("table_heavy.pdf"))
-    assert ocr_client.call_count == 0
+    assert (tier1.call_count, tier2.call_count, tier3.call_count) == (0, 0, 0)
 
 
 # A Gemini call failure during OCR degrades that one page gracefully —
@@ -463,7 +480,7 @@ def test_ocr_fallback_call_failure_degrades_gracefully_not_a_crash(caplog):
             raise _fake_client_error(429, "quota exceeded — simulated")
 
     ocr_client = RaisingOcrClient()
-    parser = Parser(ocr_client=ocr_client)
+    parser = Parser(ocr_tiers=[("gemini", ocr_client)])
 
     with caplog.at_level("WARNING"):
         doc = parser.parse(load("scanned.pdf"))
@@ -487,3 +504,367 @@ def test_ocr_fallback_call_failure_degrades_gracefully_not_a_crash(caplog):
     warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
     assert any("OCR" in w and ("raised" in w.lower() or "fail" in w.lower()) for w in warnings)
     assert sum(1 for w in warnings if "page" in w.lower()) >= 2  # one per low-yield page
+
+
+# --- 3-tier chain: full deterministic combination matrix (2026-07-26) ------
+#
+# Gemini (tier 1) -> OCR.space (tier 2, independent vendor) -> Tesseract
+# (tier 3, self-hosted last resort) -> unrecovered. Each of the 4 real
+# combinations the chain can land in, confirmed via call-counting fakes —
+# same pattern as FakeOcrClient above, just parametrized per tier so each
+# test can independently control every tier's behavior.
+
+
+class TierFake:
+    """One configurable fake tier: "succeed" returns canned text, "raise"
+    simulates an exception/timeout/quota error, "none" simulates a tier
+    that ran but found nothing (not an exception) — both real failure
+    shapes a tier can take. Counts calls so each combination test can
+    assert exactly which tiers were (and weren't) invoked."""
+
+    def __init__(self, mode: str, text: str = "recovered text"):
+        assert mode in ("succeed", "raise", "none")
+        self.mode = mode
+        self.text = text
+        self.calls = 0
+
+    def transcribe_page(self, image):
+        self.calls += 1
+        if self.mode == "succeed":
+            return self.text
+        if self.mode == "raise":
+            raise RuntimeError("simulated tier failure")
+        return None
+
+
+def _recovered_elements(doc):
+    return [e for e in doc.elements if e.element_id.startswith("ocr-page-")]
+
+
+# Combination 1: tier 1 succeeds -> tiers 2/3 never called.
+def test_ocr_chain_tier1_succeeds_tiers_2_and_3_never_called():
+    tier1 = TierFake("succeed", text="gemini recovered this")
+    tier2 = TierFake("succeed")
+    tier3 = TierFake("succeed")
+    parser = Parser(ocr_tiers=[("gemini", tier1), ("ocrspace", tier2), ("tesseract", tier3)])
+
+    doc = parser.parse(load("scanned.pdf"))
+
+    assert tier1.calls == 2  # pages 2 and 3
+    assert tier2.calls == 0
+    assert tier3.calls == 0
+    recovered = _recovered_elements(doc)
+    assert len(recovered) == 2
+    assert all(e.content == "gemini recovered this" for e in recovered)
+
+
+# Combination 2: tier 1 fails, tier 2 succeeds -> tier 3 never called.
+def test_ocr_chain_tier1_fails_tier2_succeeds_tier3_never_called():
+    tier1 = TierFake("raise")
+    tier2 = TierFake("succeed", text="ocrspace recovered this")
+    tier3 = TierFake("succeed")
+    parser = Parser(ocr_tiers=[("gemini", tier1), ("ocrspace", tier2), ("tesseract", tier3)])
+
+    doc = parser.parse(load("scanned.pdf"))
+
+    assert tier1.calls == 2
+    assert tier2.calls == 2
+    assert tier3.calls == 0
+    recovered = _recovered_elements(doc)
+    assert len(recovered) == 2
+    assert all(e.content == "ocrspace recovered this" for e in recovered)
+
+
+# Combination 3: tiers 1+2 fail, tier 3 (Tesseract, last resort) succeeds.
+def test_ocr_chain_tiers_1_and_2_fail_tier3_succeeds():
+    tier1 = TierFake("none")  # ran, found nothing — not an exception
+    tier2 = TierFake("raise")  # exception/timeout/quota error
+    tier3 = TierFake("succeed", text="tesseract recovered this")
+    parser = Parser(ocr_tiers=[("gemini", tier1), ("ocrspace", tier2), ("tesseract", tier3)])
+
+    doc = parser.parse(load("scanned.pdf"))
+
+    assert tier1.calls == 2
+    assert tier2.calls == 2
+    assert tier3.calls == 2
+    recovered = _recovered_elements(doc)
+    assert len(recovered) == 2
+    assert all(e.content == "tesseract recovered this" for e in recovered)
+
+
+# Combination 4: all three tiers fail — existing fail-safe still holds:
+# logged, no crash, page unrecovered, rest of document completes.
+def test_ocr_chain_all_three_tiers_fail_page_stays_unrecovered(caplog):
+    tier1 = TierFake("raise")
+    tier2 = TierFake("none")
+    tier3 = TierFake("raise")
+    parser = Parser(ocr_tiers=[("gemini", tier1), ("ocrspace", tier2), ("tesseract", tier3)])
+
+    with caplog.at_level("WARNING"):
+        doc = parser.parse(load("scanned.pdf"))
+
+    assert tier1.calls == 2
+    assert tier2.calls == 2
+    assert tier3.calls == 2
+
+    assert len(doc.elements) == 2  # page 1's pre-existing elements only
+    assert {e.page_number for e in doc.elements} == {1}
+    assert _recovered_elements(doc) == []
+
+    warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+    assert sum(1 for w in warnings if "exhausted all tiers" in w) == 2  # one per low-yield page
+
+
+# --- Real 3-way tier comparison (task brief item 7) -------------------------
+#
+# Forces tier 1 (Gemini) to fail so tier 2 (OCR.space, real demo key) does
+# the real recovery, and separately runs the real Tesseract client against
+# the exact same page image, so all three tiers' real output on the same
+# real page can be honestly compared — not just asserted as "non-empty".
+def test_real_ocrspace_recovery_and_three_way_quality_comparison(capsys):
+    class AlwaysFailsGemini:
+        def transcribe_page(self, image):
+            raise RuntimeError("forcing tier 1 to fail for this test")
+
+    parser = Parser(ocr_tiers=[("gemini", AlwaysFailsGemini()), ("ocrspace", OcrSpaceClient()), ("tesseract", TesseractOcrClient())])
+    doc = parser.parse(load("scanned.pdf"))
+
+    page_2_ocr = [e for e in doc.elements if e.element_id == "ocr-page-2"]
+    assert len(page_2_ocr) == 1
+    ocrspace_text = page_2_ocr[0].content
+    assert len(ocrspace_text.strip()) > 50
+
+    # Real Tesseract, real Gemini (if quota allows), against the identical
+    # page image — for an honest side-by-side, not a re-run through the
+    # chain (which would stop at whichever tier succeeds first).
+    from io import BytesIO
+
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling_core.types.io import DocumentStream
+
+    options = PdfPipelineOptions(do_ocr=False, generate_picture_images=True, generate_page_images=True)
+    converter = DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)})
+    stream = DocumentStream(name="document.pdf", stream=BytesIO(load("scanned.pdf")))
+    docling_result = converter.convert(stream)
+    page_2_image = docling_result.document.pages[2].image.pil_image
+
+    tesseract_text = TesseractOcrClient().transcribe_page(page_2_image)
+    gemini_text = GeminiOcrClient().transcribe_page(page_2_image)
+
+    with capsys.disabled():
+        print("\n" + "=" * 90)
+        print("REAL 3-WAY OCR QUALITY COMPARISON — scanned.pdf, page 2")
+        print("=" * 90)
+        print("\n[OCR.space, tier 2, real recovery via the chain]:")
+        print(repr(ocrspace_text[:400]))
+        print("\n[Tesseract, tier 3, real local binary, same page image]:")
+        print(repr(tesseract_text[:400]) if tesseract_text else "None (tesseract not available in this environment)")
+        print("\n[Gemini, tier 1, same page image — quota permitting]:")
+        print(repr(gemini_text[:400]) if gemini_text else "None (real API call failed — see .agent/MEMORY.md's 2026-07-26 quota entry)")
+
+
+# --- Audit follow-up (2026-07-26): IsErroredOnProcessing + empty-success --
+#
+# Two real gap classes the original 4-combination matrix didn't cover:
+# (a) OCR.space's own documented "200 OK but IsErroredOnProcessing: true"
+# shape was never exercised against the REAL OcrSpaceClient class — only
+# generic fakes. (b) "the API call succeeded" and "the API call actually
+# recovered something useful" are different claims — a tier returning
+# empty/whitespace text (not an exception) must be treated as failure by
+# the chain, not accepted as valid recovery.
+
+
+def _ocrspace_response(status_code: int, json_body: dict) -> httpx.Response:
+    request = httpx.Request("POST", "https://api.ocr.space/parse/image")
+    return httpx.Response(status_code, json=json_body, request=request)
+
+
+class _MockOcrSpaceHttp:
+    """Stands in for OcrSpaceClient's httpx.Client — records the call and
+    returns a caller-controlled canned response, same FakeClient/FakeModels
+    pattern as test_generator.py's Gemini fake, just for httpx.Client.post
+    instead of client.models.generate_content."""
+
+    def __init__(self, response: httpx.Response):
+        self._response = response
+        self.calls = 0
+
+    def post(self, url, *, headers, data):
+        self.calls += 1
+        return self._response
+
+
+def test_ocrspace_client_treats_is_errored_on_processing_as_failure():
+    # Real shape OCR.space actually documents/returns for a processing
+    # failure — a normal 200 OK, not a 4xx/5xx raise_for_status() would
+    # catch.
+    mock_http = _MockOcrSpaceHttp(
+        _ocrspace_response(200, {"IsErroredOnProcessing": True, "ErrorMessage": ["simulated processing error"]})
+    )
+    client = OcrSpaceClient(api_key="test-key", http_client=mock_http)
+
+    result = client.transcribe_page(Image.new("RGB", (10, 10)))
+
+    assert result is None
+    assert mock_http.calls == 1
+
+
+def test_ocrspace_is_errored_on_processing_makes_the_chain_fall_through_to_tier3():
+    mock_http = _MockOcrSpaceHttp(
+        _ocrspace_response(200, {"IsErroredOnProcessing": True, "ErrorMessage": ["simulated processing error"]})
+    )
+    real_ocrspace = OcrSpaceClient(api_key="test-key", http_client=mock_http)
+    tier1 = TierFake("raise")
+    tier3 = TierFake("succeed", text="tesseract recovered this")
+    parser = Parser(ocr_tiers=[("gemini", tier1), ("ocrspace", real_ocrspace), ("tesseract", tier3)])
+
+    doc = parser.parse(load("scanned.pdf"))
+
+    assert tier1.calls == 2
+    assert mock_http.calls == 2  # the real OcrSpaceClient, not a fake, actually got called for both pages
+    assert tier3.calls == 2
+    recovered = _recovered_elements(doc)
+    assert len(recovered) == 2
+    assert all(e.content == "tesseract recovered this" for e in recovered)
+
+
+class _RawTierFake:
+    """Unlike TierFake above, this does NOT self-normalize — it returns
+    exactly what it's told, including a raw whitespace-only string. Used
+    to prove the CHAIN itself (not just each well-behaved real client)
+    refuses to accept whitespace-only text as valid recovery — a real gap
+    found live during audit: a bare `if text:` check treats a non-empty
+    whitespace string as truthy, silently accepting garbage as "recovered"
+    from any tier that didn't normalize on its own."""
+
+    def __init__(self, text):
+        self.text = text
+        self.calls = 0
+
+    def transcribe_page(self, image):
+        self.calls += 1
+        return self.text
+
+
+def test_chain_treats_whitespace_only_success_as_failure_not_valid_recovery():
+    tier1 = _RawTierFake("   \n\t  ")  # "succeeded" but recovered nothing useful
+    tier2 = TierFake("succeed", text="tier2 recovered this")
+    parser = Parser(ocr_tiers=[("gemini", tier1), ("ocrspace", tier2), ("tesseract", TierFake("succeed"))])
+
+    doc = parser.parse(load("scanned.pdf"))
+
+    assert tier1.calls == 2  # tier 1 was tried on both low-yield pages
+    assert tier2.calls == 2  # and correctly fell through to tier 2 each time
+    recovered = _recovered_elements(doc)
+    assert len(recovered) == 2
+    assert all(e.content == "tier2 recovered this" for e in recovered)  # never the whitespace
+
+
+def test_chain_treats_empty_string_success_as_failure_not_valid_recovery():
+    tier1 = _RawTierFake("")
+    tier2 = TierFake("succeed", text="tier2 recovered this")
+    parser = Parser(ocr_tiers=[("gemini", tier1), ("ocrspace", tier2), ("tesseract", TierFake("succeed"))])
+
+    doc = parser.parse(load("scanned.pdf"))
+
+    recovered = _recovered_elements(doc)
+    assert len(recovered) == 2
+    assert all(e.content == "tier2 recovered this" for e in recovered)
+
+
+# Each real client's OWN empty/whitespace handling, independent of the
+# chain-level defense above (defense in depth, same reasoning as the
+# try/except layering) — a mocked "successful" call returning nothing
+# useful for each of the three real client classes.
+def test_gemini_client_normalizes_empty_response_text_to_none():
+    class EmptyResponse:
+        text = "   "
+
+    class EmptyModels:
+        def generate_content(self, *, model, contents):
+            return EmptyResponse()
+
+    class EmptyGeminiClient:
+        models = EmptyModels()
+
+    client = GeminiOcrClient(client=EmptyGeminiClient())
+    assert client.transcribe_page(Image.new("RGB", (10, 10))) is None
+
+
+def test_ocrspace_client_normalizes_empty_parsed_text_to_none():
+    mock_http = _MockOcrSpaceHttp(
+        _ocrspace_response(
+            200,
+            {"IsErroredOnProcessing": False, "ParsedResults": [{"ParsedText": "   ", "FileParseExitCode": 1}]},
+        )
+    )
+    client = OcrSpaceClient(api_key="test-key", http_client=mock_http)
+    assert client.transcribe_page(Image.new("RGB", (10, 10))) is None
+
+
+def test_tesseract_client_normalizes_blank_image_to_none():
+    # A real, genuinely blank image through the real local Tesseract
+    # binary — no text at all to recognize, a real "successful but empty"
+    # OCR call, not a mock standing in for one.
+    blank_image = Image.new("RGB", (200, 200), color="white")
+    result = TesseractOcrClient().transcribe_page(blank_image)
+    assert result is None
+
+
+# --- Audit follow-up (2026-07-26): timeout coverage on all 3 tiers --------
+#
+# OcrSpaceClient already had an explicit 60s timeout; GeminiOcrClient and
+# TesseractOcrClient did not — confirmed by reading the installed SDK/
+# pytesseract source directly (genai passes timeout=None to httpx with no
+# http_options set, which httpx treats as "wait forever"; pytesseract's
+# own default timeout=0 skips subprocess.communicate()'s timeout
+# entirely). Both now set one explicitly; these tests confirm the real
+# constructed objects actually carry it, not just that the code compiles.
+
+
+def test_gemini_client_sets_an_explicit_http_timeout_by_default(monkeypatch):
+    from services.parser import OCR_TIMEOUT_MS
+
+    # A fake, syntactically-valid key — genai.Client() construction never
+    # validates it over the network (confirmed earlier: construction is
+    # cheap/local), so this test stays self-contained regardless of
+    # whether a real GEMINI_API_KEY happens to be set in the environment
+    # it runs in (it deliberately isn't, in the fresh-clone check this
+    # exact gap was found through).
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key-for-this-test-only")
+    client = GeminiOcrClient()
+    # Real client construction is lazy (audit finding, 2026-07-26 — see
+    # GeminiOcrClient.__init__'s own comment: resolving GEMINI_API_KEY at
+    # Parser()-construction time crashed the whole Parser() over a missing
+    # key, even for a document that would never touch OCR). _get_client()
+    # forces the same real construction transcribe_page() would trigger
+    # lazily, without making an actual network call — genai.Client() itself
+    # only builds an HTTP client object, it doesn't call out.
+    real_client = client._get_client()
+    # (_http_options is a plain dict on the installed SDK version here,
+    # confirmed by direct inspection, not a typed object with attribute
+    # access.)
+    assert real_client._api_client._http_options["timeout"] == OCR_TIMEOUT_MS
+
+
+def test_tesseract_client_passes_a_nonzero_timeout_to_pytesseract(monkeypatch):
+    calls = []
+
+    def fake_image_to_string(image, timeout=0):
+        calls.append(timeout)
+        return "some text"
+
+    monkeypatch.setattr("pytesseract.image_to_string", fake_image_to_string)
+
+    TesseractOcrClient().transcribe_page(Image.new("RGB", (10, 10)))
+
+    assert len(calls) == 1
+    assert calls[0] > 0  # not the library's own hangs-forever default of 0
+
+
+def test_ocrspace_client_still_has_an_explicit_timeout():
+    client = OcrSpaceClient(api_key="test-key")
+    assert client._http.timeout.connect is not None
+    assert client._http.timeout.connect > 0

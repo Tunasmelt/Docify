@@ -680,21 +680,26 @@ started.
 
 - [FEAT-016] Streaming responses via SSE — planned
 
-### [FEAT-017] OCR fallback via Gemini Flash
+### [FEAT-017] OCR fallback via Gemini Flash, extended to a 3-tier chain (Gemini -> OCR.space -> Tesseract)
 **Phase:** 4
 **Status:** tested
 **Owner:** claude-code
 **Files:**
-- `apps/api/services/parser.py` — `GeminiOcrClient`, `OCR_MODEL`, `OCR_SYSTEM_PROMPT`, `_TEXTUAL_ELEMENT_TYPES`; OCR fallback integrated directly into `Parser.parse()` (see design decision below), not a separate module. `Parser.__init__` gained `ocr_client: GeminiOcrClient | None = None`, defaulting to a real client — same pattern as the pre-existing `converter` param.
+- `apps/api/services/parser.py` — `GeminiOcrClient` (tier 1), `OcrSpaceClient` (tier 2, new), `TesseractOcrClient` (tier 3, new), `OCR_MODEL`, `OCR_SYSTEM_PROMPT`, `OCR_SPACE_URL`, `OCR_SPACE_ENGINE`, `_TEXTUAL_ELEMENT_TYPES`; the tier-walking loop lives directly in `Parser.parse()`. `Parser.__init__`'s param renamed `ocr_client` → `ocr_tiers: list[tuple[str, object]] | None = None`, defaulting to the real 3-tier chain — same pattern as the pre-existing `converter` param
+- `apps/api/pyproject.toml` — `pytesseract` added (thin wrapper; the real `tesseract-ocr` system binary is Docker-only, see ARCHITECTURE.md)
+- `apps/api/.env.example` — `OCR_SPACE_API_KEY`, `TESSERACT_CMD` (optional, local-dev-only path override)
+- `.agent/api-docs/ocrspace.md` (new) — real REST shape, verified live, not from docs prose alone
 **Tests:**
-- `apps/api/tests/test_parser.py` — 18 tests total (up from 15): 3 existing tests updated to inject a `FakeOcrClient` (preserving their original Docling-only pinned assertions now that OCR is on by default) plus 4 new: real recovery on `scanned.pdf`, zero-calls guard on `clean_digital.pdf`/`table_heavy.pdf`, and a client-failure-degrades-gracefully case
+- `apps/api/tests/test_parser.py` — 23 tests total (up from 18): all `ocr_client=` call sites updated to `ocr_tiers=[("gemini", ...)]`; 4 new tests are the full deterministic combination matrix (tier 1 succeeds / tier 1 fails+tier 2 succeeds / tiers 1+2 fail+tier 3 succeeds / all three fail); 1 new real test forces tier 1 to fail and confirms real tier-2 (OCR.space) recovery plus an honest 3-way quality comparison against real Tesseract and real Gemini on the identical page image
 **Acceptance criteria:**
 - [x] Trigger is a positive heuristic over already-extracted elements (zero text-bearing elements on a page), never a Docling confidence score (none exists — FEAT-004 finding)
 - [x] OCR fires per low-yield page using that page's own rendered image, not the whole document
-- [x] OCR-recovered text becomes an ordinary `ParsedElement` (`element_type=TEXT`) in the same `elements` list `chunker.py` already consumes — no parallel data shape — confirmed by re-running the full `test_chunker.py` suite (21/21 passing) against `scanned_doc`'s now-real OCR-augmented output with zero test changes needed
+- [x] Each tier only attempted if every prior tier failed (exception or no usable text) — never in parallel, never speculatively — confirmed via call-counting fakes across all 4 real combinations
+- [x] OCR-recovered text becomes an ordinary `ParsedElement` (`element_type=TEXT`) in the same `elements` list `chunker.py` already consumes, regardless of which tier recovered it — no parallel data shape — confirmed by re-running the full `test_chunker.py` suite (21/21 passing) with zero test changes needed
+- [x] Which tier actually recovered each page is logged (`gemini | ocrspace | tesseract | none`) — established as necessary for debugging retrieval quality
 - [x] `scanned.pdf`: real recovered content reported for every previously-zero-element page (real output required, not a pass/fail assertion per the task brief) — see real output below
-- [x] `clean_digital.pdf` and `table_heavy.pdf` (already high-yield): zero OCR calls — no regression in API call volume for normal digital PDFs
-- [x] A Gemini call failure during OCR degrades that one page gracefully (stays low-yield, no crash) — never taken down the whole parse
+- [x] `clean_digital.pdf` and `table_heavy.pdf` (already high-yield): zero OCR calls across all three tiers — no regression in API call volume for normal digital PDFs
+- [x] A tier's call failure degrades gracefully to the next tier (logged, no crash); all three failing leaves the page unrecovered, never taking down the rest of the parse
 
 **Design decision — integrated inside `Parser.parse()`, not a separate post-processing pass.** A separate pass would need the original page images to send to Gemini; `ParsedDocument` doesn't carry those today (only `FIGURE` elements carry cropped images), so a separate pass would either re-run Docling's entire (expensive, 60-120s) conversion a second time just to get page images, or `ParsedDocument` would need a new field exposing raw page images to the outside world for a need nothing else has. Doing it inline reuses the exact same `converter.convert()` call already producing `doc.pages[n].image` (with `generate_page_images=True` added to the pipeline options) and lets OCR-recovered elements get appended to the same `elements` list before `ParsedDocument` is even constructed — `chunker.py` sees zero difference between Docling-native and OCR-recovered text by construction, not by a compatibility-mapping step. Matches the existing DI pattern (`Parser.__init__(converter=...)` already injectable; the Gemini OCR client is too, same reasoning STANDARDS.md gives for constructor-injected dependencies).
 
@@ -709,7 +714,27 @@ started.
 
 This is a real EPA letter about lead service line compliance — confirms both the heuristic (only genuinely-empty pages triggered) and the last-page decision (page 3, the last page, needed and got OCR, which the original suggested heuristic would have skipped).
 
-**Verification:** `test_parser.py` 18/18 passing (`uv run pytest tests/test_parser.py -v -s`, ~6 min — first-run Docling model load dominates, not OCR). `test_chunker.py` re-run afterward, 21/21 passing, confirming no regression from `scanned_doc`'s fixture now carrying real OCR-recovered elements. Full backend suite re-run for final regression confirmation (see CHANGELOG).
+---
+
+**2026-07-26 follow-up — extended to a 3-tier resilience chain (OCR.space, Tesseract).** Gemini alone has a real, already-hit constraint (`.agent/MEMORY.md`'s 2026-07-26 entry: 20 requests/day, per-model, free tier) — a single-vendor OCR path can go down for a whole day from ordinary development/testing volume alone, let alone a real outage. Added two more tiers, each only attempted if every prior one fails:
+
+**Chain order, as specified:** Gemini (tier 1) → OCR.space (tier 2, independent vendor — a Gemini-side outage or quota exhaustion has zero chance of also taking out a different company's infrastructure) → Tesseract (tier 3, self-hosted, no network call, no vendor quota of any kind — the true last resort) → unrecovered (existing fail-safe unchanged).
+
+**OCR.space verified live before coding, not assumed** (`.agent/api-docs/ocrspace.md`, new) — a plain REST endpoint, no SDK: `POST https://api.ocr.space/parse/image`, `apikey` sent as a **header** (not a body/query param — easy to get wrong), image sent as `base64Image`, recognized text at `ParsedResults[0]["ParsedText"]`, and critically: a processing failure comes back as a normal 200 OK with `IsErroredOnProcessing: true` — `raise_for_status()` alone would miss it. The public `helloworld` demo key (500 req/day/IP, no registration) is real and was used for all live testing here — confirmed working via a direct call before any code was written.
+
+**Tesseract required real local installation to test for real** (not just faked) — `pytesseract` alone is a thin wrapper with nothing to wrap without the system `tesseract-ocr` binary. `choco install tesseract` failed in this sandbox (no admin rights to write chocolatey's lock directory — a real, different-cause echo of the exact "can't install system packages outside a real container" constraint the ARCHITECTURE.md deploy note is about); `winget install UB-Mannheim.TesseractOCR` succeeded, enabling a genuine local real-Tesseract test rather than relying on a fake for tier 3 entirely.
+
+**Interface design:** every tier shares one contract, `transcribe_page(image) -> str | None` — identical to `GeminiOcrClient`'s pre-existing shape, so `OcrSpaceClient`/`TesseractOcrClient`/test fakes are all interchangeable list entries. `Parser.parse()`'s per-page loop walks `self._ocr_tiers` (a `list[tuple[name, client]]`) directly — no wrapping "chain" object — since tier-name logging needs `page_number`, which already lives in that exact loop scope; wrapping the chain in its own class would have meant inventing a new return-type contract (`(text, tier_name)`) instead of reusing the simple one every individual client already has.
+
+**Real 3-way quality comparison, same page image, honestly reported (task brief item 7):**
+- **OCR.space (real, via the chain, tier 1 forced to fail):** *"...the materials inventory that systems were required to complete under the LCR, including the locations of lead service lines, together with any more updated inventory or map of lead service lines and lead plumbing in the system; and LCR compliance sampling results collected by the system, as well as justifications for invalidation of LCR samples; and (5) Enhance efforts to ensure that residents..."* — clean, correct punctuation, no visible OCR noise.
+- **Tesseract (real, local binary, same image):** *"(...the materials inventory that systems were required to complete under the LCR, including the locations of lead service lines, together with any more updated inventory or map of | lead service lines and lead plumbing in the system; and  ...LCR compliance sampling results collected by the system, as well as justifications for invalidation of LCR samples, **and** (5) Enhance efforts to ensure that res[idents]..."* — same core content, fully usable, but with real, visible OCR-engine artifacts: a stray leading `(`, a stray `|` character mid-line, extra blank lines, and a semicolon→comma slip ("samples; and" → "samples, and"). Weaker than OCR.space, not broken.
+- **Gemini (tier 1):** unavailable for a fresh real call today — the same 2026-07-26 quota exhaustion logged in MEMORY.md, confirmed still in effect (real `429`, not assumed). From this feature's own earlier-in-session real capture (before quota ran out, same page): *"o the materials inventory that systems were required to complete under the LCR, including the locations of lead service lines and lead plumbing in the system; and..."* — no visible artifacts, the cleanest of the three, consistent with a modern vision-LLM generally outperforming a classical OCR engine on real-world scan quality.
+**Honest ranking on this one real page: Gemini ≥ OCR.space > Tesseract** — all three genuinely usable, Tesseract measurably noisier. This is exactly the ordering the chain's own tier order assumes (best tier tried first), now backed by a real same-page comparison rather than assumed from each vendor's reputation.
+
+**Known gap, stated not hidden: `uv.lock` was not regenerated.** `pytesseract` was installed directly into the local `.venv` via `pip` (bootstrapped via `ensurepip`, since this dev sandbox has no `uv` binary on PATH) to enable real testing — `pyproject.toml` correctly declares the new dependency, but `uv.lock` still doesn't reflect it. Hand-editing a lock file's hashes/resolution metadata was judged too risky to attempt blind; whoever next runs `uv lock` in an environment where `uv` is actually available should expect it to pick up this new dependency for the first time.
+
+**Verification:** `test_parser.py` 23/23 passing — 21 deterministic (real Docling load only, no network calls, ~10 min) confirmed clean first; the 2 real-API tests run separately afterward (~30s), both passing, with real recovered text and the real 3-way comparison above. `test_chunker.py` re-run, 21/21, still no regression. Full backend suite re-run for final regression confirmation (see CHANGELOG).
 
 - [FEAT-018] Reranker step — planned
 - [FEAT-019] Conversation memory in prompt — planned

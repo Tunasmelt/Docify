@@ -54,6 +54,14 @@ dependencies = [
     # pillow bumped 2026-07-23 (security fix): 11.3.0 had multiple CVEs,
     # fixed across 12.1.1/12.2.0/12.3.0.
     "pillow>=12.3.0,<12.4",
+    # FEAT-017 tier 3 (OCR fallback last resort): pytesseract is a thin
+    # Python wrapper — it shells out to the SYSTEM tesseract-ocr binary,
+    # which this package does not install. That binary is Docker-only on
+    # Render (see ARCHITECTURE.md's deploy constraint: Render's native
+    # runtime blocks apt-get/OS-level installs entirely, confirmed).
+    # Version floor is what was installed and tested against locally
+    # (2026-07-26), not a specific security-driven pin like the others above.
+    "pytesseract>=0.3.13,<0.4",
 ]
 
 [dependency-groups]

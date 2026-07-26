@@ -67,6 +67,8 @@ Multi-tenant SaaS web app: users upload documents (PDFs), ask natural-language q
 | Frontend deploy | Vercel | Hobby | Free, GitHub integration, edge network |
 | Backend deploy | Render | Free tier | 750 hrs/mo, Docker support for Python + Docling, 15-min idle spin-down |
 
+**Backend MUST deploy via Docker on Render, not the native Python runtime — Render's native environment blocks apt-get/OS-level package installs entirely, and both Tesseract (FEAT-017's tier-3 OCR fallback — `tesseract-ocr`, a system binary, not a Python package) and Docling's own requirements depend on a real, controllable container environment. This is a hard constraint, not a preference.** Confirmed directly: local development itself needed the equivalent of a real system-level install to get Tesseract working at all (`winget install UB-Mannheim.TesseractOCR` on Windows; `apt-get install tesseract-ocr` on Debian/Ubuntu, the base most container images use) — `pytesseract` (the Python dependency in `pyproject.toml`) is only a thin wrapper that shells out to this binary, and installs to nothing without it. There is no way to `pip install` an equivalent.
+
 ---
 
 ## Request flows
