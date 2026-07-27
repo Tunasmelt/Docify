@@ -9,7 +9,7 @@ Specification for the internal FastAPI endpoints. Both `apps/api` (Pydantic mode
 ## Base URL
 
 - Development: `http://localhost:8000`
-- Production: `https://docify-api.onrender.com` (placeholder — update after Render deploy)
+- Production: `https://docify-api.onrender.com` — real, deployed 2026-07-27 (Render web service `docify-api`, Docker runtime, connected to the real production Supabase project). `/health` and authenticated `GET /conversations` verified live with a real Supabase-issued JWT. **Known limitation, not yet resolved:** `POST /ingest` reliably OOM-crashes the free-tier instance (512MB RAM) during real Docling parsing — confirmed live, not assumed (Render platform logs show the process going silent mid-model-load, no Python traceback, followed by an automatic restart ~2 minutes later — the signature of a kernel OOM-kill, not a caught exception). The CPU-only-torch fix (pyproject.toml, 2026-07-27) was necessary and fixed a *different*, earlier OOM at container *startup*, but real inference memory still exceeds what the free tier provides. See CHANGELOG.md's deploy entry for the full investigation.
 
 ## Auth model
 

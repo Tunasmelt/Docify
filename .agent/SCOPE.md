@@ -132,7 +132,7 @@ Source of truth for what is and is not in scope, per phase. The agent checks her
 
 ### In scope
 - [ ] Vercel prod deploy of `apps/web`
-- [ ] Render prod deploy of `apps/api` with env vars + health check
+- [x] Render prod deploy of `apps/api` with env vars + health check — 2026-07-27. Live at `https://docify-api.onrender.com`, real health check and real authenticated request both verified (CHANGELOG.md). **Directly confirms the "Production job execution" risk below, not just predicts it:** a real `/ingest` call OOM-crashed the free-tier instance mid-Docling-parse — the crashed background task left its document silently stuck in `parsing` forever, exactly the "a process restart silently loses in-flight work" failure mode this entry already named before any real deploy existed to prove it. Not fixed in this pass.
 - [ ] Custom domain (if user has one)
 - [ ] Landing page with demo video / gif and "try with sample doc" flow
 - [ ] README.md at repo root: architecture diagram, tech decisions, how to run locally
