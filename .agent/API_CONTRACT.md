@@ -241,6 +241,34 @@ Ask a question over one or more documents.
 
 ---
 
+### `POST /query/stream` (FEAT-016, 2026-07-27)
+SSE streaming variant of `POST /query` — same request body, same auth/ownership/history validation (run to completion **before** the stream opens, so an invalid `document_id`/JWT/conversation always comes back as a normal JSON error response with the codes above, never as a stream that starts and then errors out). A separate route rather than a mode flag on `/query`: `response_model=QueryResponse` validation and a `StreamingResponse` are mutually exclusive in FastAPI, and `/query`'s synchronous contract stays untouched for any caller that doesn't want SSE.
+
+Browsers' `EventSource` can't send a POST body or an `Authorization` header — clients must use `fetch()` with a manually-read stream (see `apps/web/lib/api/query.ts`'s `askQuestionStream()`), not `EventSource`.
+
+**Response:** `Content-Type: text/event-stream`, one `event: <type>\ndata: <json>\n\n` frame per event. Real, fixed event sequence — no event is ever skipped or reordered:
+
+```
+retrieving -> token* (zero or more) -> verifying -> citations-resolved -> done
+```
+
+`error` can replace any step from `token` onward and always terminates the stream — there is no path that closes the connection without either a `done` or an `error`.
+
+| Event | `data` shape | Meaning |
+|---|---|---|
+| `retrieving` | `{}` | Retrieval has started. |
+| `token` | `{"text": "..."}` | One raw text delta from Gemini, in arrival order. May contain unresolved `[N]` citation brackets — **must render as plain inert text, never styled or clickable**, since verification hasn't run yet. |
+| `verifying` | `{}` | Generation is complete; citation verification has started. Claim-span extraction needs the full answer text, so this can never start earlier — there is no way to verify progressively. |
+| `citations-resolved` | `{"conversation_id", "message_id", "answer", "citations"}` | Same `citations` shape as `POST /query`'s response (including the `supported`/`partial`-kept, `unsupported`-dropped-and-marker-stripped rule). `answer` is the **final**, marker-stripped text — clients should replace whatever raw text they'd accumulated from `token` events with this value, then re-parse citation markers against `citations` (see `buildAssistantMessage()`, reused for both the streaming and historical-message paths). |
+| `done` | `{"metadata"}` | Same `metadata` shape as `POST /query`'s response. Terminal — the connection closes after this. |
+| `error` | `{"code", "message"}` | Same error codes as the table above (`GENERATE_FAILED`, `VERIFY_FAILED`, `RETRIEVE_FAILED`, `PERSIST_FAILED`) — surfaced mid-stream instead of as an HTTP status, since the stream may already be open. Terminal. |
+
+**UI contract for the gap between `token` and `citations-resolved`:** the client must show a distinct "verifying" indicator during this window — never let the fully-streamed-but-unverified text just sit there with no sign anything is still happening (`apps/web/components/chat/loading-stages.tsx`).
+
+**Implementation note (real bug found and fixed during this feature, 2026-07-27):** every downstream call in the SSE generator (`Retriever.retrieve`, `Verifier.verify_batch`, `fetch_generator_chunks`, `signed_figure_url`, `create_query_turn`) is synchronous/blocking Python, run via `asyncio.to_thread(...)`. Calling `verify_batch()` directly (no `await`) was confirmed live to freeze the event loop for its entire real ~8s Gemini-verification duration, which meant uvicorn never got a chance to flush the already-yielded `verifying` frame to the socket until the *next* yield — the client received `verifying` and `citations-resolved` at the identical timestamp instead of with the real gap between them. Caught via real browser testing (DOM sampling + a temporary client-side event-arrival log), not from protocol-level tests alone, which happened to mask it. Only Gemini's own token-generation stream (`generate_content_stream`, genuinely async via `client.aio`) does not need this.
+
+---
+
 ### `GET /conversations`
 Lists user's conversations.
 

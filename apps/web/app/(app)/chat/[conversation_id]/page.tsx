@@ -7,24 +7,15 @@ import { Sidebar } from "@/components/layout/sidebar";
 import { Topbar, WorkspaceBadge, MobileMenuButton } from "@/components/layout/topbar";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { UserMessageBubble, AssistantMessageBubble } from "@/components/chat/message-bubble";
-import { LoadingStages } from "@/components/chat/loading-stages";
+import { LoadingStages, type StreamingStage } from "@/components/chat/loading-stages";
 import { QuestionInput } from "@/components/chat/question-input";
 import { SourcePanel } from "@/components/chat/source-panel";
 import type { ChatMessage, Citation } from "@/lib/types/chat";
 import { createClient } from "@/lib/supabase/browser";
-import { askQuestion } from "@/lib/api/query";
+import { askQuestionStream } from "@/lib/api/query";
+import { buildAssistantMessage } from "@/lib/chat/parse-message";
 import { getConversationMessages, listConversations, type ApiConversation } from "@/lib/api/conversations";
 import { ApiError } from "@/lib/api/client";
-
-// The staged-loading copy (loading-stages.tsx) was built against real
-// measured /query latency (3.4-9.3s, not estimated — see this feature's
-// CHANGELOG entry) but there is no real stage-by-stage backend signal to
-// drive it without streaming (deferred, FEAT-016). This interval is an
-// honest "sent -> waiting -> response received" approximation: advance
-// once per tick up to the last stage, then hold there until the real
-// response actually lands and clears loading — never claims to know
-// backend progress it doesn't have.
-const LOADING_STAGE_INTERVAL_MS = 1700;
 
 const USER = { initials: "AK", name: "Ana Kovač", email: "ana@firm.com" };
 
@@ -51,22 +42,27 @@ export default function ChatPage({ params }: { params: { conversation_id: string
   const [notFound, setNotFound] = React.useState(false);
   const [historyError, setHistoryError] = React.useState<string | null>(null);
   const [askError, setAskError] = React.useState<string | null>(null);
-  const [loadingStage, setLoadingStage] = React.useState<number | null>(null);
+  // FEAT-016 (2026-07-27): replaces the old timer-driven `loadingStage`
+  // index with real SSE-signal state. `streamingId` is the in-progress
+  // assistant message's id (null when nothing is streaming — also what
+  // disables the question input); `streamingStage` is only meaningful
+  // while streamingId is set, and covers exactly the two gaps that have
+  // no visible content of their own: before the first token ("retrieving")
+  // and after the last token, while verification runs ("verifying").
+  // While tokens are actively arriving, streamingStage is null — the
+  // growing real text IS the progress indicator.
+  const [streamingId, setStreamingId] = React.useState<string | null>(null);
+  const [streamingStage, setStreamingStage] = React.useState<StreamingStage | null>(null);
   const [activeCitation, setActiveCitation] = React.useState<Citation | null>(null);
   const [mobileMenuOpen, setMobileMenuOpen] = React.useState(false);
   const [recentConversations, setRecentConversations] = React.useState<ApiConversation[] | null>(null);
 
   const scrollRef = React.useRef<HTMLDivElement>(null);
-  const stageInterval = React.useRef<ReturnType<typeof setInterval>>();
-
-  React.useEffect(() => {
-    return () => clearInterval(stageInterval.current);
-  }, []);
 
   React.useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages, loadingStage]);
+  }, [messages, streamingStage]);
 
   // Real conversation history — omitted entirely for a fresh "new" chat,
   // since there is nothing to load until the first real POST /query
@@ -123,33 +119,79 @@ export default function ChatPage({ params }: { params: { conversation_id: string
       return;
     }
     setAskError(null);
-    const optimisticUserMessage: ChatMessage = { id: `local-${Date.now()}`, role: "user", text: question };
+    const userMessageId = `local-${Date.now()}`;
+    const streamId = `stream-${userMessageId}`;
+    const optimisticUserMessage: ChatMessage = { id: userMessageId, role: "user", text: question };
     setMessages((prev) => [...prev, optimisticUserMessage]);
-    setLoadingStage(0);
-    stageInterval.current = setInterval(() => {
-      setLoadingStage((prev) => Math.min(2, (prev ?? 0) + 1));
-    }, LOADING_STAGE_INTERVAL_MS);
+    setStreamingId(streamId);
+    setStreamingStage("retrieving");
+
+    // Local accumulator, not state — read/written synchronously inside
+    // the SSE callbacks below (all of which fire strictly in sequence
+    // for one stream, never concurrently), then flushed into `messages`
+    // state on every token so the visible text grows in real time.
+    let accumulated = "";
+    let resolvedConversationId: string | null = null;
 
     try {
-      const result = await askQuestion(question, documentIds, conversationId);
-      setMessages((prev) => [...prev, result.assistantMessage]);
-      if (!title) setTitle(truncateTitle(question));
-      if (!conversationId) {
-        setConversationId(result.conversationId);
-        // Replace, not push — "new" was never a real conversation state
-        // worth returning to via back-navigation.
-        router.replace(`/chat/${result.conversationId}`);
-      }
+      await askQuestionStream(question, documentIds, conversationId, {
+        onRetrieving: () => setStreamingStage("retrieving"),
+        onToken: (text) => {
+          accumulated += text;
+          setStreamingStage(null);
+          setMessages((prev) => {
+            // First token: the placeholder bubble doesn't exist yet
+            // (kept out of `messages` entirely during "retrieving" so
+            // LoadingStages' skeleton renders in its place, not
+            // alongside an empty bubble) — insert it now.
+            const exists = prev.some((m) => m.id === streamId);
+            const rebuilt = buildAssistantMessage(streamId, accumulated, []);
+            return exists ? prev.map((m) => (m.id === streamId ? rebuilt : m)) : [...prev, rebuilt];
+          });
+        },
+        onVerifying: () => setStreamingStage("verifying"),
+        onCitationsResolved: (event) => {
+          resolvedConversationId = event.conversation_id;
+          const finalMessage = buildAssistantMessage(streamId, event.answer, event.citations);
+          setMessages((prev) => prev.map((m) => (m.id === streamId ? finalMessage : m)));
+        },
+        onDone: () => {
+          setStreamingId(null);
+          setStreamingStage(null);
+          if (!title) setTitle(truncateTitle(question));
+          if (resolvedConversationId && !conversationId) {
+            setConversationId(resolvedConversationId);
+            // Replace, not push — "new" was never a real conversation
+            // state worth returning to via back-navigation.
+            router.replace(`/chat/${resolvedConversationId}`);
+          }
+        },
+        onError: (message) => {
+          setStreamingId(null);
+          setStreamingStage(null);
+          if (accumulated.length === 0) {
+            // Nothing was ever shown — behave like a full failure
+            // (matches the old non-streaming error path) so retrying
+            // doesn't leave a duplicated question behind.
+            setMessages((prev) => prev.filter((m) => m.id !== userMessageId && m.id !== streamId));
+          }
+          // Partial text (if any) is deliberately left in place — a
+          // half-finished answer with a clear error notice below it is
+          // the required "sensible error state," never a silent hang or
+          // an unindicated partial answer.
+          setAskError(message);
+        },
+      });
     } catch (err) {
-      setMessages((prev) => prev.filter((m) => m.id !== optimisticUserMessage.id));
+      // Failed before any streaming began at all (network error opening
+      // the connection, or a non-2xx validation/ownership/auth response)
+      // — identical to the old non-streaming failure path.
+      setStreamingId(null);
+      setStreamingStage(null);
+      setMessages((prev) => prev.filter((m) => m.id !== userMessageId && m.id !== streamId));
       setAskError(
-        err instanceof ApiError
-          ? err.message
-          : "Something went wrong asking that question. Try again."
+        err instanceof ApiError ? err.message : "Something went wrong asking that question. Try again."
       );
-    } finally {
-      clearInterval(stageInterval.current);
-      setLoadingStage(null);
     }
   }
 
@@ -264,22 +306,28 @@ export default function ChatPage({ params }: { params: { conversation_id: string
                 msg.role === "user" ? (
                   <UserMessageBubble key={msg.id} message={msg} />
                 ) : (
-                  <AssistantMessageBubble
-                    key={msg.id}
-                    message={msg}
-                    activeCitationId={activeCitation?.id ?? null}
-                    onOpenCitation={setActiveCitation}
-                  />
+                  <React.Fragment key={msg.id}>
+                    <AssistantMessageBubble
+                      message={msg}
+                      activeCitationId={activeCitation?.id ?? null}
+                      onOpenCitation={setActiveCitation}
+                    />
+                    {msg.id === streamingId && streamingStage === "verifying" ? (
+                      <LoadingStages stage="verifying" />
+                    ) : null}
+                  </React.Fragment>
                 )
               )}
-              {loadingStage !== null ? <LoadingStages stage={loadingStage} /> : null}
+              {streamingId !== null && streamingStage === "retrieving" ? (
+                <LoadingStages stage="retrieving" />
+              ) : null}
             </div>
           )}
         </main>
         {askError ? (
           <p className="mx-6 mb-1 text-center text-sm text-destructive">{askError}</p>
         ) : null}
-        <QuestionInput onSend={ask} disabled={loadingStage !== null || loadingHistory || notFound} />
+        <QuestionInput onSend={ask} disabled={streamingId !== null || loadingHistory || notFound} />
         <SourcePanel
           citation={activeCitation}
           onClose={() => setActiveCitation(null)}

@@ -114,9 +114,9 @@ Source of truth for what is and is not in scope, per phase. The agent checks her
 - [ ] Verifier verdict + reasoning stored in `citations` table for audit
 - [ ] Reranker step added to retrieval (Voyage rerank-2 or self-hosted cross-encoder)
 - [ ] OCR fallback via Gemini Flash for low-confidence Docling pages
-- [ ] DOCX/PPTX/HTML ingestion (via Docling's native support)
-- [ ] Conversation memory (previous Q&A in same session as context)
-- [ ] Streaming responses via SSE
+- [x] DOCX/PPTX/HTML ingestion (via Docling's native support) — FEAT-020, 2026-07-27. Note: the rest of this Phase 4 checklist (verifier, reranker, OCR fallback, conversation memory) is also already built (FEAT-011/018/017/019) but wasn't checked off here when each shipped — left as-is, out of this task's scope to reconcile the whole list.
+- [x] Conversation memory (previous Q&A in same session as context) — FEAT-019, 2026-07-27
+- [x] Streaming responses via SSE — FEAT-016, 2026-07-27 (`POST /query/stream`; filed under Phase 2 in FEATURES.md, not this Phase 4 list, since it's a direct `/query` extension — checked off here too since this line still names it)
 
 ### Explicitly out of scope
 - Strategy selector UI (v2 — after v1 shipped)

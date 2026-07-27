@@ -137,6 +137,28 @@ class GenerateResult:
     latency_ms: float
 
 
+# generate_stream()'s async generator yields plain `str` text deltas as
+# they arrive, then a single final GenerateStreamResult once Gemini's
+# stream is exhausted — mirrors GenerateResult exactly (same fields, same
+# citation-parsing rules) so routes/query.py's SSE endpoint builds its
+# `citations-resolved` event the identical way the non-streaming endpoint
+# already builds its response, not a second parallel code path that could
+# silently drift from it. Callers distinguish the two shapes with
+# `isinstance(item, str)` rather than a second channel/callback — the
+# accumulated answer text isn't known (and citations can't be parsed)
+# until the whole stream has been consumed, so there is no way to hand
+# back the final result any earlier regardless of the mechanism used.
+@dataclass
+class GenerateStreamResult:
+    answer: str
+    cited_indices: list[int]
+    hallucinated_markers: list[int]
+    model: str
+    input_tokens: int
+    output_tokens: int
+    latency_ms: float
+
+
 def _default_client() -> genai.Client:
     # The SDK's automatic env-var detection looks for GOOGLE_API_KEY, not
     # GEMINI_API_KEY (this project's actual env var, shared with the OCR
@@ -279,6 +301,64 @@ class Generator:
             cited_indices=cited_indices,
             hallucinated_markers=hallucinated_markers,
             model=response.model_version or MODEL,
+            input_tokens=usage.prompt_token_count if usage and usage.prompt_token_count is not None else 0,
+            output_tokens=usage.candidates_token_count if usage and usage.candidates_token_count is not None else 0,
+            latency_ms=latency_ms,
+        )
+
+    async def generate_stream(
+        self, question: str, chunks: list[GeneratorChunk], history: list[dict] | None = None
+    ):
+        """Streaming counterpart to generate() (FEAT-016, 2026-07-27) —
+        same prompt-building, same citation-parsing rules, same
+        SYSTEM_INSTRUCTION, only the Gemini call itself differs
+        (`client.aio.models.generate_content_stream`, confirmed live
+        against the installed SDK to live on the SAME `genai.Client`
+        instance as the non-streaming path — no second client
+        constructed). Yields each non-empty text delta as a `str` in
+        arrival order, then yields exactly one final
+        GenerateStreamResult once the underlying stream is exhausted.
+
+        Citation parsing cannot start until the full answer text exists
+        (claim-span extraction needs real sentence boundaries) — this is
+        a hard dependency of the verification step downstream, not a
+        streaming-specific limitation, so there is no earlier point at
+        which cited_indices could be produced.
+        """
+        if not chunks:
+            raise GenerationError("generate_stream() requires at least one context chunk")
+
+        contents = _build_contents(question, chunks, history)
+        config = types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION, temperature=0.2)
+
+        started = time.perf_counter()
+        answer_parts: list[str] = []
+        last_response = None
+        try:
+            stream = await self._client.aio.models.generate_content_stream(model=MODEL, contents=contents, config=config)
+            async for response_chunk in stream:
+                last_response = response_chunk
+                delta = response_chunk.text
+                if delta:
+                    answer_parts.append(delta)
+                    yield delta
+        except APIError as exc:
+            raise GenerationError(f"Gemini streaming generation failed: {exc}") from exc
+        latency_ms = (time.perf_counter() - started) * 1000
+
+        answer = "".join(answer_parts)
+        if not answer:
+            prompt_feedback = last_response.prompt_feedback if last_response else None
+            raise GenerationError(f"Gemini returned no text content (prompt_feedback={prompt_feedback})")
+
+        cited_indices, hallucinated_markers = _parse_citations(answer, len(chunks))
+        usage = last_response.usage_metadata if last_response else None
+
+        yield GenerateStreamResult(
+            answer=answer,
+            cited_indices=cited_indices,
+            hallucinated_markers=hallucinated_markers,
+            model=(last_response.model_version if last_response else None) or MODEL,
             input_tokens=usage.prompt_token_count if usage and usage.prompt_token_count is not None else 0,
             output_tokens=usage.candidates_token_count if usage and usage.candidates_token_count is not None else 0,
             latency_ms=latency_ms,
