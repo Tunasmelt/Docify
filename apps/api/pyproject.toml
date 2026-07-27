@@ -62,6 +62,26 @@ dependencies = [
     # Version floor is what was installed and tested against locally
     # (2026-07-26), not a specific security-driven pin like the others above.
     "pytesseract>=0.3.13,<0.4",
+    # torch is transitive (docling -> docling-ibm-models/accelerate ->
+    # torch), never imported by this project's own code directly —
+    # declared here explicitly anyway, pinned to the exact version
+    # docling already resolves to, purely so [tool.uv.sources] below can
+    # bind to it. uv only honors a [tool.uv.sources] override for a
+    # package listed in [project.dependencies]; a transitive-only
+    # dependency is invisible to that table (confirmed live 2026-07-27 —
+    # the override was silently ignored, still pulling PyPI's default
+    # CUDA-bundled wheel, until torch was added here).
+    "torch==2.13.0",
+    # torchvision must be pinned alongside torch for the same reason,
+    # not just symmetry: leaving it sourced from plain PyPI (built
+    # against PyPI's default CUDA-bundled torch ABI) while torch itself
+    # comes from the CPU-only index produces a real ABI mismatch —
+    # confirmed live (2026-07-27) as a container crash-on-import
+    # (`transformers`' AutoProcessor lazy-load silently reports itself
+    # "unavailable" when its own is_torchvision_available() check trips
+    # on the mismatched build, surfacing as a confusing
+    # ModuleNotFoundError several layers away from the real cause).
+    "torchvision==0.28.0",
 ]
 
 [dependency-groups]
@@ -96,3 +116,28 @@ pythonpath = ["."]
 # resolver to a patched version without misrepresenting it as something
 # we depend on directly.
 constraint-dependencies = ["langsmith>=0.8.18"]
+
+[tool.uv.sources]
+# torch/torchvision are transitive (docling -> its layout/table-structure
+# models), never imported by this project's own code directly. PyPI's
+# default linux wheel for `torch` bundles full CUDA support (nvidia-cudnn,
+# nvidia-nccl, nvidia-cufft, etc. — several hundred MB of GPU libraries),
+# which this project never uses: Docling's `do_ocr=False` is always set
+# (MEMORY.md's Docling-defaults entry) and Render's deploy target has no
+# GPU at all. Confirmed live (2026-07-27, first real Render deploy
+# attempt): the CUDA build's runtime memory footprint alone exceeded
+# Render's free-tier 512MB limit ("Out of memory (used over 512Mi)"),
+# failing the deploy before the app ever finished starting up — not a
+# hypothetical optimization, a real blocker. Routing torch/torchvision to
+# PyTorch's own CPU-only wheel index removes the CUDA libraries entirely
+# (smaller image, faster build, and — the part that actually mattered
+# here — fits in 512MB at runtime), with zero behavior change: nothing in
+# this codebase or Docling's own pipeline (as configured here) ever
+# requests CUDA either way.
+torch = [{ index = "pytorch-cpu" }]
+torchvision = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
