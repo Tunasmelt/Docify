@@ -287,7 +287,7 @@ export default function ChatPage({ params }: { params: { conversation_id: string
             // Real per-page document viewing is Phase 4+ scope (not part
             // of this wiring pass — no route/viewer exists yet to open).
             // eslint-disable-next-line no-console
-            console.log("[not yet built] open document at page", citation.page)
+            console.log("[not yet built] open document at location", citation.location)
           }
         />
       </div>

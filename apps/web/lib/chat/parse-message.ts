@@ -15,12 +15,36 @@ import type { AssistantMessage, Citation, MessageSegment } from "@/lib/types/cha
 const CITATION_BRACKET = /\[([^[\]]*)]/g;
 const CITATION_NUMBER = /\d+/g;
 
+// FEAT-020 (2026-07-27): page_number's real meaning depends on the
+// source document's format — confirmed live per format, not assumed
+// (.agent/SCHEMA.md's page_number note, apps/api/routes/ingest.py's
+// SUPPORTED_MIME_TYPES). PPTX's page_number really is the 1-indexed
+// slide index. DOCX/HTML give Docling no page/location concept at all,
+// so page_number is always a fixed `1` sentinel there — real for PDF,
+// meaningless for these two. Any mime_type not recognized here
+// (including PDF) falls through to the historical "page" behavior,
+// matching what every citation looked like before this format
+// distinction existed.
+const SLIDE_MIME_TYPES = new Set([
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation", // .pptx
+]);
+const NO_REAL_LOCATION_MIME_TYPES = new Set([
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document", // .docx
+  "text/html",
+]);
+
+function citationLocation(mimeType: string, pageNumber: number): Citation["location"] {
+  if (NO_REAL_LOCATION_MIME_TYPES.has(mimeType)) return null;
+  if (SLIDE_MIME_TYPES.has(mimeType)) return { kind: "slide", number: pageNumber };
+  return { kind: "page", number: pageNumber };
+}
+
 function apiCitationToClientCitation(id: string, c: ApiCitation): Citation {
   return {
     id,
     n: c.marker,
     documentName: c.document_name,
-    page: c.page_number,
+    location: citationLocation(c.document_mime_type, c.page_number),
     // Backend only ever sends 'supported' | 'partial' citations to the
     // client (POST /query drops 'unsupported' from its response array,
     // GET /conversations/{id}/messages' list_citations_for_messages()

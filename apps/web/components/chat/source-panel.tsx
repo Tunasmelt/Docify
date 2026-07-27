@@ -15,10 +15,17 @@ export function SourcePanel({ citation, onClose, onOpenInDocument }: SourcePanel
   if (!citation) return null;
 
   const style = CITATION_VERDICT_STYLES[citation.verdict];
+  // location is null for DOCX/HTML sources — Docling gives no real page
+  // concept for these formats, so the backend's page_number is an
+  // honest-but-meaningless `1` sentinel that must never be shown as if
+  // it were real (FEAT-020, .agent/SCHEMA.md). Every phrase below that
+  // mentions a location branches on this instead of assuming one exists.
+  const location = citation.location;
+  const locationClause = location ? ` on ${location.kind} ${location.number}` : "";
   const verdictText =
     citation.verdict === "partial"
-      ? "Partially supported — this page backs part of the claim. Worth a direct look."
-      : `Verified — this passage supports the claim on page ${citation.page}.`;
+      ? `Partially supported — this${location ? " " + location.kind : " source"} backs part of the claim. Worth a direct look.`
+      : `Verified — this passage supports the claim${locationClause}.`;
 
   return (
     <aside
@@ -43,9 +50,11 @@ export function SourcePanel({ citation, onClose, onOpenInDocument }: SourcePanel
         <h3 className="m-0 font-serif text-lg font-medium leading-snug">
           {citation.documentName}
         </h3>
-        <p className="m-0 mt-0.5 font-mono text-[11px] tracking-[0.04em] text-faint">
-          PAGE {citation.page}
-        </p>
+        {location ? (
+          <p className="m-0 mt-0.5 font-mono text-[11px] tracking-[0.04em] text-faint">
+            {location.kind.toUpperCase()} {location.number}
+          </p>
+        ) : null}
         <p
           className="m-0 mt-4 rounded-md px-3 py-2 text-[13px] font-medium leading-relaxed"
           style={{ color: style.fg, background: style.bg }}
@@ -64,7 +73,10 @@ export function SourcePanel({ citation, onClose, onOpenInDocument }: SourcePanel
               <img
                 data-testid="figure-image"
                 src={citation.figureUrl}
-                alt={citation.figureCaption ?? `Figure from ${citation.documentName}, page ${citation.page}`}
+                alt={
+                  citation.figureCaption ??
+                  `Figure from ${citation.documentName}${location ? `, ${location.kind} ${location.number}` : ""}`
+                }
                 className="max-h-[240px] w-full rounded-md border border-line bg-surface object-contain"
               />
             ) : (
@@ -87,7 +99,7 @@ export function SourcePanel({ citation, onClose, onOpenInDocument }: SourcePanel
           onClick={() => onOpenInDocument(citation)}
           className="mt-6 w-full rounded-md border border-border py-2.5 text-sm font-medium text-muted hover:bg-panel hover:text-ink"
         >
-          Open page {citation.page} in document
+          {location ? `Open ${location.kind} ${location.number} in document` : "Open in document"}
         </button>
       </div>
     </aside>

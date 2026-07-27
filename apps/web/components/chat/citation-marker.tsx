@@ -18,9 +18,13 @@ export interface CitationMarkerProps {
 export function CitationMarker({ citation, active, onOpen }: CitationMarkerProps) {
   const style = CITATION_VERDICT_STYLES[citation.verdict];
   const isPartial = citation.verdict === "partial";
-  const tip =
-    (isPartial ? "Partially supported — " : "") +
-    `${citation.documentName}, p. ${citation.page}`;
+  // location is null for DOCX/HTML sources (no real page concept —
+  // FEAT-020) — omit the location clause entirely rather than show a
+  // false "p. 1" for every citation in the document.
+  const locationSuffix = citation.location
+    ? `, ${citation.location.kind === "page" ? "Page" : "Slide"} ${citation.location.number}`
+    : "";
+  const tip = (isPartial ? "Partially supported — " : "") + `${citation.documentName}${locationSuffix}`;
 
   return (
     <sup>

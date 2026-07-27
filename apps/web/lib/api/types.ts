@@ -9,6 +9,14 @@ export interface ApiCitation {
   chunk_id: string;
   document_id: string;
   document_name: string;
+  /** The source document's real mime_type (FEAT-020, 2026-07-27) —
+   * needed to know what `page_number` actually means: a real PDF page,
+   * a PPTX slide index, or a DOCX/HTML `page_number: 1` sentinel that
+   * must never be displayed as if it were a real location
+   * (.agent/SCHEMA.md's page_number note). See lib/chat/parse-message.ts's
+   * `citationLocation()` for the one place this gets turned into display
+   * text. */
+  document_mime_type: string;
   page_number: number;
   element_type: string;
   snippet: string;

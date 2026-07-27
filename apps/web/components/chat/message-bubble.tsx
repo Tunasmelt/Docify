@@ -63,7 +63,13 @@ export function AssistantMessageBubble({
               >
                 {citation.n}
               </span>
-              {citation.documentName} · P.{citation.page}
+              {citation.documentName}
+              {/* location is null for DOCX/HTML sources (no real page
+                  concept — FEAT-020) — omit rather than show a false
+                  page number for every citation in the document. */}
+              {citation.location
+                ? ` · ${citation.location.kind === "page" ? "P" : "S"}.${citation.location.number}`
+                : ""}
               {citation.verdict === "partial" ? " · partial" : ""}
             </button>
           ))}
