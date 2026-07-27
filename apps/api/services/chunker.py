@@ -364,7 +364,25 @@ class Chunker:
                 continue  # not modeled for chunking (shouldn't occur — parser already filters)
 
             candidate_texts = pending_texts + [element.content]
-            if pending_indices and _approx_token_count("\n".join(candidate_texts)) > TOKEN_BUDGET:
+            crosses_page_boundary = pending_pages and element.page_number != pending_pages[-1]
+            if pending_indices and (
+                _approx_token_count("\n".join(candidate_texts)) > TOKEN_BUDGET or crosses_page_boundary
+            ):
+                # FEAT-020 (2026-07-27) real finding: without this, grouping
+                # freely crosses a page_number boundary, and
+                # db/queries.py's build_chunk_rows stores
+                # min(chunk.page_numbers) as the single page_number column
+                # — a chunk spanning two pages silently reports only the
+                # first one. For PDF this was a minor, rare imprecision
+                # (continuous flowing text near a page break); for PPTX,
+                # where page_number is a genuinely discrete slide index,
+                # this produced a real, confirmed-live bug: a real citation
+                # reported slide 1 for content that actually lives on slide
+                # 2. Caught by FEAT-020's real end-to-end /query test, not
+                # a unit test — treating a page/slide change as a flush
+                # boundary (same tier as TOKEN_BUDGET overflow or hitting a
+                # TABLE/FIGURE/CAPTION) fixes it for all formats uniformly,
+                # not just PPTX.
                 flush_pending()
 
             if not pending_indices:

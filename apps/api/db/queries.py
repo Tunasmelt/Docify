@@ -337,7 +337,7 @@ def list_messages_for_conversation(
 
 CITATION_JOIN_COLUMNS = (
     "id,message_id,marker,verdict,supporting_quote,chunk_id,"
-    "chunks(document_id,page_number,element_type,content,figure_path,documents(filename))"
+    "chunks(document_id,page_number,element_type,content,figure_path,documents(filename,mime_type))"
 )
 
 

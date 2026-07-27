@@ -79,6 +79,7 @@ def _citation_response(client, row: dict) -> CitationResponse:
         chunk_id=row["chunk_id"],
         document_id=chunk["document_id"],
         document_name=chunk["documents"]["filename"],
+        document_mime_type=chunk["documents"]["mime_type"],
         page_number=chunk["page_number"],
         element_type=chunk["element_type"],
         snippet=chunk["content"][:200],

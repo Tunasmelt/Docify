@@ -18,9 +18,18 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Phase 1 scope is PDF only — DOCX/PPTX/HTML are explicitly out of scope
-# until Phase 4 (.agent/SCOPE.md).
-SUPPORTED_MIME_TYPES = {"application/pdf"}
+# FEAT-020 (2026-07-27): extended from PDF-only to also accept DOCX,
+# PPTX, and HTML — verified per-format against real fixtures, not assumed
+# from "Docling supports it" alone (.agent/FEATURES.md's FEAT-020 entry
+# has the full investigation). The exact mime types below are what real
+# browsers/OS file pickers send for these extensions (standard,
+# registered IANA media types — not guessed).
+SUPPORTED_MIME_TYPES = {
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # .docx
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",  # .pptx
+    "text/html",
+}
 
 
 # Our own upload flow only ever produces "uploads/{user_id}/{uuid}.{ext}"
@@ -185,7 +194,7 @@ async def post_ingest(
         return JSONResponse(
             status_code=422,
             content=error_envelope(
-                "VALIDATION_ERROR", f"unsupported mime_type {payload.mime_type!r} (Phase 1 supports PDF only)"
+                "VALIDATION_ERROR", f"unsupported mime_type {payload.mime_type!r} (supported: PDF, DOCX, PPTX, HTML)"
             ),
         )
 
@@ -258,7 +267,15 @@ def run_ingest_pipeline(
         # SDK requests "uploads/uploads/..." and 404s.
         in_bucket_path = storage_path.removeprefix("uploads/")
         file_bytes = resolved_client.storage.from_("uploads").download(in_bucket_path)
-        parsed = parser.parse(file_bytes)
+        # FEAT-020: Parser.parse() needs the real filename/extension to
+        # tell Docling which format this actually is (it inspects the
+        # extension, no content-sniffing — confirmed against the
+        # installed SDK). storage_path's own trailing segment is the
+        # validated "{uuid}.{ext}" object name (validate_storage_path's
+        # whitelist above), not payload.filename's free-form display
+        # name, since that's the value guaranteed to carry the real,
+        # safe extension for whatever was actually uploaded.
+        parsed = parser.parse(file_bytes, filename=storage_path.rsplit("/", 1)[-1])
 
         # Approximation, not a Docling-native page count: the highest page
         # number seen among *extracted* elements. A trailing page with no

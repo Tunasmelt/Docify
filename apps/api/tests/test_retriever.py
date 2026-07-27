@@ -108,7 +108,7 @@ def _vector_along_dimension(dim_index: int, size: int = 1024) -> list[float]:
     return vector
 
 
-def _create_document(admin, user_id: str, filename: str) -> str:
+def _create_document(admin, user_id: str, filename: str, mime_type: str = "application/pdf") -> str:
     return (
         admin.table("documents")
         .insert(
@@ -116,7 +116,7 @@ def _create_document(admin, user_id: str, filename: str) -> str:
                 "user_id": user_id,
                 "filename": filename,
                 "storage_path": f"uploads/{user_id}/{filename}",
-                "mime_type": "application/pdf",
+                "mime_type": mime_type,
                 "size_bytes": 17,
             }
         )
@@ -311,8 +311,38 @@ def test_returns_top_k_with_metadata_chunk_id_content_page_document_n(admin, use
     assert result.content == "the exact content that should round-trip"
     assert result.page == 7
     assert result.document_name == "metadata-check.pdf"
+    assert result.document_mime_type == "application/pdf"
     assert result.element_type == "table"
     assert isinstance(result.score, float) and result.score > 0
+
+
+# FEAT-020 (2026-07-27): document_mime_type is the field the citation-
+# display layer needs to tell a real PDF page from a PPTX slide index or
+# a DOCX/HTML page_number=1 sentinel — confirm it round-trips a REAL
+# non-PDF value through the actual RPC functions
+# (match_chunks_by_vector/match_chunks_by_fts), not just always echoing
+# back the one hardcoded "application/pdf" every other test in this file
+# uses via _create_document's default.
+def test_document_mime_type_round_trips_a_real_non_pdf_value(admin, user_a):
+    user_id, _token = user_a
+    document_id = _create_document(
+        admin, user_id, "slides.pptx",
+        mime_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    )
+    _insert_chunk(
+        admin,
+        document_id=document_id,
+        user_id=user_id,
+        chunk_index=0,
+        content="a real pptx-sourced chunk",
+        embedding=_vector_along_dimension(0),
+    )
+
+    retriever = Retriever(client=admin, embedder=FakeQueryEmbedder(_vector_along_dimension(0)))
+    results = retriever.retrieve("question", [document_id], user_id, k=1)
+
+    assert len(results) == 1
+    assert results[0].document_mime_type == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
 
 # Acceptance criterion: user_id is included in every SQL WHERE clause explicitly

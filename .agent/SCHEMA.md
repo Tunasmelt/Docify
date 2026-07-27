@@ -83,6 +83,13 @@ create index chunks_embedding_idx on chunks
   with (m = 16, ef_construction = 64);
 ```
 
+**`page_number`'s real meaning depends on the source document's format (FEAT-020, 2026-07-27), confirmed live per format, not assumed:**
+- **PDF:** the real PDF page number (unchanged, as before FEAT-020).
+- **PPTX:** the real slide index (1-indexed) — Docling reports this via the same `item.prov[0].page_no` mechanism as PDF; confirmed against a real 3-slide fixture that `page_no` genuinely tracks slide position. Column name stays `page_number` for schema/API stability, but this is really "slide number" for a PPTX-sourced chunk.
+- **DOCX / HTML:** always `1`, for every chunk in the document. Confirmed live, not assumed: Docling's DOCX and HTML backends never populate `item.prov` at all — no element, of any type, in any DOCX/HTML document ever carries page or bbox information. There is no real page/pagination concept for Docling to report for these two formats (`doc.pages` itself is empty). `page_number` stayed `not null` (no migration) — `1` is an explicit, honest sentinel meaning "no real location available," not a fabricated page number. `bbox` likewise gets a zero-sized `{x0:0,y0:0,x1:0,y1:0}` sentinel for these two formats (the column is already nullable, but a fixed zero-box was chosen over `null` for consistency with how OCR-recovered PDF elements already always populate some bbox).
+
+**Frontend gap closed (2026-07-27 follow-up).** The mime-type gap noted above is fixed: `documents.mime_type` now flows all the way to the client (`document_mime_type` on `CitationResponse`/`ApiCitation`) via a new migration (`match_chunks_by_vector`/`match_chunks_by_fts` gained a `document_mime_type` output column — required `DROP FUNCTION` first, confirmed live that Postgres does not allow `CREATE OR REPLACE FUNCTION` to change `RETURNS TABLE` columns) and `CITATION_JOIN_COLUMNS`' `documents(filename,mime_type)` embed. `lib/chat/parse-message.ts`'s `citationLocation()` is the one place the format→display decision is made (PDF/unknown → "page", PPTX → "slide", DOCX/HTML → `null`, omitted entirely); every display site (`source-panel.tsx`, `message-bubble.tsx`, `citation-marker.tsx`) reads `citation.location` instead of a raw page number. Verified in a real browser against all 4 formats (screenshots + rendered text captured, not just code review).
+
 ### `conversations`
 Grouping of Q&A over one or more documents.
 

@@ -80,6 +80,54 @@ def test_groups_text_heading_list_elements_respecting_boundaries(clean_digital_d
     assert len(chunks[2].source_element_indices) == 1
 
 
+# FEAT-020 (2026-07-27) real bug, found via the real end-to-end /query
+# test, not a unit test: grouping used to freely cross a page_number
+# change, and db/queries.py's build_chunk_rows stores
+# min(chunk.page_numbers) as the single page_number column — a chunk
+# spanning two pages silently reported only the first one. Harmless-ish
+# imprecision for PDF's continuous pagination; a real, confirmed-live
+# wrong-slide-number bug for PPTX, where page_number is a genuinely
+# discrete slide index. Fixed by treating a page/slide change as a flush
+# boundary, same tier as TOKEN_BUDGET overflow.
+def test_grouping_never_crosses_a_page_number_boundary_even_within_token_budget():
+    elements = [
+        make_element(ElementType.TEXT, page_number=1, content="page one, first paragraph", element_id="#/t/0"),
+        make_element(ElementType.TEXT, page_number=1, content="page one, second paragraph", element_id="#/t/1"),
+        make_element(ElementType.TEXT, page_number=2, content="page two, first paragraph", element_id="#/t/2"),
+    ]
+    doc = ParsedDocument(elements=elements)
+
+    chunks = Chunker().chunk(doc)
+
+    # All three elements together are nowhere near TOKEN_BUDGET (500
+    # tokens) — without the page-boundary fix, this would produce ONE
+    # chunk spanning both pages. Must now produce two: one per page.
+    assert len(chunks) == 2
+    assert chunks[0].page_numbers == [1]
+    assert chunks[0].source_element_indices == [0, 1]
+    assert chunks[1].page_numbers == [2]
+    assert chunks[1].source_element_indices == [2]
+
+
+def test_grouping_within_a_single_page_is_unaffected_by_the_page_boundary_fix():
+    # Regression guard for the fix above: elements that all share the
+    # SAME page_number must still group together exactly as before —
+    # the fix must only trigger on an actual page change, not on every
+    # element boundary.
+    elements = [
+        make_element(ElementType.TEXT, page_number=5, content="first", element_id="#/t/0"),
+        make_element(ElementType.TEXT, page_number=5, content="second", element_id="#/t/1"),
+        make_element(ElementType.TEXT, page_number=5, content="third", element_id="#/t/2"),
+    ]
+    doc = ParsedDocument(elements=elements)
+
+    chunks = Chunker().chunk(doc)
+
+    assert len(chunks) == 1
+    assert chunks[0].page_numbers == [5]
+    assert chunks[0].source_element_indices == [0, 1, 2]
+
+
 def test_table_content_is_never_split_across_chunks(table_heavy_doc):
     chunks = Chunker().chunk(table_heavy_doc)
 

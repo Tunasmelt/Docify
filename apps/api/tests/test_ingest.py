@@ -92,15 +92,18 @@ def test_storage_path_prefix_mismatch_with_jwt_user_id_returns_403(app_client, a
 
 
 def test_unsupported_mime_type_returns_422(app_client, user_a):
+    # FEAT-020 (2026-07-27) extended SUPPORTED_MIME_TYPES to DOCX/PPTX/HTML
+    # alongside PDF — this test's example must be something genuinely
+    # still unsupported, not one of the newly-added formats.
     user_id, token = user_a
-    storage_path = f"uploads/{user_id}/doc.docx"
+    storage_path = f"uploads/{user_id}/doc.txt"
 
     response = app_client.post(
         "/ingest",
         json={
             "storage_path": storage_path,
-            "filename": "doc.docx",
-            "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "filename": "doc.txt",
+            "mime_type": "text/plain",
             "size_bytes": 17,
         },
         headers={"Authorization": f"Bearer {token}"},

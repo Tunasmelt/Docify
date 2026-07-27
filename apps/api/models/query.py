@@ -13,6 +13,14 @@ class CitationResponse(BaseModel):
     chunk_id: str
     document_id: str
     document_name: str
+    # The source document's real mime_type (FEAT-020, 2026-07-27) — the
+    # client needs this to know what page_number actually means: a real
+    # PDF page, a PPTX slide index, or a DOCX/HTML page_number=1 sentinel
+    # that must never be displayed as if it were a real location
+    # (.agent/SCHEMA.md's page_number note has the full per-format
+    # investigation). Presentation logic (label wording, when to omit)
+    # lives client-side — this field just relays the real fact.
+    document_mime_type: str
     page_number: int
     element_type: str
     snippet: str

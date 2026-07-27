@@ -812,7 +812,80 @@ This is a real EPA letter about lead service line compliance — confirms both t
 **Verification:** `test_parser.py` 23/23 passing — 21 deterministic (real Docling load only, no network calls, ~10 min) confirmed clean first; the 2 real-API tests run separately afterward (~30s), both passing, with real recovered text and the real 3-way comparison above. `test_chunker.py` re-run, 21/21, still no regression. Full backend suite re-run for final regression confirmation (see CHANGELOG).
 
 - [FEAT-018] Reranker step — **built 2026-07-27, but filed under FEAT-009's own follow-up section instead of this reserved number.** Caught only while reserving FEAT-019 below and re-reading this exact placeholder list first (the same discipline FEAT-026's own "Decision — FEAT number" note describes) — the reranking work itself (Voyage `rerank-2.5`, opt-in via `retrieve(rerank=True)`) is real and complete, see FEAT-009's entry for the full write-up; only the FEAT-number bookkeeping was inconsistent. Not renumbered retroactively — CHANGELOG.md is append-only and the commit already exists under that labeling; noted here so the mismatch isn't silently lost.
-- [FEAT-020] DOCX/PPTX ingestion — planned
+
+---
+
+### [FEAT-020] DOCX/PPTX/HTML ingestion
+**Phase:** 4
+**Status:** complete
+**Owner:** claude-code
+**Depends on:** FEAT-004 (Parser), FEAT-005 (Chunker), FEAT-007 (`/ingest`)
+**Files:**
+- `apps/api/services/parser.py` — `_default_converter()` now passes `allowed_formats=[PDF, DOCX, PPTX, HTML]` explicitly; new `_FORMATS_WITHOUT_PROVENANCE` constant; `Parser.parse()` gained a `filename: str = "document.pdf"` parameter (drives Docling's own format detection) and a 3-way branch (real provenance / sentinel / genuine-anomaly-drop) in the extraction loop
+- `apps/api/services/chunker.py` — grouping now flushes on a `page_number` change, not just `TOKEN_BUDGET` overflow (real bug found via this feature's own e2e test, see below — affects all formats, not just the three new ones)
+- `apps/api/routes/ingest.py` — `SUPPORTED_MIME_TYPES` extended to the 3 new formats; `run_ingest_pipeline` passes `storage_path`'s real trailing filename segment to `parser.parse(..., filename=...)`
+- `apps/api/db/queries.py` — unchanged (`build_chunk_rows`'s `min(chunk.page_numbers)` already does the right thing once the chunker fix above is in place)
+- `apps/api/tests/fixtures/table.docx` (new — real DOCX, a table + a real embedded image), `slides.pptx` (new — real 3-slide PPTX, title/bullets/image), `page.html` (new — real HTML, a table)
+- `.agent/SCHEMA.md`, `.agent/API_CONTRACT.md` — `page_number`'s per-format meaning documented (see below)
+**Tests:**
+- `apps/api/tests/test_parser.py` — 14 new tests: real per-format element-type/provenance/bbox/figure-extraction checks (DOCX, PPTX, HTML), content-sniffing robustness (PDF/DOCX/PPTX correctly detected regardless of a wrong extension; HTML does NOT — a real, confirmed exception, see below), and a PDF regression guard
+- `apps/api/tests/test_chunker.py` — 2 new tests for the page-boundary grouping fix (crosses a boundary even within token budget; unaffected when everything shares one page)
+- `apps/api/tests/e2e/test_format_ingest_e2e.py` (new) — real Docling+Voyage+Gemini through the actual `/ingest` + `/query` HTTP endpoints for all 3 formats, gated behind `RUN_FORMAT_INGEST_E2E_TEST=1`
+**Acceptance criteria:**
+- [x] Real per-format Docling investigation completed BEFORE any code was written (task's explicit item 2), not assumed — see the findings below
+- [x] `page_number` design fork resolved explicitly, in writing, before implementing (task item 3) — see below and `.agent/SCHEMA.md`
+- [x] `routes/ingest.py` accepts DOCX/PPTX/HTML mime types alongside PDF
+- [x] Each format proven through the REAL end-to-end pipeline (upload → parse → chunk → embed → query), not just parser unit tests — `test_format_ingest_e2e.py`
+- [x] `do_ocr`/`generate_picture_images` settings confirmed correct (or N/A) per format — see below
+- [x] OCR fallback chain (FEAT-017) confirmed correctly PDF-only in practice, without needing explicit exclusion — see below
+- [x] Existing PDF fixtures produce identical element/chunk counts after this change — confirmed (`clean_digital.pdf`: 21 elements/3 chunks; `table_heavy.pdf`: 66 elements/43 chunks — the exact count documented since FEAT-005; `scanned.pdf`: 2 elements/2 chunks — all unchanged)
+
+**Real per-format investigation (task item 2), run against real fixtures before any design or code:**
+
+| | Provenance (`item.prov`) | `page_number` meaning | bbox | Figure extraction | Tier 1 captions | Pipeline |
+|---|---|---|---|---|---|---|
+| PDF | Always present | Real page number | Real | Works (`generate_picture_images=True`) | Works (FEAT-004) | `PdfPipelineOptions` / custom |
+| PPTX | Always present | Real slide index (1-indexed) | Real | Works, zero config needed | Not observed (fixture has no captioned image) | `SimplePipeline` / Docling defaults |
+| DOCX | **Never present**, for any element, ever | Sentinel: always `1` | Sentinel: zero-box | Works, zero config needed | **Does not function** — a table's `captions` is always empty, and even a paragraph in Word's own native "Caption" style still comes through labeled plain `text`, never `CAPTION` | `SimplePipeline` / Docling defaults |
+| HTML | **Never present**, for any element, ever | Sentinel: always `1` | Sentinel: zero-box | **Broken** — Docling creates a `picture` element for an `<img>` tag but `get_image()` returns `None` | Works, but only via an `<img>`'s `alt` attribute (confirmed: `alt` text becomes an explicitly-linked `CAPTION` element) — moot in practice since the image itself never resolves | `SimplePipeline` / Docling defaults |
+
+**`do_ocr`/`generate_picture_images`/`generate_page_images` (task item 6) — confirmed not applicable to DOCX/PPTX/HTML, not just "not needed":** these three settings live on `PdfPipelineOptions`, used only by the PDF pipeline. Confirmed directly against the installed Docling source that DOCX/PPTX/HTML all use `SimplePipeline` with `ConvertPipelineOptions` — a completely different options class with no OCR field and no picture/page-image-generation field at all. There is nothing to tune; figure extraction working for DOCX/PPTX with zero configuration is explained by these formats embedding real image objects directly (unlike a PDF page, which must be rendered/cropped to produce an image).
+
+**OCR fallback chain (task item 7) — confirmed already, correctly, a structural no-op for the 3 new formats, no explicit exclusion needed:** `doc.pages` is completely empty for DOCX/HTML (`SimplePipeline` never populates it), so `Parser.parse()`'s OCR-fallback loop simply never executes for those two. PPTX's `doc.pages` DOES have one entry per slide, but `page.image` is always `None` (`SimplePipeline` never renders slide images the way `PdfPipeline` renders page images) — a textless PPTX slide would enter the loop and immediately hit the existing "no rendered page image, cannot attempt OCR fallback" branch. This is the right behavior, not an accidental one: a DOCX/HTML/PPTX "page" with no extractable text is a structurally different failure mode than a scanned PDF page (there is no scan to re-read).
+
+**`page_number` design decision (task item 3), resolved before implementing, documented in `.agent/SCHEMA.md`:** kept `chunks.page_number` `NOT NULL` (no migration) — DOCX/HTML get a fixed sentinel (`1`) rather than a fabricated per-element location, since Docling provides no real page/location concept for these formats at all (confirmed empirically, not assumed). PPTX needed no special-casing: its real slide index flows through the exact same `item.prov` extraction path PDF already uses. **Frontend gap closed 2026-07-27** (was flagged here as out of this task's file scope — fixed as its own small follow-up): `source-panel.tsx`'s hardcoded "PAGE N" display now branches on the citation's real source format. Full write-up in `.agent/SCHEMA.md`'s `chunks.page_number` note and `.agent/API_CONTRACT.md`'s `document_mime_type` note.
+
+**A real chunker.py bug found via the real end-to-end test, not a unit test (exactly why the task demanded full-pipeline testing over parser-level tests alone):** the first real PPTX e2e run answered "customer count grew to 5,200" correctly but cited **page_number 1** for content that actually lives on **slide 2**. Root cause: `Chunker`'s TEXT/HEADING/LIST grouping never flushed on a `page_number` change, only on `TOKEN_BUDGET` overflow — and `db/queries.py`'s `build_chunk_rows` stores `min(chunk.page_numbers)` as the single `page_number` column, so a chunk spanning slides 1–2 silently reported only slide 1. Harmless-ish imprecision for PDF's continuous pagination (a paragraph trailing across a page break); a real, live-confirmed **wrong-slide-number bug** for PPTX, where `page_number` is a genuinely discrete unit. Fixed by treating a page/slide change as a flush boundary, same tier as hitting a `TABLE`/`FIGURE`/`CAPTION` element — applied uniformly to all formats (not format-conditional), since respecting page boundaries is arguably the more correct default for PDF too, not just a PPTX-specific patch. Re-ran the real e2e test after the fix: PPTX's citation now correctly reports page_number 2. Existing PDF fixtures' element/chunk counts confirmed unchanged by this fix (see acceptance criteria above) — the real fixtures apparently never had a case where free grouping crossed a page boundary, so the fix is a pure bug closure with zero observed PDF behavior change.
+
+**Content-sniffing is more robust than initially assumed, confirmed live — a real correction mid-task:** initial design assumed Docling relies purely on the filename extension for format detection (per its own docstring example). Reading Docling's actual `_guess_format()` source and testing directly revealed real magic-byte content-sniffing (`filetype.guess_mime()`) takes priority for PDF and the ZIP-based Office formats — confirmed live that real PDF/DOCX/PPTX content is correctly identified even given a deliberately wrong extension. **HTML is the one real exception:** its detection is a low-priority fallback only reached if the magic-byte check and extension-to-mime mapping both come back inconclusive — a `.pdf` extension confidently short-circuits to `application/pdf` before HTML's fallback sniffing ever runs, so real HTML content given a `.pdf` name genuinely fails to parse (a real `ParseError`, confirmed live). This is exactly why `Parser.parse()`'s `filename` parameter still matters in practice for at least one format, not a purely theoretical concern — `routes/ingest.py` always passes the real uploaded filename (via `storage_path`'s own trailing segment), so production ingestion never hits this failure mode.
+
+**Real end-to-end results (task item 5), through the actual `/ingest` + `/query` HTTP endpoints, real Docling + real Voyage + real Gemini, no fakes:**
+
+| Fixture | Question | Real answer | Citation page_number |
+|---|---|---|---|
+| `table.docx` | What was Q3 2026 revenue? | "In Q3 2026, the revenue was $1,410,000 (USD) [1][2]." | 1 (correct — DOCX sentinel) |
+| `slides.pptx` | What was the customer count in Q3 2026? | "In Q3 2026, the customer count grew to 5,200 [1]." | 2 (correct — real slide index, after the chunker fix) |
+| `page.html` | What was Q3 2026 revenue? | "Q3 2026 revenue was $1,410,000 [1], [2]." | 1 (correct — HTML sentinel) |
+
+**Run:**
+- `pytest apps/api/tests/test_parser.py apps/api/tests/test_chunker.py -v` (fast, no network)
+- `RUN_FORMAT_INGEST_E2E_TEST=1 pytest apps/api/tests/e2e/test_format_ingest_e2e.py -v -s` (slow, real Docling+Voyage+Gemini calls across 3 formats, ~5 min)
+
+**2026-07-27 follow-up — format-aware citation display (closes the frontend gap flagged above):**
+
+**Task item 1, confirmed before any code:** the citation-display layer had zero format information — `CitationResponse`/`ApiCitation`/`Citation` had `document_name`/`page_number` but nothing telling the client which format `page_number` actually meant. Required a real addition to the citation response shape, not just a frontend fix, exactly as anticipated.
+
+**A real migration, not just a model field:** `documents.mime_type` existed since FEAT-001 but was never selected anywhere between it and the client. `match_chunks_by_vector`/`match_chunks_by_fts` (FEAT-009) needed a new `document_mime_type` output column — confirmed live against the local Postgres that `CREATE OR REPLACE FUNCTION` cannot change a function's `RETURNS TABLE` column list ("cannot change return type of existing function... Use DROP FUNCTION first"), so `20260727_001_citation_document_mime_type.sql` does a real `DROP FUNCTION` + `CREATE FUNCTION` for both. `GET /conversations/{id}/messages`' path needed no migration — `CITATION_JOIN_COLUMNS`' PostgREST embed just gained `mime_type` alongside `filename`.
+
+**Display logic, one decision point, several consumers:** `lib/chat/parse-message.ts`'s new `citationLocation(mimeType, pageNumber)` is the only place the format → display decision is made — PDF (and any unrecognized mime type, matching pre-existing behavior) → `{kind: "page", number}`; PPTX → `{kind: "slide", number}` (the real slide index already flowing through since the original FEAT-020 work, no backend change needed for this part); DOCX/HTML → `null`. `Citation.page: number` was replaced with `Citation.location: {kind, number} | null` so every consumer (`source-panel.tsx`, `message-bubble.tsx`, `citation-marker.tsx`, plus a not-yet-built "open in document" stub) reads the same precomputed decision rather than each re-deriving it — the task named only `source-panel.tsx`, but `citation-marker.tsx`'s tooltip and `message-bubble.tsx`'s citation-summary footer had the identical hardcoded "p."/"P." page bug, caught while grepping for every real usage, not just the one named file.
+
+**DOCX/HTML: omitted, not a fake "Page 1"** — the page indicator line, the "on page N" clause, the figure alt text's location, and the "Open page N" button all conditionally drop the location entirely (verified: no leftover empty space or awkward punctuation in the rendered output). **PPTX: "SLIDE N"**, not "PAGE N" — same real slide index as before, now correctly labeled.
+
+**Verified in a real browser, not just code review or a type check** (task item 3, all 4 formats): `npx tsc --noEmit` confirmed zero type errors project-wide first. Then a temporary Playwright-driven route (deleted afterward, along with a temporary middleware auth-exemption that was fully reverted) rendered the real, compiled `AssistantMessageBubble`/`CitationMarker`/`SourcePanel` components against one real citation shape per format and captured both screenshots and rendered text. Real output, PDF: tooltip "annual-report-2025.pdf, Page 14", footer "P.14", panel "PAGE 14" / "supports the claim on page 14" / "Open page 14 in document". DOCX: footer "table.docx" (no page suffix), panel has no location line, "Verified — this passage supports the claim." (no location clause), "Open in document". PPTX: footer "S.2", panel "SLIDE 2" / "this slide backs part of the claim" (partial verdict) / "Open slide 2 in document". HTML: identical omission behavior to DOCX. All four matched the design exactly.
+
+**Backend verification:** `test_retriever.py` gained a real round-trip test for a non-PDF `document_mime_type` through the actual RPC functions (not just PDF's default). `test_conversations.py` gained the same for `GET /conversations/{id}/messages`' citation shape. `test_query.py`'s existing citation-shape test extended with a `document_mime_type` assertion. Full backend suite re-run for final regression confirmation.
+
+**Changelog:** See CHANGELOG.md 2026-07-27 "feature: DOCX/PPTX/HTML ingestion (FEAT-020)" and 2026-07-27 "feature: format-aware citation display (FEAT-020 follow-up)"
 
 ---
 

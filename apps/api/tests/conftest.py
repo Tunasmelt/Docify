@@ -92,7 +92,7 @@ class FakeParser:
     def __init__(self, elements=None):
         self.elements = elements if elements is not None else fake_elements()
 
-    def parse(self, pdf_bytes: bytes) -> ParsedDocument:
+    def parse(self, pdf_bytes: bytes, filename: str = "document.pdf") -> ParsedDocument:
         return ParsedDocument(elements=self.elements, dropped_elements=0)
 
 
@@ -160,7 +160,8 @@ def clear_pipeline_override():
 
 
 def ingest_real_document(
-    app_client, user_id: str, token: str, *, filename: str = "doc.pdf", chunks=None, elements=None
+    app_client, user_id: str, token: str, *, filename: str = "doc.pdf", chunks=None, elements=None,
+    mime_type: str = "application/pdf",
 ) -> str:
     """Runs a real document through the real /ingest endpoint (real Auth,
     real DB writes, real Storage upload/download) with a faked Docling/
@@ -177,7 +178,7 @@ def ingest_real_document(
             json={
                 "storage_path": storage_path,
                 "filename": filename,
-                "mime_type": "application/pdf",
+                "mime_type": mime_type,
                 "size_bytes": 17,
             },
             headers={"Authorization": f"Bearer {token}"},

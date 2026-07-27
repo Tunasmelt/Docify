@@ -268,6 +268,7 @@ async def post_query(
                 chunk_id=chunk.chunk_id,
                 document_id=retrieved_chunk.document_id,
                 document_name=chunk.document_name,
+                document_mime_type=retrieved_chunk.document_mime_type,
                 page_number=chunk.page_number,
                 element_type=chunk.element_type,
                 snippet=chunk.content[:200],

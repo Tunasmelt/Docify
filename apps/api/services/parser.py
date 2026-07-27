@@ -43,8 +43,41 @@ def _default_converter() -> DocumentConverter:
     # generate_page_images=True (FEAT-017): the OCR fallback below needs each
     # low-yield page's own rendered image to send to Gemini — this is the
     # only way to get it without a second, separate Docling conversion.
+    #
+    # FEAT-020 (2026-07-27) — these three settings are PDF-specific and
+    # deliberately NOT ported to DOCX/PPTX/HTML: confirmed directly against
+    # the installed Docling source that DOCX/PPTX/HTML all use SimplePipeline
+    # with ConvertPipelineOptions, a completely different options class with
+    # no do_ocr/generate_picture_images/generate_page_images fields at all —
+    # there is nothing to set. Figure extraction (PictureItem.get_image())
+    # was confirmed live to work for DOCX/PPTX with zero configuration
+    # (these formats embed real image objects directly, unlike a PDF page
+    # which must be rendered/cropped) — see FEATURES.md's FEAT-020 entry for
+    # the full per-format investigation this decision is based on.
+    # allowed_formats is explicit (not left at Docling's "every format it
+    # knows how to read" default) so a format this project doesn't support
+    # yet fails clearly inside Docling rather than silently being accepted —
+    # routes/ingest.py's mime_type whitelist is the primary gate; this is
+    # defense-in-depth for any other caller of Parser() directly.
     options = PdfPipelineOptions(do_ocr=False, generate_picture_images=True, generate_page_images=True)
-    return DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)})
+    return DocumentConverter(
+        allowed_formats=[InputFormat.PDF, InputFormat.DOCX, InputFormat.PPTX, InputFormat.HTML],
+        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)},
+    )
+
+
+# FEAT-020 (2026-07-27) — confirmed live, not assumed: DOCX and HTML
+# elements NEVER carry provenance (`item.prov` is an empty list for every
+# single element, always — including tables, figures, and headings). PDF
+# and PPTX always DO have real provenance (PPTX's page_no is genuinely the
+# slide index, confirmed against a real 3-slide fixture). This is a
+# structural difference in Docling's own backends, not a per-document
+# anomaly: DOCX/HTML simply have no page/coordinate concept for Docling to
+# report. Elements from these two formats get a fixed sentinel location
+# (page_number=1, a zero-sized bbox) instead of being dropped as "no
+# provenance" — see Parser.parse()'s extraction loop and FEATURES.md's
+# FEAT-020 entry for the full page_number design decision this resolves.
+_FORMATS_WITHOUT_PROVENANCE = {InputFormat.DOCX, InputFormat.HTML}
 
 
 # Audit finding (2026-07-26): with no explicit http_options.timeout, the
@@ -302,14 +335,26 @@ class Parser:
         # GeminiOcrClient/OcrSpaceClient/TesseractOcrClient all share.
         self._ocr_tiers = ocr_tiers if ocr_tiers is not None else _default_ocr_tiers()
 
-    def parse(self, pdf_bytes: bytes) -> ParsedDocument:
-        stream = DocumentStream(name="document.pdf", stream=BytesIO(pdf_bytes))
+    def parse(self, file_bytes: bytes, filename: str = "document.pdf") -> ParsedDocument:
+        """filename drives Docling's own format detection (it inspects the
+        extension on DocumentStream.name, confirmed against the installed
+        SDK — there is no content-sniffing) — defaults to "document.pdf"
+        so every existing PDF-only call site (routes/ingest.py before
+        FEAT-020, and the large majority of this project's own tests)
+        keeps working unchanged. A caller ingesting DOCX/PPTX/HTML MUST
+        pass the real filename (or at least the real extension) or Docling
+        will silently try to parse it as the wrong format."""
+        stream = DocumentStream(name=filename, stream=BytesIO(file_bytes))
         try:
             result = self._converter.convert(stream)
         except Exception as exc:
             raise ParseError(f"Docling conversion failed: {exc}") from exc
 
         doc = result.document
+        # Real per-format finding (FEAT-020): DOCX/HTML never populate
+        # item.prov at all, for any element, ever — resolved once here
+        # rather than re-derived per element.
+        format_lacks_provenance = result.input.format in _FORMATS_WITHOUT_PROVENANCE
         elements: list[ParsedElement] = []
         dropped_elements = 0
         last_page_number: int | None = None
@@ -321,7 +366,23 @@ class Parser:
                 if element_type is None:
                     continue  # not one of our six types — expected filtering, not a drop
 
-                if not item.prov:
+                if item.prov:
+                    prov = item.prov[0]
+                    page_number = prov.page_no
+                    bbox = BBox(x0=prov.bbox.l, y0=prov.bbox.t, x1=prov.bbox.r, y1=prov.bbox.b)
+                elif format_lacks_provenance:
+                    # Not an anomaly for these two formats — this is every
+                    # element, always (confirmed live). Sentinel location:
+                    # page_number=1 (there is no real page/pagination
+                    # concept to report — inventing one would be worse
+                    # than an honest fixed value), zero-sized bbox (no
+                    # real coordinate space exists either).
+                    page_number = 1
+                    bbox = BBox(x0=0.0, y0=0.0, x1=0.0, y1=0.0)
+                else:
+                    # A genuine anomaly for a format that normally has
+                    # provenance (PDF, PPTX) — keep the original drop
+                    # behavior, unchanged.
                     dropped_elements += 1
                     logger.warning(
                         "parser: dropped %s element — no provenance (page/bbox unavailable)",
@@ -329,10 +390,7 @@ class Parser:
                     )
                     continue
 
-                prov = item.prov[0]
-                page_number = prov.page_no
                 last_page_number = page_number
-                bbox = BBox(x0=prov.bbox.l, y0=prov.bbox.t, x1=prov.bbox.r, y1=prov.bbox.b)
 
                 if element_type == ElementType.TABLE:
                     content = item.export_to_markdown(doc)
@@ -402,6 +460,24 @@ class Parser:
         # never become a ParseError for the whole document (GeminiOcrClient
         # itself never raises; this loop only needs to survive a page whose
         # rendered image is unexpectedly missing).
+        #
+        # FEAT-020 (2026-07-27): confirmed this loop is already, correctly,
+        # a structural no-op for DOCX/PPTX/HTML — no special-casing added,
+        # none needed. doc.pages is completely empty for DOCX/HTML (their
+        # SimplePipeline never populates it, confirmed live), so this loop
+        # simply never executes for those two. PPTX's doc.pages DOES have
+        # one real entry per slide, but page.image is always None (PPTX
+        # also uses SimplePipeline, which never renders slide images the
+        # way PdfPipeline renders page images) — a textless PPTX slide
+        # would enter this loop, immediately hit the "no rendered page
+        # image" branch below, and move on. This is the right behavior:
+        # a DOCX/HTML/PPTX "page" with no extractable text is a
+        # structurally different failure mode than a scanned PDF page
+        # (there is no scan to re-read — the content is either genuinely
+        # absent or in a form Docling doesn't extract, e.g. HTML's broken
+        # figure extraction, see FEATURES.md's FEAT-020 entry), so OCR
+        # fallback correctly never fires for these formats rather than
+        # needing to be explicitly excluded.
         pages_with_textual_content = {
             e.page_number for e in elements if e.element_type in _TEXTUAL_ELEMENT_TYPES
         }

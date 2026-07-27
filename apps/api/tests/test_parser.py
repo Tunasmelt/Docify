@@ -25,6 +25,7 @@
 # added for both silent-drop cases (missing provenance, get_image() -> None).
 
 import httpx
+from docling.datamodel.base_models import InputFormat
 from docling_core.types.doc import DocItemLabel
 from google.genai.errors import ClientError
 from PIL import Image
@@ -32,6 +33,16 @@ from PIL import Image
 from services.parser import BBox, ElementType, GeminiOcrClient, OcrSpaceClient, ParseError, Parser, TesseractOcrClient
 
 FIXTURES = "tests/fixtures"
+
+
+class FakeConversionInput:
+    """Stands in for docling's real ConversionResult.input — Parser.parse()
+    reads .format (FEAT-020) to know whether this format is expected to
+    carry provenance at all. Defaults to PDF (provenance always expected)
+    since that's what every pre-FEAT-020 fake in this file is simulating."""
+
+    def __init__(self, format=InputFormat.PDF):
+        self.format = format
 
 
 def load(name: str) -> bytes:
@@ -282,6 +293,7 @@ def test_exception_during_element_iteration_raises_parse_error_with_last_known_p
 
     class FakeResult:
         document = FakeDoc()
+        input = FakeConversionInput()
 
     class FakeConverter:
         def convert(self, stream):
@@ -314,6 +326,7 @@ def test_element_with_missing_provenance_is_counted_and_logged(caplog):
 
     class FakeResult:
         document = FakeDoc()
+        input = FakeConversionInput()
 
     class FakeConverter:
         def convert(self, stream):
@@ -868,3 +881,177 @@ def test_ocrspace_client_still_has_an_explicit_timeout():
     client = OcrSpaceClient(api_key="test-key")
     assert client._http.timeout.connect is not None
     assert client._http.timeout.connect > 0
+
+
+# --- FEAT-020 (2026-07-27): DOCX/PPTX/HTML ingestion -------------------------
+#
+# Real per-format investigation, confirmed live against real fixtures
+# (tests/fixtures/table.docx, slides.pptx, page.html) before any of this
+# was designed, not assumed from "Docling supports it":
+#
+# - DOCX and HTML: item.prov is EMPTY for every single element, always —
+#   these formats have no page/coordinate concept in Docling at all
+#   (doc.pages itself is empty). Parser.parse() gives these a sentinel
+#   location (page_number=1, a zero-sized bbox) instead of dropping them.
+# - PPTX: item.prov IS populated, exactly like PDF — page_no is genuinely
+#   the 1-indexed slide number, bbox is real. No special-casing needed;
+#   the existing PDF extraction path just works.
+# - Figure extraction (PictureItem.get_image()) works with zero
+#   configuration for DOCX/PPTX (they embed real image objects directly,
+#   unlike a PDF page which must be rendered/cropped) — confirmed real,
+#   not assumed. HTML figure extraction was confirmed BROKEN — Docling
+#   creates a picture element for an <img> tag but get_image() returns
+#   None — so HTML support here is effectively text/table only.
+# - Tier 1 caption-association (FEAT-004): confirmed to NOT function for
+#   DOCX at all (a table's `captions` list is always empty, and even a
+#   paragraph in Word's own native "Caption" style still comes through
+#   labeled as plain text, never DocItemLabel.CAPTION) — chunker.py's
+#   Tier 2 heuristic has nothing to work with either, since nothing is
+#   ever labeled CAPTION in the first place. Not covered by a fixture-level
+#   test here since there is no positive behavior to assert — the fixture
+#   simply never produces a CAPTION element, confirmed by the element-type
+#   test below.
+
+
+def test_docx_real_parse_produces_expected_element_types():
+    doc = Parser().parse(load("table.docx"), filename="table.docx")
+
+    element_types = {e.element_type for e in doc.elements}
+    assert ElementType.HEADING in element_types
+    assert ElementType.TEXT in element_types
+    assert ElementType.TABLE in element_types
+    assert ElementType.FIGURE in element_types
+    # Confirmed real finding: Docling's DOCX backend never labels anything
+    # CAPTION — not even a paragraph in Word's own native "Caption" style.
+    assert ElementType.CAPTION not in element_types
+    assert doc.dropped_elements == 0
+
+
+def test_docx_elements_get_sentinel_page_number_and_zero_bbox():
+    doc = Parser().parse(load("table.docx"), filename="table.docx")
+
+    assert len(doc.elements) > 0
+    for element in doc.elements:
+        assert element.page_number == 1
+        assert element.bbox == BBox(x0=0.0, y0=0.0, x1=0.0, y1=0.0)
+
+
+def test_docx_figure_extracts_as_a_real_usable_image():
+    doc = Parser().parse(load("table.docx"), filename="table.docx")
+
+    figures = [e for e in doc.elements if e.element_type == ElementType.FIGURE]
+    assert len(figures) == 1
+    assert isinstance(figures[0].content, Image.Image)
+    assert figures[0].content.size[0] > 0 and figures[0].content.size[1] > 0
+    figures[0].content.close()
+
+
+def test_pptx_real_parse_produces_expected_element_types():
+    doc = Parser().parse(load("slides.pptx"), filename="slides.pptx")
+
+    element_types = {e.element_type for e in doc.elements}
+    assert ElementType.HEADING in element_types  # slide titles
+    assert ElementType.TEXT in element_types or ElementType.LIST in element_types  # body content
+    assert ElementType.FIGURE in element_types  # the chart image on slide 3
+    assert doc.dropped_elements == 0
+
+
+def test_pptx_page_number_is_the_real_slide_index_not_a_sentinel():
+    doc = Parser().parse(load("slides.pptx"), filename="slides.pptx")
+
+    # Confirmed real finding: PPTX carries genuine provenance, exactly
+    # like PDF — page_no is the real 1-indexed slide number. This fixture
+    # has 3 slides; every element's page_number must be one of them, and
+    # all three slides must actually be represented (not collapsed to a
+    # sentinel the way DOCX/HTML are).
+    page_numbers = {e.page_number for e in doc.elements}
+    assert page_numbers == {1, 2, 3}
+
+
+def test_pptx_elements_have_real_nonzero_bbox():
+    doc = Parser().parse(load("slides.pptx"), filename="slides.pptx")
+
+    assert len(doc.elements) > 0
+    for element in doc.elements:
+        assert element.bbox != BBox(x0=0.0, y0=0.0, x1=0.0, y1=0.0)
+
+
+def test_pptx_figure_extracts_as_a_real_usable_image():
+    doc = Parser().parse(load("slides.pptx"), filename="slides.pptx")
+
+    figures = [e for e in doc.elements if e.element_type == ElementType.FIGURE]
+    assert len(figures) == 1
+    assert isinstance(figures[0].content, Image.Image)
+    assert figures[0].content.size == (400, 300)  # the real embedded chart image's real size
+    figures[0].content.close()
+
+
+def test_html_real_parse_produces_expected_element_types():
+    doc = Parser().parse(load("page.html"), filename="page.html")
+
+    element_types = {e.element_type for e in doc.elements}
+    assert ElementType.HEADING in element_types
+    assert ElementType.TEXT in element_types
+    assert ElementType.TABLE in element_types
+    assert doc.dropped_elements == 0
+
+
+def test_html_elements_get_sentinel_page_number_and_zero_bbox():
+    doc = Parser().parse(load("page.html"), filename="page.html")
+
+    assert len(doc.elements) > 0
+    for element in doc.elements:
+        assert element.page_number == 1
+        assert element.bbox == BBox(x0=0.0, y0=0.0, x1=0.0, y1=0.0)
+
+
+def test_pdf_docx_pptx_content_sniffing_is_robust_to_a_wrong_extension():
+    # Real, more nuanced finding than initially assumed: Docling does NOT
+    # rely on the filename extension alone — reading Docling's own
+    # _guess_format() source confirms it inspects real magic bytes first
+    # (via the `filetype` library) for PDF and the ZIP-based Office
+    # formats, falling back to the extension only to disambiguate which
+    # Office format a generic "application/zip" actually is. Confirmed
+    # live: real PDF/DOCX/PPTX content is correctly identified even when
+    # given a deliberately wrong extension.
+    pdf_result = Parser().parse(load("clean_digital.pdf"), filename="wrong.docx")
+    assert len(pdf_result.elements) > 0
+
+    pptx_result = Parser().parse(load("slides.pptx"), filename="wrong.html")
+    assert len(pptx_result.elements) > 0
+
+
+def test_html_content_given_a_non_html_extension_fails_to_parse():
+    # The one real exception to the above, confirmed live (not assumed
+    # from the PDF/DOCX/PPTX robustness above — HTML genuinely behaves
+    # differently): _guess_format()'s HTML detection is a low-priority
+    # content-sniffing fallback, only reached if filetype's magic-byte
+    # check AND the extension-to-mime mapping both come back inconclusive.
+    # A ".pdf" extension maps confidently to "application/pdf" and short-
+    # circuits before HTML's fallback sniffing ever runs, so real HTML
+    # bytes given a .pdf name genuinely fail — this is exactly why
+    # Parser.parse()'s filename parameter matters in practice, not a
+    # purely theoretical concern. routes/ingest.py always passes the
+    # real uploaded filename (via storage_path's own trailing segment),
+    # so production ingestion never hits this path — but a caller of
+    # Parser() that gets the filename wrong genuinely breaks HTML, unlike
+    # the other three formats.
+    html_bytes = load("page.html")
+
+    try:
+        Parser().parse(html_bytes, filename="wrong.pdf")
+        assert False, "expected ParseError"
+    except ParseError:
+        pass
+
+
+# Cost/scope guard (task item 8): existing PDF fixtures must produce
+# identical results after FEAT-020 — the new allowed_formats/provenance
+# branching must be a no-op for the PDF path.
+def test_pdf_fixtures_are_unaffected_by_docx_pptx_html_support():
+    clean = Parser().parse(load("clean_digital.pdf"))
+    assert clean.dropped_elements == 0
+    assert all(isinstance(e.page_number, int) and e.page_number >= 1 for e in clean.elements)
+    # PDF must never get FEAT-020's DOCX/HTML sentinel treatment — a real
+    # PDF page's bbox is never the exact zero-box sentinel.
+    assert all(e.bbox != BBox(x0=0.0, y0=0.0, x1=0.0, y1=0.0) for e in clean.elements)

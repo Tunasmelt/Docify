@@ -149,6 +149,7 @@ def test_post_query_returns_200_with_answer_citations_per_api_contrac(app_client
             page=chunk_row["page_number"],
             document_id=document_id,
             document_name="doc.pdf",
+            document_mime_type="application/pdf",
             element_type=chunk_row["element_type"],
             score=0.9,
         )
@@ -182,6 +183,7 @@ def test_post_query_returns_200_with_answer_citations_per_api_contrac(app_client
     assert citation["marker"] == 1
     assert citation["chunk_id"] == chunk_row["id"]
     assert citation["document_id"] == document_id
+    assert citation["document_mime_type"] == "application/pdf"
     assert citation["verdict"] == "supported"
     assert citation["supporting_quote"] == "Revenue grew 12%"
     assert body["metadata"]["retrieved_count"] == 1
@@ -199,7 +201,7 @@ def test_unsupported_citations_are_dropped_from_response_markers_stri(app_client
     retrieved = [
         RetrievedChunk(
             chunk_id=chunk_row["id"], content=chunk_row["content"], page=1, document_id=document_id,
-            document_name="doc.pdf", element_type="text", score=0.9,
+            document_name="doc.pdf", document_mime_type="application/pdf", element_type="text", score=0.9,
         )
     ]
     gen_result = GenerateResult(
@@ -237,7 +239,7 @@ def test_partial_verdict_citations_are_kept_not_dropped(app_client, admin, user_
     retrieved = [
         RetrievedChunk(
             chunk_id=chunk_row["id"], content=chunk_row["content"], page=1, document_id=document_id,
-            document_name="doc.pdf", element_type="text", score=0.9,
+            document_name="doc.pdf", document_mime_type="application/pdf", element_type="text", score=0.9,
         )
     ]
     gen_result = GenerateResult(
@@ -272,7 +274,7 @@ def test_creates_conversation_message_citations_rows_atomically(app_client, admi
     retrieved = [
         RetrievedChunk(
             chunk_id=chunk_row["id"], content=chunk_row["content"], page=1, document_id=document_id,
-            document_name="doc.pdf", element_type="text", score=0.9,
+            document_name="doc.pdf", document_mime_type="application/pdf", element_type="text", score=0.9,
         )
     ]
     gen_result = GenerateResult(
@@ -321,7 +323,7 @@ def test_unsupported_citation_is_still_persisted_for_audit_even_though_dropped_f
     retrieved = [
         RetrievedChunk(
             chunk_id=chunk_row["id"], content=chunk_row["content"], page=1, document_id=document_id,
-            document_name="doc.pdf", element_type="text", score=0.9,
+            document_name="doc.pdf", document_mime_type="application/pdf", element_type="text", score=0.9,
         )
     ]
     gen_result = GenerateResult(
@@ -353,7 +355,7 @@ def test_continuing_an_existing_conversation_appends_messages_correct(app_client
     retrieved = [
         RetrievedChunk(
             chunk_id=chunk_row["id"], content=chunk_row["content"], page=1, document_id=document_id,
-            document_name="doc.pdf", element_type="text", score=0.9,
+            document_name="doc.pdf", document_mime_type="application/pdf", element_type="text", score=0.9,
         )
     ]
 
@@ -433,7 +435,7 @@ def _setup_single_chunk_query(app_client, admin, user_id, token, filename="doc.p
     retrieved = [
         RetrievedChunk(
             chunk_id=chunk_row["id"], content=chunk_row["content"], page=1, document_id=document_id,
-            document_name=filename, element_type="text", score=0.9,
+            document_name=filename, document_mime_type="application/pdf", element_type="text", score=0.9,
         )
     ]
     return document_id, chunk_row, retrieved
@@ -702,9 +704,9 @@ def test_cited_position_maps_to_the_correct_chunk_id_with_multiple_chunks(app_cl
     ).execute().data[0]
 
     retrieved = [
-        RetrievedChunk(chunk_id=seed_row["id"], content=seed_row["content"], page=1, document_id=document_id, document_name="doc.pdf", element_type="text", score=0.9),
-        RetrievedChunk(chunk_id=row_b["id"], content=row_b["content"], page=2, document_id=document_id, document_name="doc.pdf", element_type="text", score=0.8),
-        RetrievedChunk(chunk_id=row_c["id"], content=row_c["content"], page=3, document_id=document_id, document_name="doc.pdf", element_type="text", score=0.7),
+        RetrievedChunk(chunk_id=seed_row["id"], content=seed_row["content"], page=1, document_id=document_id, document_name="doc.pdf", document_mime_type="application/pdf", element_type="text", score=0.9),
+        RetrievedChunk(chunk_id=row_b["id"], content=row_b["content"], page=2, document_id=document_id, document_name="doc.pdf", document_mime_type="application/pdf", element_type="text", score=0.8),
+        RetrievedChunk(chunk_id=row_c["id"], content=row_c["content"], page=3, document_id=document_id, document_name="doc.pdf", document_mime_type="application/pdf", element_type="text", score=0.7),
     ]
     gen_result = GenerateResult(
         answer="The second fact is true [2].", cited_indices=[2], hallucinated_markers=[],
@@ -747,9 +749,9 @@ def test_two_citations_in_one_sentence_with_different_verdicts_do_not_cross_cont
     ).execute().data[0]
 
     retrieved = [
-        RetrievedChunk(chunk_id=seed_row["id"], content=seed_row["content"], page=1, document_id=document_id, document_name="doc.pdf", element_type="text", score=0.9),
-        RetrievedChunk(chunk_id=row_supported["id"], content=row_supported["content"], page=2, document_id=document_id, document_name="doc.pdf", element_type="text", score=0.8),
-        RetrievedChunk(chunk_id=row_unsupported["id"], content=row_unsupported["content"], page=3, document_id=document_id, document_name="doc.pdf", element_type="text", score=0.7),
+        RetrievedChunk(chunk_id=seed_row["id"], content=seed_row["content"], page=1, document_id=document_id, document_name="doc.pdf", document_mime_type="application/pdf", element_type="text", score=0.9),
+        RetrievedChunk(chunk_id=row_supported["id"], content=row_supported["content"], page=2, document_id=document_id, document_name="doc.pdf", document_mime_type="application/pdf", element_type="text", score=0.8),
+        RetrievedChunk(chunk_id=row_unsupported["id"], content=row_unsupported["content"], page=3, document_id=document_id, document_name="doc.pdf", document_mime_type="application/pdf", element_type="text", score=0.7),
     ]
     gen_result = GenerateResult(
         answer="Revenue grew [2] due to strong sales in Q3 [3].",
@@ -801,8 +803,8 @@ def test_citation_document_id_correctly_identifies_which_of_multiple_documents(a
     row_second = _real_chunk_row(admin, document_id_second)
 
     retrieved = [
-        RetrievedChunk(chunk_id=row_first["id"], content=row_first["content"], page=1, document_id=document_id_first, document_name="first.pdf", element_type="text", score=0.9),
-        RetrievedChunk(chunk_id=row_second["id"], content=row_second["content"], page=1, document_id=document_id_second, document_name="second.pdf", element_type="text", score=0.8),
+        RetrievedChunk(chunk_id=row_first["id"], content=row_first["content"], page=1, document_id=document_id_first, document_name="first.pdf", document_mime_type="application/pdf", element_type="text", score=0.9),
+        RetrievedChunk(chunk_id=row_second["id"], content=row_second["content"], page=1, document_id=document_id_second, document_name="second.pdf", document_mime_type="application/pdf", element_type="text", score=0.8),
     ]
     gen_result = GenerateResult(
         answer="The first fact [1] and the second fact [2].", cited_indices=[1, 2], hallucinated_markers=[],
@@ -906,8 +908,8 @@ def test_figure_fetcher_downloads_image_bytes_for_figure_chunks_only(admin, user
     ).execute().data[0]
 
     retrieved = [
-        RetrievedChunk(chunk_id=figure_row["id"], content="", page=1, document_id=document_id, document_name="d.pdf", element_type="figure", score=1.0),
-        RetrievedChunk(chunk_id=text_row["id"], content="plain text", page=1, document_id=document_id, document_name="d.pdf", element_type="text", score=0.9),
+        RetrievedChunk(chunk_id=figure_row["id"], content="", page=1, document_id=document_id, document_name="d.pdf", document_mime_type="application/pdf", element_type="figure", score=1.0),
+        RetrievedChunk(chunk_id=text_row["id"], content="plain text", page=1, document_id=document_id, document_name="d.pdf", document_mime_type="application/pdf", element_type="text", score=0.9),
     ]
 
     result = fetch_generator_chunks(admin, retrieved)
@@ -953,7 +955,7 @@ def test_figure_fetcher_degrades_one_failed_download_without_losing_the_others(a
         rows.append(row)
 
     retrieved = [
-        RetrievedChunk(chunk_id=r["id"], content="", page=1, document_id=document_id, document_name="d.pdf", element_type="figure", score=1.0)
+        RetrievedChunk(chunk_id=r["id"], content="", page=1, document_id=document_id, document_name="d.pdf", document_mime_type="application/pdf", element_type="figure", score=1.0)
         for r in rows
     ]
 
@@ -978,7 +980,7 @@ def test_generation_failure_returns_502(app_client, admin, user_a):
     document_id = _ingest_doc_with_content(app_client, admin, user_id, token, "doc.pdf", "content")
     chunk_row = _real_chunk_row(admin, document_id)
     retrieved = [
-        RetrievedChunk(chunk_id=chunk_row["id"], content=chunk_row["content"], page=1, document_id=document_id, document_name="doc.pdf", element_type="text", score=0.9)
+        RetrievedChunk(chunk_id=chunk_row["id"], content=chunk_row["content"], page=1, document_id=document_id, document_name="doc.pdf", document_mime_type="application/pdf", element_type="text", score=0.9)
     ]
     _override(retriever=FakeRetriever(retrieved), generator=FakeGeneratorRaising(GenerationError("simulated failure")), verifier=FakeVerifier({}))
 

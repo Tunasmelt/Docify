@@ -79,6 +79,7 @@ def _ask_real_question(app_client, admin, user_id, token, document_id, chunk_row
             page=chunk_row["page_number"],
             document_id=document_id,
             document_name="doc.pdf",
+            document_mime_type="application/pdf",
             element_type=chunk_row["element_type"],
             score=0.9,
         )
@@ -185,8 +186,32 @@ def test_get_conversation_messages_returns_full_history_with_citations(app_clien
     assert citation["chunk_id"] == chunk_row["id"]
     assert citation["document_id"] == document_id
     assert citation["document_name"] == "doc.pdf"
+    assert citation["document_mime_type"] == "application/pdf"
     assert citation["verdict"] == "supported"
     assert "figure_url" not in citation  # text citation — omitted, not null
+
+
+# FEAT-020 (2026-07-27): document_mime_type is what the citation-display
+# layer needs to tell a real PDF page from a PPTX slide/DOCX-HTML
+# sentinel — confirm a real NON-pdf value round-trips through this read
+# path too (CITATION_JOIN_COLUMNS' documents(filename,mime_type) embed),
+# not just the one hardcoded "application/pdf" every other test here uses.
+def test_get_conversation_messages_citation_carries_the_real_non_pdf_mime_type(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id = ingest_real_document(
+        app_client, user_id, token, filename="slides.pptx",
+        mime_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    )
+    chunk_row = admin.table("chunks").select("id,document_id,element_type,page_number,content").eq("document_id", document_id).execute().data[0]
+
+    result = _ask_real_question(app_client, admin, user_id, token, document_id, chunk_row, "Customer count grew to 5,200 [1].")
+    conv_id = result["conversation_id"]
+
+    response = app_client.get(f"/conversations/{conv_id}/messages", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    citation = response.json()["messages"][1]["citations"][0]
+
+    assert citation["document_mime_type"] == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
 
 # Acceptance criterion: unsupported citations are not shown in message history either

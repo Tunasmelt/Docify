@@ -60,6 +60,14 @@ class RetrievedChunk:
     page: int
     document_id: str
     document_name: str
+    # The source document's real mime_type (documents.mime_type) — added
+    # FEAT-020, 2026-07-27, so the citation-display layer can tell a real
+    # PDF page from a PPTX slide index or a DOCX/HTML page_number=1
+    # sentinel (these two formats have no real page concept at all; see
+    # .agent/SCHEMA.md's page_number note). Was never selected anywhere
+    # between `documents.mime_type` (stored since FEAT-001) and the
+    # client before this.
+    document_mime_type: str
     element_type: str
     # Higher is more relevant. RRF's fused score by default; when
     # rerank=True succeeds, this is Voyage's rerank relevance_score
@@ -226,6 +234,7 @@ class Retriever:
                 page=row["page_number"],
                 document_id=row["document_id"],
                 document_name=row["document_name"],
+                document_mime_type=row["document_mime_type"],
                 element_type=row["element_type"],
                 score=score,
             )

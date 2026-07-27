@@ -180,6 +180,7 @@ Ask a question over one or more documents.
       "chunk_id": "b2e0...",
       "document_id": "3f9e...",
       "document_name": "annual-report-2025.pdf",
+      "document_mime_type": "application/pdf",
       "page_number": 14,
       "element_type": "text",
       "snippet": "Third-quarter revenue totaled $4.2 million...",
@@ -191,6 +192,7 @@ Ask a question over one or more documents.
       "chunk_id": "c9f1...",
       "document_id": "3f9e...",
       "document_name": "annual-report-2025.pdf",
+      "document_mime_type": "application/pdf",
       "page_number": 14,
       "element_type": "table",
       "snippet": "| Q2 | $3.56M | | Q3 | $4.20M |",
@@ -202,6 +204,7 @@ Ask a question over one or more documents.
       "chunk_id": "d4a7...",
       "document_id": "3f9e...",
       "document_name": "annual-report-2025.pdf",
+      "document_mime_type": "application/pdf",
       "page_number": 15,
       "element_type": "text",
       "snippet": "Growth was broad-based across all regions this quarter.",
@@ -228,6 +231,8 @@ Ask a question over one or more documents.
   - `partial` — citation is **kept** in the `citations` array (same as `supported`, never dropped); the client renders it with a warning indicator, since the source only partially backs the claim (e.g. the marker-3 example above: the source confirms broad-based growth but not specifically "international demand" — kept so the reader can judge the source themselves, not silently hidden)
   - `unsupported` — citation is **dropped** from the `citations` array; the corresponding `[N]` marker is stripped from `answer`
 - **`figure_url`** (added FEAT-026): present only on a citation with `element_type: "figure"` — a signed, time-limited Storage URL (600s) for that figure's image. **Omitted entirely** (not sent as `null`) on `text`/`table` citations, and on a `figure` citation whose image fetch itself failed server-side (that citation's `element_type` degrades to `"text"` in that case — see `services/figure_fetcher.py` — so `figure_url` never appears alongside a lie about what the citation actually is). Not persisted anywhere — built fresh from the citation's `chunk_id` → `figure_path` on every read, live or historical (`GET /conversations/{id}/messages` below produces byte-identical citation shapes from stored data, including a freshly-signed `figure_url` each time it's read, not a cached/expired one).
+- **`page_number`** (FEAT-020, extended 2026-07-27 to cover DOCX/PPTX/HTML): the example above is from a PDF source, where this is a real PDF page number. For a **PPTX**-sourced citation it's the real slide index instead (same field, same 1-indexed meaning of "position within the source"). For a **DOCX/HTML**-sourced citation it is always `1` — Docling provides no page/location concept for these two formats at all (confirmed empirically, `.agent/SCHEMA.md`'s `chunks.page_number` note has the full investigation), so every citation from the same DOCX/HTML document reports the same value.
+- **`document_mime_type`** (added 2026-07-27, closing the gap the note above used to describe): the citation's source document's real mime type (`documents.mime_type`) — this is what the client actually uses to know whether `page_number` means a real page, a slide index, or a meaningless sentinel. Required a migration (`match_chunks_by_vector`/`match_chunks_by_fts` gained this as a new output column — Postgres does not allow `CREATE OR REPLACE FUNCTION` to change `RETURNS TABLE` columns, confirmed live, so this needed a real `DROP FUNCTION` + `CREATE FUNCTION`). The frontend's `citationLocation()` (`lib/chat/parse-message.ts`) is the one place this becomes display text: "Page N" for PDF/unrecognized mime types, "Slide N" for PPTX, omitted entirely for DOCX/HTML rather than showing a false "Page 1". Verified in a real browser against all 4 formats.
 
 **Errors:**
 - `403 FORBIDDEN` if any `document_ids` don't belong to user
