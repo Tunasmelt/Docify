@@ -20,6 +20,20 @@ router = APIRouter()
 
 _SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+")
 
+# Conversation memory window (2026-07-27 follow-up): last 5 turns (10
+# messages: 5 user + 5 assistant), not the full conversation history.
+# Real justification, not an arbitrary round number: ordinary follow-up
+# ambiguity ("that", "it", "how does that compare") resolves against the
+# immediately preceding turn or two in practice; 5 gives generous margin
+# beyond that without letting a long-running conversation's prompt size
+# (and therefore Generator's real per-call latency/cost) grow unbounded.
+# Matches this project's established "ship minimal, measure before
+# adding speculative complexity" pattern from reranking's rollout
+# (.agent/MEMORY.md's 2026-07-27 reranking decision) rather than a
+# token-budget scheme, which would need its own tokenizer call just to
+# enforce and isn't obviously better-justified at this scale.
+MAX_HISTORY_TURNS = 5
+
 
 # FastAPI dependency-provider indirection, same pattern as
 # routes/ingest.py's get_pipeline_runner() — real constructor injection
@@ -126,10 +140,23 @@ async def post_query(
         # this endpoint's own documented contract.
         return JSONResponse(status_code=403, content=error_envelope("FORBIDDEN", "one or more document_ids do not belong to the authenticated user"))
 
+    prior_messages: list[dict] = []
     if payload.conversation_id is not None:
         conversation = queries.get_conversation(client, conversation_id=payload.conversation_id, user_id=user_id)
         if conversation is None:
             return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "conversation not found"))
+        # Minimal conversation memory (2026-07-27): prior turns fold into
+        # Generator's prompt so a follow-up like "how does that compare
+        # to X?" resolves correctly in the ANSWER. Reuses FEAT-026's
+        # already-isolation-proven fetch (conversation_id + user_id both
+        # filtered) rather than a second, parallel history path — the
+        # only change is the new `limit` param, which this is the first
+        # caller to use. Retrieval below is UNCHANGED: it still searches
+        # using only payload.question, no query rewriting — a deliberate
+        # scope decision (.agent/FEATURES.md), not an oversight.
+        prior_messages = queries.list_messages_for_conversation(
+            client, conversation_id=payload.conversation_id, user_id=user_id, limit=MAX_HISTORY_TURNS * 2
+        )
 
     started = time.perf_counter()
 
@@ -169,7 +196,7 @@ async def post_query(
     generator_chunks = fetch_generator_chunks(client, retrieved)
 
     try:
-        gen_result = generator.generate(payload.question, generator_chunks)
+        gen_result = generator.generate(payload.question, generator_chunks, history=prior_messages)
     except GenerationError as exc:
         logger.error("post_query: generation failed for user %s: %s", user_id, exc)
         return JSONResponse(status_code=502, content=error_envelope("GENERATE_FAILED", "answer generation failed"))

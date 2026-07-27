@@ -29,7 +29,11 @@ SYSTEM_INSTRUCTION = (
     "second is [2], and so on) — it is NOT any database id or other identifier. Cite every "
     "chunk you rely on; a claim with no [N] marker will be treated as unsupported. Never "
     "invent a marker number higher than the number of chunks you were given. If the provided "
-    "chunks do not contain enough information to answer, say so plainly instead of guessing."
+    "chunks do not contain enough information to answer, say so plainly instead of guessing. "
+    "If a prior conversation history is provided before the numbered chunks, use it ONLY to "
+    "understand what the user is asking about now (e.g. resolving 'that' or 'it' to something "
+    "discussed earlier) — it is background context, not something to cite. Every [N] marker "
+    "in your new answer must still refer only to the numbered chunks given for THIS question."
 )
 
 # Gemini was observed live grouping multiple citations into one bracket —
@@ -141,8 +145,48 @@ def _default_client() -> genai.Client:
     return genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 
-def _build_contents(question: str, chunks: list[GeneratorChunk]) -> list[types.Part]:
+_HISTORY_HEADER = (
+    "Conversation history (older turns first, for context only — "
+    "citation markers below are numbered fresh for THIS question and do "
+    "not correspond to anything in this history):"
+)
+
+
+def _strip_citation_markers(text: str) -> str:
+    """Removes every [N]-shaped bracket entirely — used only when folding
+    a PRIOR turn's stored answer into the current turn's history context.
+    Deliberately reuses CITATION_BRACKET (the same regex claim-span
+    extraction and dropped-marker stripping already rely on) rather than
+    a second pattern, so this can never silently disagree with what
+    counts as a marker elsewhere in this file.
+
+    Why strip at all: a prior turn's [N] markers were positions into
+    THAT turn's own chunks list, which no longer exists in this turn's
+    prompt — leaving them in would either be meaningless noise or, worse,
+    something the model could mistake for a still-valid reference. See
+    Generator.generate()'s docstring for the full citation-numbering-
+    across-turns explanation."""
+    stripped = CITATION_BRACKET.sub("", text)
+    stripped = re.sub(r"\s+([.,;:!?])", r"\1", stripped)
+    stripped = re.sub(r"[ \t]{2,}", " ", stripped)
+    return stripped.strip()
+
+
+def _build_history_parts(history: list[dict]) -> list[types.Part]:
+    if not history:
+        return []
+    lines = [_HISTORY_HEADER]
+    for message in history:
+        if message["role"] == "user":
+            lines.append(f"User: {message['content']}")
+        else:
+            lines.append(f"Assistant: {_strip_citation_markers(message['content'])}")
+    return [types.Part.from_text(text="\n".join(lines))]
+
+
+def _build_contents(question: str, chunks: list[GeneratorChunk], history: list[dict] | None = None) -> list[types.Part]:
     parts: list[types.Part] = []
+    parts.extend(_build_history_parts(history or []))
     for i, chunk in enumerate(chunks, start=1):
         header = f"[{i}] (page {chunk.page_number}, {chunk.element_type}, from {chunk.document_name}):"
         parts.append(types.Part.from_text(text=f"{header}\n{chunk.content}"))
@@ -184,11 +228,36 @@ class Generator:
     def __init__(self, client: genai.Client | None = None):
         self._client = client or _default_client()
 
-    def generate(self, question: str, chunks: list[GeneratorChunk]) -> GenerateResult:
+    def generate(
+        self, question: str, chunks: list[GeneratorChunk], history: list[dict] | None = None
+    ) -> GenerateResult:
+        """history: optional prior messages for this conversation (each a
+        dict with "role" ("user"|"assistant") and "content"), oldest
+        first — e.g. straight from db.queries.list_messages_for_conversation().
+        This is MINIMAL conversation memory (2026-07-27 follow-up):
+        history is folded into the prompt so a follow-up like "how does
+        that compare to X?" resolves correctly in the ANSWER. Retrieval
+        itself is unaffected — the caller (routes/query.py) still
+        searches using only the raw current-turn `question`, no query
+        reformulation/rewriting. A follow-up whose wording alone doesn't
+        retrieve well (relies entirely on unstated context) may retrieve
+        poorly even though this method has the context to answer well
+        once the right chunks are found — a known, deliberate scope
+        limitation, not an oversight (.agent/FEATURES.md).
+
+        Citation numbering resets every turn: `chunks` is always THIS
+        call's own list, so [N] here always means chunks[N-1] of ONLY
+        this call, never anything from a prior turn — history's own old
+        [N] markers are stripped before being folded in (see
+        _strip_citation_markers) specifically so they can never be
+        confused with this turn's numbering. Matches FEAT-026's existing
+        per-message marker persistence (each stored message's `content`
+        keeps its own turn's marker numbering, never renumbered later).
+        """
         if not chunks:
             raise GenerationError("generate() requires at least one context chunk")
 
-        contents = _build_contents(question, chunks)
+        contents = _build_contents(question, chunks, history)
         config = types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION, temperature=0.2)
 
         started = time.perf_counter()

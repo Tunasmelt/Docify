@@ -291,7 +291,9 @@ def get_conversation_detail(client, *, conversation_id: str, user_id: str) -> di
     return rows[0] if rows else None
 
 
-def list_messages_for_conversation(client, *, conversation_id: str, user_id: str) -> list[dict]:
+def list_messages_for_conversation(
+    client, *, conversation_id: str, user_id: str, limit: int | None = None
+) -> list[dict]:
     """Ordered oldest-first (messages_conv_idx already indexes
     (conversation_id, created_at) ascending — SCHEMA.md), matching a
     conversation's natural reading order. conversation_id ownership is
@@ -300,8 +302,26 @@ def list_messages_for_conversation(client, *, conversation_id: str, user_id: str
     create_query_turn's RPC uses) — the user_id filter here is
     defense-in-depth on top of that, not the primary check, same
     "costs nothing to also filter" reasoning as
-    remove_document_from_conversations()."""
-    return (
+    remove_document_from_conversations().
+
+    limit=None (default, GET /conversations/{id}/messages's own usage,
+    unchanged): fetch every message, oldest-first, as before.
+    limit=N (routes/query.py's 2026-07-27 conversation-memory follow-up):
+    same query, same oldest-first order, then keep just the last N in
+    Python. Deliberately NOT `order(created_at desc).limit(N)` reversed
+    back — confirmed empirically that this breaks: a turn's user and
+    assistant messages are inserted in the same create_query_turn()
+    transaction, and Postgres's `now()` is transaction-start time, so
+    both rows share an IDENTICAL created_at. A DESC query does not
+    reliably invert the ASC order for tied rows (observed returning
+    user-before-assistant even under DESC), so reversing it silently
+    swapped a turn's two messages. Reusing the exact same proven ASC
+    query and slicing client-side avoids this correctness risk entirely
+    — the accepted tradeoff is fetching the full (but
+    conversation_id-indexed, so still a cheap index scan, not a table
+    scan) history rather than only the tail, judged fine at this
+    project's portfolio scale rather than assumed free."""
+    rows = (
         client.table("messages")
         .select("id,role,content,created_at")
         .eq("conversation_id", conversation_id)
@@ -310,6 +330,9 @@ def list_messages_for_conversation(client, *, conversation_id: str, user_id: str
         .execute()
         .data
     )
+    if limit is None:
+        return rows
+    return rows[-limit:] if limit > 0 else []
 
 
 CITATION_JOIN_COLUMNS = (

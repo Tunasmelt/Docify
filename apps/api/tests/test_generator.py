@@ -150,6 +150,94 @@ def test_non_figure_chunks_never_produce_an_image_part_even_with_content():
     assert image_parts == []
 
 
+# --- Conversation memory (2026-07-27 follow-up) ----------------------------
+
+
+def _history_text_parts(contents):
+    return [p.text for p in contents if p.text is not None]
+
+
+def test_generate_with_no_history_produces_no_history_block_at_all():
+    # Regression guard: history=None (the default, and every pre-2026-07-27
+    # call site) must produce byte-identical contents to before this
+    # feature existed — no empty "Conversation history:" block appended.
+    client = FakeClient()
+    generator = Generator(client=client)
+
+    generator.generate("question", [_chunk(content="some content")])
+
+    texts = _history_text_parts(client.models.calls[0]["contents"])
+    assert not any("Conversation history" in t for t in texts)
+
+
+def test_generate_folds_history_into_the_prompt_before_the_chunks():
+    client = FakeClient()
+    generator = Generator(client=client)
+    history = [
+        {"role": "user", "content": "What was Q3 revenue?"},
+        {"role": "assistant", "content": "Q3 revenue was $5M [1]."},
+    ]
+
+    generator.generate("How does that compare to Q2?", [_chunk(content="Q2 revenue was $4M.")], history=history)
+
+    contents = client.models.calls[0]["contents"]
+    texts = _history_text_parts(contents)
+    assert any("Conversation history" in t for t in texts)
+    assert any("What was Q3 revenue?" in t for t in texts)
+    assert any("Q3 revenue was $5M" in t for t in texts)
+
+    # History must appear BEFORE the numbered chunks in the prompt, and
+    # the chunk numbering must be completely unaffected by history's
+    # presence — chunk [1] is still the only real chunk, at position 1.
+    history_index = next(i for i, p in enumerate(contents) if p.text and "Conversation history" in p.text)
+    chunk_index = next(i for i, p in enumerate(contents) if p.text and "Q2 revenue was $4M" in p.text)
+    assert history_index < chunk_index
+    assert any(t.startswith("[1] (page") and "Q2 revenue was $4M" in t for t in texts)
+
+
+def test_generate_strips_citation_markers_from_historical_assistant_answers():
+    # A prior turn's [N] markers were positions into THAT turn's own
+    # chunks list, which no longer exists — leaving them in the folded-in
+    # history text would be meaningless noise at best. Confirms they're
+    # actually stripped, not just documented as stripped.
+    client = FakeClient()
+    generator = Generator(client=client)
+    history = [
+        {"role": "user", "content": "What was Q3 revenue?"},
+        {"role": "assistant", "content": "Q3 revenue was $5M [1], up from [2]."},
+    ]
+
+    generator.generate("follow-up", [_chunk(content="filler")], history=history)
+
+    texts = _history_text_parts(client.models.calls[0]["contents"])
+    history_text = next(t for t in texts if "Conversation history" in t)
+    assert "[1]" not in history_text
+    assert "[2]" not in history_text
+    assert "Q3 revenue was $5M, up from" in history_text  # content preserved, only brackets removed
+
+
+def test_citation_numbering_in_new_answer_is_unaffected_by_marker_like_text_in_history():
+    # Citation numbering resets every turn: even if history contains text
+    # that looks marker-shaped, _parse_citations only ever scans the
+    # model's actual returned answer text (response.text), never the
+    # prompt it was given — this locks that in as an explicit regression
+    # test rather than leaving it as an implicit consequence of the code
+    # structure.
+    client = FakeClient(response=FakeResponse(text="A fresh answer [1]."))
+    generator = Generator(client=client)
+    history = [
+        {"role": "user", "content": "earlier question mentioning [1] and [9] as plain text"},
+        {"role": "assistant", "content": "an earlier answer citing [1], [2], and even [99]"},
+    ]
+
+    result = generator.generate("new question", [_chunk()], history=history)
+
+    # Only the CURRENT answer's own [1] is parsed — none of history's
+    # [1]/[2]/[9]/[99] leak into cited_indices or hallucinated_markers.
+    assert result.cited_indices == [1]
+    assert result.hallucinated_markers == []
+
+
 # Acceptance criterion: Returns metadata: model, input_tokens, output_tokens, latency_ms
 def test_returns_metadata_model_input_tokens_output_tokens_latency_ms():
     response = FakeResponse(

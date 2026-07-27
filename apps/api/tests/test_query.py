@@ -26,10 +26,12 @@
 # reference REAL chunk rows from a real ingested document, never
 # made-up ids.
 
+import os
 import time
 
 import pytest
 
+from db import queries
 from main import app
 from routes import query
 from services.chunker import Chunk
@@ -58,8 +60,8 @@ class FakeGenerator:
         self._result = result
         self.calls: list[dict] = []
 
-    def generate(self, question, chunks):
-        self.calls.append({"question": question, "chunks": chunks})
+    def generate(self, question, chunks, history=None):
+        self.calls.append({"question": question, "chunks": chunks, "history": history})
         return self._result
 
 
@@ -67,7 +69,7 @@ class FakeGeneratorRaising:
     def __init__(self, exc: Exception):
         self._exc = exc
 
-    def generate(self, question, chunks):
+    def generate(self, question, chunks, history=None):
         raise self._exc
 
 
@@ -412,6 +414,173 @@ def test_continuing_a_conversation_that_does_not_belong_to_user_returns_404(app_
         headers={"Authorization": f"Bearer {token_a}"},
     )
     assert response.status_code == 404
+
+
+# --- Conversation memory (2026-07-27 follow-up) -----------------------------
+#
+# Minimal memory: prior Q&A pairs fold into Generator's prompt so a
+# follow-up resolves correctly in the ANSWER. Retrieval itself is
+# unchanged (still searches on the raw current-turn question alone — no
+# query rewriting, a deliberate scope decision, see .agent/FEATURES.md).
+# History fetch reuses FEAT-026's already-isolation-proven
+# list_messages_for_conversation() (now with an added optional `limit`)
+# rather than a second, parallel path.
+
+
+def _setup_single_chunk_query(app_client, admin, user_id, token, filename="doc.pdf", content="Some fact."):
+    document_id = _ingest_doc_with_content(app_client, admin, user_id, token, filename, content)
+    chunk_row = _real_chunk_row(admin, document_id)
+    retrieved = [
+        RetrievedChunk(
+            chunk_id=chunk_row["id"], content=chunk_row["content"], page=1, document_id=document_id,
+            document_name=filename, element_type="text", score=0.9,
+        )
+    ]
+    return document_id, chunk_row, retrieved
+
+
+def _post_query(app_client, token, document_id, question, conversation_id=None):
+    payload = {"question": question, "document_ids": [document_id]}
+    if conversation_id is not None:
+        payload["conversation_id"] = conversation_id
+    return app_client.post("/query", json=payload, headers={"Authorization": f"Bearer {token}"}).json()
+
+
+def test_first_turn_with_no_conversation_id_generator_receives_empty_history(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id, chunk_row, retrieved = _setup_single_chunk_query(app_client, admin, user_id, token)
+    gen_result = GenerateResult(
+        answer="A fact [1].", cited_indices=[1], hallucinated_markers=[],
+        model="gemini-3.6-flash", input_tokens=10, output_tokens=5, latency_ms=10.0,
+    )
+    fake_generator = FakeGenerator(gen_result)
+    _override(
+        retriever=FakeRetriever(retrieved), generator=fake_generator,
+        verifier=FakeVerifier({chunk_row["id"]: _verdict(VerdictLabel.SUPPORTED)}),
+    )
+
+    _post_query(app_client, token, document_id, "first question")
+
+    assert fake_generator.calls[0]["history"] == []
+
+
+def test_second_turn_receives_first_turns_qa_as_history(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id, chunk_row, retrieved = _setup_single_chunk_query(app_client, admin, user_id, token)
+
+    gen_result_1 = GenerateResult(
+        answer="First fact [1].", cited_indices=[1], hallucinated_markers=[],
+        model="gemini-3.6-flash", input_tokens=10, output_tokens=5, latency_ms=10.0,
+    )
+    _override(
+        retriever=FakeRetriever(retrieved), generator=FakeGenerator(gen_result_1),
+        verifier=FakeVerifier({chunk_row["id"]: _verdict(VerdictLabel.SUPPORTED)}),
+    )
+    first = _post_query(app_client, token, document_id, "first question")
+
+    gen_result_2 = GenerateResult(
+        answer="Second fact [1].", cited_indices=[1], hallucinated_markers=[],
+        model="gemini-3.6-flash", input_tokens=10, output_tokens=5, latency_ms=10.0,
+    )
+    fake_generator_2 = FakeGenerator(gen_result_2)
+    _override(
+        retriever=FakeRetriever(retrieved), generator=fake_generator_2,
+        verifier=FakeVerifier({chunk_row["id"]: _verdict(VerdictLabel.SUPPORTED)}),
+    )
+    _post_query(app_client, token, document_id, "second question", conversation_id=first["conversation_id"])
+
+    history = fake_generator_2.calls[0]["history"]
+    assert [(m["role"], m["content"]) for m in history] == [
+        ("user", "first question"),
+        ("assistant", "First fact [1]."),
+    ]
+
+
+def test_conversation_history_window_is_bounded_to_max_history_turns(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id, chunk_row, retrieved = _setup_single_chunk_query(app_client, admin, user_id, token)
+
+    total_turns = query.MAX_HISTORY_TURNS + 2  # deliberately more turns than the window keeps
+    conversation_id = None
+    last_fake_generator = None
+    for i in range(total_turns):
+        gen_result = GenerateResult(
+            answer=f"answer {i} [1].", cited_indices=[1], hallucinated_markers=[],
+            model="gemini-3.6-flash", input_tokens=10, output_tokens=5, latency_ms=10.0,
+        )
+        fake_generator = FakeGenerator(gen_result)
+        _override(
+            retriever=FakeRetriever(retrieved), generator=fake_generator,
+            verifier=FakeVerifier({chunk_row["id"]: _verdict(VerdictLabel.SUPPORTED)}),
+        )
+        response = _post_query(app_client, token, document_id, f"question {i}", conversation_id=conversation_id)
+        conversation_id = response["conversation_id"]
+        last_fake_generator = fake_generator
+
+    history = last_fake_generator.calls[0]["history"]
+    assert len(history) == query.MAX_HISTORY_TURNS * 2  # bounded, not all (total_turns - 1) prior turns
+
+    contents = [m["content"] for m in history]
+    assert "question 0" not in contents  # the oldest turn, now outside the window
+    assert "question 1" in contents  # the oldest turn STILL inside the window
+
+
+def test_conversation_history_with_limit_preserves_user_then_assistant_order_within_a_turn(app_client, admin, user_a):
+    # Regression test for a real bug caught while building this: a turn's
+    # user and assistant messages share an IDENTICAL created_at (both
+    # insert inside the one create_query_turn() transaction, and
+    # Postgres's now() is transaction-start time, not per-statement) — an
+    # earlier implementation ordered DESC + reversed in Python to bound
+    # the fetch, which silently swapped the two to (assistant, user) for
+    # exactly this common tie. list_messages_for_conversation()'s limit=
+    # path must still return (user, assistant) in that order.
+    user_id, token = user_a
+    document_id, chunk_row, retrieved = _setup_single_chunk_query(app_client, admin, user_id, token)
+    gen_result = GenerateResult(
+        answer="A fact [1].", cited_indices=[1], hallucinated_markers=[],
+        model="gemini-3.6-flash", input_tokens=10, output_tokens=5, latency_ms=10.0,
+    )
+    _override(
+        retriever=FakeRetriever(retrieved), generator=FakeGenerator(gen_result),
+        verifier=FakeVerifier({chunk_row["id"]: _verdict(VerdictLabel.SUPPORTED)}),
+    )
+    result = _post_query(app_client, token, document_id, "the question")
+    conversation_id = result["conversation_id"]
+
+    bounded = queries.list_messages_for_conversation(admin, conversation_id=conversation_id, user_id=user_id, limit=10)
+
+    assert [m["role"] for m in bounded] == ["user", "assistant"]
+    assert bounded[0]["content"] == "the question"
+    assert bounded[1]["content"] == "A fact [1]."
+
+
+def test_conversation_history_fetch_with_limit_is_scoped_to_the_requesting_user(app_client, admin, user_a, user_b):
+    # The new `limit=` branch of list_messages_for_conversation() is the
+    # code this follow-up actually added — confirms isolation holds for
+    # it specifically, rather than assuming it's inherited untested from
+    # the limit=None path FEAT-026 already proved.
+    user_id_a, token_a = user_a
+    user_id_b, _token_b = user_b
+    document_id, chunk_row, retrieved = _setup_single_chunk_query(
+        app_client, admin, user_id_a, token_a, filename="a.pdf", content="user A's fact"
+    )
+    gen_result = GenerateResult(
+        answer="A fact [1].", cited_indices=[1], hallucinated_markers=[],
+        model="gemini-3.6-flash", input_tokens=10, output_tokens=5, latency_ms=10.0,
+    )
+    _override(
+        retriever=FakeRetriever(retrieved), generator=FakeGenerator(gen_result),
+        verifier=FakeVerifier({chunk_row["id"]: _verdict(VerdictLabel.SUPPORTED)}),
+    )
+    result = _post_query(app_client, token_a, document_id, "user A's private question")
+    conversation_id = result["conversation_id"]
+
+    # Positive control first — user A can fetch their own bounded history.
+    as_owner = queries.list_messages_for_conversation(admin, conversation_id=conversation_id, user_id=user_id_a, limit=10)
+    assert any(m["content"] == "user A's private question" for m in as_owner)
+
+    as_other_user = queries.list_messages_for_conversation(admin, conversation_id=conversation_id, user_id=user_id_b, limit=10)
+    assert as_other_user == []
 
 
 # Acceptance criterion: Cross-tenant document_ids in request → 403
@@ -836,3 +1005,174 @@ def test_no_retrieved_chunks_returns_a_graceful_answer_not_an_error(app_client, 
     assert body["citations"] == []
     assert body["metadata"]["retrieved_count"] == 0
     assert "couldn't find" in body["answer"].lower()
+
+
+# --- Real conversation memory quality + latency (2026-07-27 follow-up) ------
+#
+# Task item 5/6: a genuine two-turn conversation against real ingested
+# content (real Docling parse, real Voyage embeddings, real Gemini
+# generation+verification through the actual /query endpoint — no
+# dependency overrides at all), reporting the real second answer and the
+# real added latency from folding history into the prompt. Gated behind
+# its own env var, same pattern as RUN_RETRIEVAL_QUALITY_TEST/
+# RUN_GENERATION_QUALITY_TEST/RUN_VERIFICATION_QUALITY_TEST.
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_CONVERSATION_MEMORY_QUALITY_TEST") != "1",
+    reason=(
+        "set RUN_CONVERSATION_MEMORY_QUALITY_TEST=1 to run a real two-turn conversation "
+        "against real Docling+Voyage+Gemini (slow, uses quota)"
+    ),
+)
+def test_real_two_turn_conversation_uses_first_turns_context_to_answer_the_second(app_client, admin, user_a):
+    from services.chunker import Chunker
+    from services.embedder import Embedder
+    from services.figure_fetcher import fetch_generator_chunks
+    from services.generator import Generator
+    from services.parser import Parser
+    from services.retriever import Retriever
+
+    user_id, token = user_a
+    fixtures = os.path.join(os.path.dirname(__file__), "fixtures")
+
+    with open(os.path.join(fixtures, "table_heavy.pdf"), "rb") as f:
+        pdf_bytes = f.read()
+
+    parsed = Parser().parse(pdf_bytes)
+    chunks = Chunker().chunk(parsed)
+    embedder = Embedder()
+    vectors = embedder.embed(chunks)
+
+    document_id = (
+        admin.table("documents")
+        .insert(
+            {
+                "user_id": user_id,
+                "filename": "table_heavy.pdf",
+                "storage_path": f"uploads/{user_id}/table_heavy.pdf",
+                "mime_type": "application/pdf",
+                "size_bytes": len(pdf_bytes),
+            }
+        )
+        .execute()
+        .data[0]["id"]
+    )
+    rows = []
+    for chunk, vector in zip(chunks, vectors, strict=True):
+        rows.append(
+            {
+                "document_id": document_id,
+                "user_id": user_id,
+                "chunk_index": chunk.chunk_index,
+                "element_type": chunk.element_type.value,
+                "page_number": min(chunk.page_numbers),
+                "content": chunk.content,
+                "embedding": vector,
+            }
+        )
+    admin.table("chunks").insert(rows).execute()
+    for image in (c.image for c in chunks if c.image is not None):
+        image.close()
+
+    # Same Voyage 3 RPM free-tier pacing FEAT-009's own quality test hit
+    # and documented (.agent/MEMORY.md) — this test makes several more
+    # real embed_query calls than a single-turn quality test would.
+    time.sleep(25)
+
+    question_1 = "What is Angola's Human Development Index value in 2010?"
+    turn1 = app_client.post(
+        "/query",
+        json={"question": question_1, "document_ids": [document_id]},
+        headers={"Authorization": f"Bearer {token}"},
+    ).json()
+
+    time.sleep(25)
+
+    question_2 = "How does that compare to the year 2000?"
+    turn2 = app_client.post(
+        "/query",
+        json={"question": question_2, "document_ids": [document_id], "conversation_id": turn1["conversation_id"]},
+        headers={"Authorization": f"Bearer {token}"},
+    ).json()
+
+    print("\n" + "=" * 90)
+    print("Real two-turn conversation — table_heavy.pdf, real Docling+Voyage+Gemini")
+    print("=" * 90)
+    print(f"\nTurn 1: {question_1}\n-> {turn1['answer']}")
+    print(f"   latency_ms={turn1['metadata']['latency_ms']}")
+    print(f"\nTurn 2: {question_2}\n-> {turn2['answer']}")
+    print(f"   latency_ms={turn2['metadata']['latency_ms']}")
+
+    # Item 6 — isolate history's OWN added latency, not just the
+    # (confounded, different-question) turn1-vs-turn2 total delta: same
+    # question/chunks/retrieval, called once with no history and once
+    # with turn 2's real fetched history, timing each real Gemini call
+    # directly. Reuses the real retrieved chunks rather than a second
+    # real retrieval call.
+    time.sleep(25)
+    retriever = Retriever(client=admin)
+    retrieved = retriever.retrieve(question_2, [document_id], user_id, k=8)
+    generator_chunks = fetch_generator_chunks(admin, retrieved)
+    real_history = queries.list_messages_for_conversation(
+        admin, conversation_id=turn1["conversation_id"], user_id=user_id, limit=query.MAX_HISTORY_TURNS * 2
+    )
+    generator = Generator()
+
+    # Fixed-order pairs (no-history always called first, with-history
+    # always second) initially produced a large gap in the WRONG
+    # direction — history calls came back faster, the opposite of what
+    # "extra context costs more" would predict — raising a real
+    # suspicion of a call-order/warm-connection confound (being
+    # second-in-pair, not "having history", correlating with being
+    # faster). Re-measured with ABBA counterbalancing (which condition
+    # goes first alternates each trial, so position-in-sequence and any
+    # latency drift over the run are spread evenly across both
+    # conditions) — the gap persisted just as strongly (see the real
+    # result below), ruling out simple call-order as the explanation.
+    # Most likely real mechanism, not fully instrumented here to confirm
+    # via output token counts: with history, the model knows exactly
+    # what "that"/"the year 2000" refers to and answers directly; without
+    # it, the model must guess the referent from an ambiguous follow-up
+    # against a multi-country/multi-year table, plausibly producing a
+    # longer, more hedging answer — and output token count, not prompt
+    # size, dominates real autoregressive generation latency. Reported as
+    # the real, reproduced (n=3 ABBA-counterbalanced trials) measurement
+    # either way, not silently smoothed over because the direction was
+    # surprising.
+    no_history_trials = []
+    with_history_trials = []
+    for trial in range(3):
+        if trial > 0:
+            time.sleep(10)
+        history_first = trial % 2 == 1
+        order = [True, False] if history_first else [False, True]
+        for is_history_call in order:
+            started = time.perf_counter()
+            generator.generate(question_2, generator_chunks, history=real_history if is_history_call else None)
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            (with_history_trials if is_history_call else no_history_trials).append(elapsed_ms)
+            if is_history_call != order[-1]:
+                time.sleep(10)
+
+    def _stats(label, trials):
+        mean = sum(trials) / len(trials)
+        print(f"   {label}: mean={mean:.1f}ms min={min(trials):.1f}ms max={max(trials):.1f}ms trials={[f'{t:.1f}' for t in trials]}")
+        return mean
+
+    print("\nGenerator.generate() latency isolation — same question/chunks, history on vs off, n=3 paired trials:")
+    no_history_mean = _stats("without history", no_history_trials)
+    with_history_mean = _stats("with history   ", with_history_trials)
+    print(f"   mean delta: {with_history_mean - no_history_mean:+.1f}ms")
+    print("=" * 90)
+
+    admin.table("chunks").delete().eq("document_id", document_id).execute()
+    admin.table("documents").delete().eq("id", document_id).execute()
+
+    assert "4.42" in turn1["answer"]
+    # The second answer must show real evidence of having used turn 1's
+    # context to resolve "that"/"the year 2000" — real content: Angola's
+    # HDI row is 4.42 in BOTH 2000 and 2010 (table_heavy.pdf, Table 19),
+    # so a context-aware answer should reference 4.42 and/or note no
+    # change between the two years.
+    assert "4.42" in turn2["answer"] or "same" in turn2["answer"].lower() or "no change" in turn2["answer"].lower()

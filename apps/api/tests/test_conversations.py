@@ -32,7 +32,7 @@ class FakeGenerator:
     def __init__(self, result):
         self._result = result
 
-    def generate(self, question, chunks):
+    def generate(self, question, chunks, history=None):
         return self._result
 
 
