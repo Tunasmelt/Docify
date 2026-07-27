@@ -476,6 +476,43 @@ def test_embed_real_chunks_from_table_heavy_pdf():
     assert all(len(call_input) == 1 for call in fake.calls for call_input in call["inputs"])
 
 
+# --- Lazy client construction (2026-07-27, closes a FEAT-017-shaped gap) ---
+#
+# Same bug class FEAT-017's audit found and fixed for GeminiOcrClient/
+# OcrSpaceClient: bare voyageai.Client() construction was confirmed live to
+# raise AuthenticationError immediately if VOYAGE_API_KEY is absent, which
+# meant a bare Embedder() (and by extension Retriever(), which builds a
+# default Embedder()) crashed in ANY environment missing VOYAGE_API_KEY —
+# even for callers that never actually call embed()/embed_query(). Fixed by
+# deferring real client construction to first actual use.
+
+
+def test_embedder_construction_never_touches_network_or_requires_api_key(monkeypatch):
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    Embedder()  # must not raise
+
+
+def test_embedder_embed_fails_with_embed_error_not_a_raw_sdk_crash_when_api_key_absent(monkeypatch):
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    embedder = Embedder()  # no client injected -> real lazy client, no key present
+
+    # Must fail as EmbedError (embed()'s own documented contract — "auth,
+    # invalid request, ..." — see the class docstring), not let a raw
+    # voyageai.error.AuthenticationError escape uncaught. This specifically
+    # exercises _get_tokenizer()'s client resolution, which embed()'s batch
+    # loop calls before its own try/except.
+    with pytest.raises(EmbedError):
+        embedder.embed([make_chunk(content="hello")])
+
+
+def test_embedder_embed_query_fails_with_embed_error_not_a_raw_sdk_crash_when_api_key_absent(monkeypatch):
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    embedder = Embedder()
+
+    with pytest.raises(EmbedError):
+        embedder.embed_query("hello")
+
+
 # --- Real API integration (opt-in only) -------------------------------------
 
 

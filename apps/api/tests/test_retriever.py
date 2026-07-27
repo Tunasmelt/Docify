@@ -493,6 +493,22 @@ def test_reranker_construction_never_touches_network_or_requires_api_key(monkeyp
     Reranker()  # must not raise
 
 
+def test_bare_retriever_construction_never_requires_voyage_api_key(admin, monkeypatch):
+    # 2026-07-27 follow-up: Retriever()'s default Embedder() used to build
+    # a real voyageai.Client() eagerly (same crash shape as the OCR tiers,
+    # FEAT-017's audit fixed there but not here at the time). Confirms the
+    # embedder.py fix actually closes this transitively — a bare
+    # Retriever() must construct fine with VOYAGE_API_KEY absent, since it
+    # never touches Voyage until an actual retrieve()/embed_query() call.
+    # Supabase env vars are left alone: get_service_role_client() needing
+    # SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY is a separate, unrelated
+    # requirement out of this fix's scope (every Retriever call needs a
+    # real DB client to do anything at all; VOYAGE_API_KEY is only needed
+    # once an embedding/rerank call actually happens).
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    Retriever(client=admin)  # must not raise
+
+
 # --- Reranking (FEAT-009 follow-up): Retriever.retrieve(rerank=...) wiring ---
 
 

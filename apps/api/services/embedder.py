@@ -108,16 +108,42 @@ def _default_client() -> voyageai.Client:
 
 class Embedder:
     def __init__(self, client: voyageai.Client | None = None, tokenizer=None):
-        self._client = client or _default_client()
-        # Lazily resolved from self._client.tokenizer(MODEL) on first use
-        # if not injected — real tests inject a fake tokenizer explicitly
-        # so fast/mocked tests never trigger a real HF download; the
-        # default path (no injection) always uses Voyage's real tokenizer.
+        # Lazily resolved on first real use (embed()/embed_query()), not
+        # here — a bare voyageai.Client() construction was confirmed live
+        # (2026-07-27, FEAT-009 rerank follow-up) to raise
+        # AuthenticationError immediately if VOYAGE_API_KEY is absent,
+        # the same eager-construction crash shape FEAT-017's audit found
+        # and fixed for GeminiOcrClient/OcrSpaceClient. That meant a bare
+        # Embedder() (and by extension Retriever(), which builds a
+        # default Embedder()) crashed in any environment missing
+        # VOYAGE_API_KEY even for callers that never actually call
+        # embed()/embed_query(). Fixed the same way: defer real client
+        # construction until it's actually needed.
+        self._client = client
+        # Lazily resolved from self._get_client().tokenizer(MODEL) on
+        # first use if not injected — real tests inject a fake tokenizer
+        # explicitly so fast/mocked tests never trigger a real HF
+        # download; the default path (no injection) always uses Voyage's
+        # real tokenizer.
         self._tokenizer = tokenizer
 
+    def _get_client(self) -> voyageai.Client:
+        if self._client is None:
+            self._client = _default_client()
+        return self._client
+
     def _get_tokenizer(self):
+        # embed()'s batch loop calls this BEFORE its own try/except (the
+        # tokenizer is needed to decide batch boundaries in the first
+        # place), so a missing/invalid API key surfacing here must still
+        # become EmbedError, not a raw VoyageError escaping embed()'s
+        # documented contract ("Non-transient embedding failure — auth,
+        # invalid request, ...").
         if self._tokenizer is None:
-            self._tokenizer = self._client.tokenizer(MODEL)
+            try:
+                self._tokenizer = self._get_client().tokenizer(MODEL)
+            except VoyageError as exc:
+                raise EmbedError(f"Voyage tokenizer unavailable: {exc}") from exc
         return self._tokenizer
 
     def embed(self, chunks: list[Chunk]) -> list[Vector]:
@@ -129,7 +155,7 @@ class Embedder:
         for batch in _batch_chunks(chunks, tokenizer):
             inputs = [_chunk_to_input(c) for c in batch]
             try:
-                result = self._client.multimodal_embed(
+                result = self._get_client().multimodal_embed(
                     inputs=inputs,
                     model=MODEL,
                     input_type="document",
@@ -165,7 +191,7 @@ class Embedder:
         embedded with input_type="document". No batching needed — a
         query is always exactly one input, never a list[Chunk]."""
         try:
-            result = self._client.multimodal_embed(
+            result = self._get_client().multimodal_embed(
                 inputs=[[text]],
                 model=MODEL,
                 input_type="query",
