@@ -11,12 +11,53 @@ from db import queries
 from db.client import get_service_role_client
 from errors import error_envelope
 from models.query import CitationResponse, QueryMetadata, QueryRequest, QueryResponse
+from rate_limit import limiter
 from services.figure_fetcher import fetch_generator_chunks, signed_figure_url
 from services.generator import CITATION_BRACKET, CITATION_NUMBER, GenerationError, Generator, GeneratorChunk
 from services.retriever import Retriever
 from services.verifier import Verdict, VerdictLabel, Verifier
 
 logger = logging.getLogger(__name__)
+
+# FEAT-024 (2026-07-28) — real vendor ceilings, not round numbers:
+#
+# Per-minute (Voyage): every real call to either /query or /query/stream
+# makes exactly one Voyage embed_query call (Retriever.retrieve(), no
+# rerank by default per FEAT-009's own opt-in decision) — the identical
+# 3 RPM shared free-tier ceiling /ingest's embed call draws on
+# (MEMORY.md). 3/minute per user is looser than /ingest's 2/minute
+# since asking questions is the core "try the demo" interaction real
+# visitors repeat most — but it draws on the SAME shared pool, so it's
+# still bounded, not generous.
+#
+# Per-day (Gemini): each real call also makes one gemini-3.6-flash
+# generation call plus one gemini-3.5-flash-lite verification call per
+# cited claim (parallelized, services/verifier.py) — a DIFFERENT quota
+# bucket from /ingest's OCR-tier-1 gemini-2.5-flash 20/day ceiling
+# (MEMORY.md's 2026-07-26 entry confirms these are per-model, separate
+# buckets, not shared). Neither model's exact free-tier daily ceiling
+# is published/confirmed (same entry) — 40/day per user is a
+# deliberately generous-but-real ceiling: high enough not to interrupt
+# a normal demo session, low enough that no single user's runaway
+# script silently drives unbounded real API cost against an unverified
+# limit.
+#
+# /query and /query/stream share ONE combined counter via
+# limiter.shared_limit(scope=...) below, not two independent ones —
+# they're the same underlying action (ask a question) with two
+# different response-delivery mechanisms, and both draw on the
+# identical real vendor calls above. Giving them separate counters
+# would silently let a user double their real effective quota by
+# alternating endpoints; confirmed live in test_rate_limit.py that a
+# user split across both routes hits ONE shared limit, not two.
+#
+# Same stated limitation as /ingest's comment: this bounds each route
+# (or, here, each shared action) per user, not a single global counter
+# across /ingest and /query combined — see that file's comment for the
+# full reasoning.
+QUERY_MINUTE_LIMIT = "3/minute"
+QUERY_DAY_LIMIT = "40/day"
+QUERY_RATE_LIMIT_SCOPE = "query_action"
 
 router = APIRouter()
 
@@ -152,6 +193,8 @@ def _load_history(client, payload: QueryRequest, user_id: str) -> tuple[list[dic
 
 
 @router.post("/query", response_model=QueryResponse, response_model_exclude_none=True)
+@limiter.shared_limit(QUERY_MINUTE_LIMIT, scope=QUERY_RATE_LIMIT_SCOPE)
+@limiter.shared_limit(QUERY_DAY_LIMIT, scope=QUERY_RATE_LIMIT_SCOPE)
 async def post_query(
     payload: QueryRequest,
     request: Request,
@@ -583,6 +626,8 @@ async def _stream_query_events(
 
 
 @router.post("/query/stream")
+@limiter.shared_limit(QUERY_MINUTE_LIMIT, scope=QUERY_RATE_LIMIT_SCOPE)
+@limiter.shared_limit(QUERY_DAY_LIMIT, scope=QUERY_RATE_LIMIT_SCOPE)
 async def post_query_stream(
     payload: QueryRequest,
     request: Request,

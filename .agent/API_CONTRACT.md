@@ -49,7 +49,7 @@ All errors return this shape with the appropriate HTTP status:
 | `NOT_FOUND` | 404 | Resource doesn't exist or isn't visible to user |
 | `CONFLICT` | 409 | Action not allowed given the resource's current state (e.g. deleting a document that's still being parsed) — added 2026-07-23, FEAT-008, was missing despite `DELETE /documents/{id}`'s own spec already documenting a 409 |
 | `VALIDATION_ERROR` | 422 | Request body failed schema validation |
-| `RATE_LIMITED` | 429 | Free-tier ceiling hit on a downstream API |
+| `RATE_LIMITED` | 429 | Either a downstream API's own free-tier ceiling was hit, or (added 2026-07-28, FEAT-024) this app's own proactive per-user rate limit on `POST /ingest`/`POST /query`/`POST /query/stream` was hit — see those endpoints' entries below for the real, vendor-quota-derived limit values and reasoning. A `Retry-After` header (seconds) is included on the proactive-limit case. |
 | `PARSE_FAILED` | 500 | Docling could not parse the document |
 | `EMBED_FAILED` | 502 | Voyage API call failed |
 | `GENERATE_FAILED` | 502 | Gemini API call failed |
@@ -100,7 +100,7 @@ Kicks off document parsing + embedding for a file already uploaded to Supabase S
 **Errors:**
 - `403 FORBIDDEN` if `storage_path` does not start with `uploads/{jwt.user_id}/`
 - `422 VALIDATION_ERROR` if mime_type unsupported
-- Background failures write `documents.error` and set `status='failed'`; no synchronous error surface
+- `429 RATE_LIMITED` (added 2026-07-28, FEAT-024) — **2 requests/minute** and **10 requests/day**, per user (`request.state.user_id`, never IP). Real vendor-quota-derived, not round numbers: each ingest makes ~1 Voyage embed call against Voyage's real, shared 3 RPM free-tier ceiling (`.agent/MEMORY.md`); a scanned document's OCR fallback can make several `gemini-2.5-flash` calls against that model's real, shared 20/day ceiling (also `.agent/MEMORY.md`) — both budgets are shared across every user of this app, not per-user, so per-user limits are deliberately tight. Full reasoning in `apps/api/routes/ingest.py`'s own comment.
 
 ---
 
@@ -238,6 +238,7 @@ Ask a question over one or more documents.
 - `403 FORBIDDEN` if any `document_ids` don't belong to user
 - `422 VALIDATION_ERROR` if `document_ids` empty or `question` empty
 - `502 GENERATE_FAILED` if Gemini call fails after retries
+- `429 RATE_LIMITED` (added 2026-07-28, FEAT-024) — **3 requests/minute** and **40 requests/day**, per user. Each real call makes one Voyage `embed_query` call (same shared 3 RPM ceiling `/ingest` draws on) plus one `gemini-3.6-flash` generation call and one `gemini-3.5-flash-lite` verification call per cited claim — a separate quota bucket from `/ingest`'s OCR ceiling, whose exact daily limit is unconfirmed (`.agent/MEMORY.md`), so 40/day is a deliberately generous-but-real bound rather than a derived vendor number. **Shares one combined counter with `POST /query/stream` below** — they're the same underlying action with two response-delivery mechanisms, not two independent budgets. Full reasoning in `apps/api/routes/query.py`'s own comment.
 
 ---
 
@@ -245,6 +246,8 @@ Ask a question over one or more documents.
 SSE streaming variant of `POST /query` — same request body, same auth/ownership/history validation (run to completion **before** the stream opens, so an invalid `document_id`/JWT/conversation always comes back as a normal JSON error response with the codes above, never as a stream that starts and then errors out). A separate route rather than a mode flag on `/query`: `response_model=QueryResponse` validation and a `StreamingResponse` are mutually exclusive in FastAPI, and `/query`'s synchronous contract stays untouched for any caller that doesn't want SSE.
 
 Browsers' `EventSource` can't send a POST body or an `Authorization` header — clients must use `fetch()` with a manually-read stream (see `apps/web/lib/api/query.ts`'s `askQuestionStream()`), not `EventSource`.
+
+**Rate limiting (added 2026-07-28, FEAT-024):** shares `POST /query`'s combined 3/minute + 40/day per-user counter (see that endpoint's entry) — a rate-limited request returns a normal `429 RATE_LIMITED` JSON response (the standard error envelope, `Content-Type: application/json`) **before the stream ever opens**, never an SSE connection that starts and then errors. Confirmed live, not assumed from decorator-ordering alone: `apps/api/tests/test_rate_limit.py`.
 
 **Response:** `Content-Type: text/event-stream`, one `event: <type>\ndata: <json>\n\n` frame per event. Real, fixed event sequence — no event is ever skipped or reordered:
 

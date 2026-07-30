@@ -82,6 +82,7 @@ dependencies = [
     # on the mismatched build, surfacing as a confusing
     # ModuleNotFoundError several layers away from the real cause).
     "torchvision==0.28.0",
+    "slowapi>=0.1.10",
 ]
 
 [dependency-groups]

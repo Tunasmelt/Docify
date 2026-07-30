@@ -10,6 +10,7 @@ from db import queries
 from db.client import get_service_role_client
 from errors import error_envelope
 from models.ingest import IngestRequest, IngestResponse
+from rate_limit import limiter
 from services.chunker import Chunker
 from services.embedder import Embedder
 from services.parser import Parser
@@ -17,6 +18,46 @@ from services.parser import Parser
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# FEAT-024 (2026-07-28) — real vendor ceilings, not round numbers:
+#
+# Per-minute (Voyage): Embedder.embed() batches every chunk of a
+# document into as few Voyage API calls as the 1000-input/300K-token
+# batch ceiling allows (services/embedder.py) — a typical document
+# ingest makes exactly ONE Voyage embed call. Voyage's real free-tier
+# ceiling is 3 RPM (MEMORY.md, hit live during FEAT-009's own quality
+# testing) — a SHARED budget across every user of this app, not
+# per-user. 2/minute per user leaves at least 1 RPM of headroom for
+# other concurrent activity sharing the same pool (other users'
+# ingests, and every /query call also draws on this same 3 RPM via its
+# own embed_query call) — tight by design, not generous, since the
+# whole point is protecting a budget this thin.
+#
+# Per-day (Gemini): a scanned/low-confidence PAGE triggers FEAT-017's
+# OCR fallback chain, tier 1 of which calls gemini-2.5-flash — real
+# confirmed ceiling: 20 requests/DAY, per-model (MEMORY.md's 2026-07-26
+# entry, hit live during this project's own OCR testing). A single
+# scanned document can trigger MANY tier-1 calls (one per low-
+# confidence page), not just one per ingest, so this cap bounds how
+# many DOCUMENTS one user can push through the pipeline per day rather
+# than precisely bounding total Gemini calls. 10/day per user leaves
+# room for at least one other real user to also ingest several
+# documents before the shared 20/day ceiling is at risk.
+#
+# Known, stated limitation: these are per-user, per-route limits, not a
+# single global counter shared across /ingest and /query together —
+# slowapi's per-route decorators can't perfectly enforce the TRUE
+# combined cross-endpoint 3 RPM/20-per-day ceiling on their own (one
+# user hammering both /ingest and /query simultaneously could still,
+# in the worst case, exceed the shared vendor budget alone). What these
+# values DO guarantee: no single accidental loop (a UI bug, a naive
+# script) or casual abuser can silently exhaust either vendor quota
+# without being throttled almost immediately. A mathematically airtight
+# global guarantee would need a single shared counter across both
+# routes, which the task scoped this feature against per-route, not as
+# one unified budget.
+INGEST_MINUTE_LIMIT = "2/minute"
+INGEST_DAY_LIMIT = "10/day"
 
 # FEAT-020 (2026-07-27): extended from PDF-only to also accept DOCX,
 # PPTX, and HTML — verified per-format against real fixtures, not assumed
@@ -160,6 +201,8 @@ def get_pipeline_runner():
 
 
 @router.post("/ingest", status_code=202, response_model=IngestResponse)
+@limiter.limit(INGEST_MINUTE_LIMIT)
+@limiter.limit(INGEST_DAY_LIMIT)
 async def post_ingest(
     payload: IngestRequest,
     request: Request,

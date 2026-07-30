@@ -26,6 +26,21 @@ from services.embedder import EmbedError
 from services.parser import BBox, ElementType, ParsedDocument, ParsedElement
 from tests._local_supabase import LOCAL_POSTGRES_DSN, admin_client, create_test_user, delete_test_user, login, upload_via_rest
 
+# FEAT-024 (2026-07-28) — disabled globally for the whole suite by
+# default: the real production limits (2-3/minute per user) are tight
+# enough by design that they'd start failing existing tests within a
+# single test run (many real calls to /ingest or /query within the
+# same test session, same user, well inside one real minute). Real
+# production behavior is unaffected — this only ever runs against the
+# app instance TestClient wraps in-process for tests, never touches
+# main.py's own default. tests/test_rate_limit.py re-enables it (and
+# resets its in-memory counters) around its own tests specifically,
+# restoring it back to disabled afterward — see that file for why this
+# is the correct way to test something whose whole job is refusing
+# requests without breaking every other test that legitimately makes
+# several real requests per session.
+app.state.limiter.enabled = False
+
 
 def _local_supabase_reachable() -> bool:
     try:

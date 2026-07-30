@@ -111,3 +111,26 @@ already been deleted while the pipeline was still mid-flight.
   `delete_document`'s code are both unchanged by FEAT-014 (a pure frontend wiring task); this gap
   predates it, just not exercised live until real delete requests started flowing from a real UI
   against real in-flight pipelines.
+
+## FEAT-024 (2026-07-28) — rate limiting closes ONE facet of SCOPE.md's "Production job execution" gap, not the whole thing
+
+`.agent/SCOPE.md`'s Phase 5 "Production job execution for `/ingest` (and `/query`)" entry has
+tracked three facets of the same underlying problem since it was written: durability, a real
+worker-pool/queue architecture, and rate-limiting. This real Render deploy — the first time this
+app ran against real, live, shared-quota vendor APIs in production — surfaced concrete evidence
+of exactly why the rate-limiting facet mattered (Voyage's real 3 RPM ceiling, Gemini's real
+20/day `gemini-2.5-flash` ceiling, both confirmed live in earlier sessions per `.agent/MEMORY.md`)
+and made it worth building ahead of the other two.
+
+- [x] **Rate-limiting on `/ingest` and `/query` (+ `/query/stream`) — done.** `apps/api/rate_limit.py`,
+  real vendor-quota-derived per-user limits, verified live end-to-end (`test_rate_limit.py`).
+  Full reasoning and numbers in `.agent/FEATURES.md`'s FEAT-024 entry and `.agent/SCOPE.md`.
+- [ ] **Durability and worker-pool/queue architecture — still open, NOT addressed by this
+  feature.** Rate-limiting only bounds how much NEW load can *start* — it does nothing for a
+  request already in flight. This gap is not hypothetical: this same deploy session's own
+  real-workload test against the live Render instance found `/ingest` OOM-crashing mid-Docling-
+  parse, silently leaving its document stuck at `status='parsing'` forever with the background
+  task simply gone (Render auto-restarted the container with zero record of the original
+  request) — exactly the "a process restart silently loses in-flight work" failure mode this
+  entry has named since before any real deploy existed to prove it. Rate-limiting a route that
+  can still crash mid-request once it starts is a real, separate, larger piece of work.

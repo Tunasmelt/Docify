@@ -6,6 +6,20 @@ Entry types: `feature` · `fix` · `decision` · `refactor` · `test` · `infra`
 
 ---
 
+## 2026-07-28 — feature: rate limiting on /ingest and /query (FEAT-024)
+**Phase:** 5
+**Feature:** FEAT-024
+**Decision:** Added per-user rate limiting to `POST /ingest`, `POST /query`, and `POST /query/stream` via `slowapi` (in-memory storage — a single Render instance, no Redis in the stack, explicit accepted tradeoff logged in `.agent/SCOPE.md`). Keyed by `request.state.user_id` (JWT-verified, never IP) — both routes already require auth, so there's no legitimate unauthenticated case to key on. Limits are real, vendor-quota-derived numbers, not round ones: `/ingest` (2/minute + 10/day) reasoned from Voyage's real 3 RPM ceiling and Gemini `gemini-2.5-flash`'s real 20/day OCR-fallback ceiling (both confirmed live and logged in `.agent/MEMORY.md` during earlier sessions); `/query`+`/query/stream` (3/minute + 40/day, sharing one combined counter — same underlying action, two delivery mechanisms) reasoned from the same shared Voyage pool plus a deliberately generous bound on Gemini generation/verification cost, whose exact daily ceiling is unconfirmed.
+
+**A real bug found via live testing:** `Limiter.__init__`'s `headers_enabled` defaults to `False` — the custom 429 handler's call to `_inject_headers()` was a silent no-op until this was set explicitly, meaning real 429 responses had no `Retry-After` header despite the handler looking correct. Fixed; re-verified the header is genuinely present.
+
+**Verified live, not assumed from slowapi's own claimed behavior:** real 429 with the standard error envelope; per-user isolation (one user's exhausted limit never blocks another); invalid/missing JWT always 401s and never counts against the limiter (confirmed the auth-before-limit ordering, not just assumed from middleware registration order); `/query` and `/query/stream` genuinely share one counter, not two; a rate-limited `/query/stream` request returns a clean `429`/`application/json`, never an SSE stream that opens and then errors; `documents`/`conversations` routes confirmed to have zero rate limiting, matching scope. The window's real reset was confirmed with an actual ~65s wait, not mocked. Full regression: 278 passed, 12 skipped, 0 failed.
+**Changed:** `apps/api/rate_limit.py` (new), `apps/api/main.py`, `apps/api/routes/ingest.py`, `apps/api/routes/query.py`, `apps/api/tests/conftest.py`, `apps/api/tests/test_rate_limit.py` (new), `apps/api/pyproject.toml`, `apps/api/uv.lock`, `.agent/API_CONTRACT.md`, `.agent/SCOPE.md`, `.agent/FEATURES.md`.
+**Impact:** The real deployed backend (`https://docify-api.onrender.com`) can no longer have its shared Voyage/Gemini free-tier quotas silently exhausted by one heavy user or a bot, protecting the demo for every other visitor.
+**Rollback:** Revert all `Changed` files above; no schema/data changes to undo.
+
+---
+
 ## 2026-07-27 — infra: first production deploy of apps/api to Render
 **Phase:** 5 (first real deploy)
 **Feature:** n/a (infra)

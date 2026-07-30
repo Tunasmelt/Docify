@@ -6,13 +6,33 @@ load_dotenv()  # must run before any module below reads env vars at import/const
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 from middleware.auth import JWTAuthMiddleware
+from rate_limit import limiter, rate_limit_exceeded_handler
 from routes import conversations, documents, health, ingest, query
 
 app = FastAPI(title="docify-api")
 
 app.add_middleware(JWTAuthMiddleware)
+
+# FEAT-024 (2026-07-28) — app.state.limiter/the exception handler must be
+# registered regardless of SlowAPIMiddleware's own position in the chain
+# below: the actual per-route rate-limit check happens inside each
+# route's own @limiter.limit(...) decorator (routes/ingest.py,
+# routes/query.py), which — like every route body — only ever runs
+# AFTER every registered Starlette middleware, JWTAuthMiddleware
+# included. So user_id_key() (rate_limit.py) is guaranteed
+# request.state.user_id is already set by the time it's called,
+# independent of where SlowAPIMiddleware itself sits here; confirmed
+# live in tests/test_rate_limit.py, not assumed from this ordering
+# alone. SlowAPIMiddleware's own job is narrower: it's what makes
+# request.state.view_rate_limit available for _inject_headers() to add
+# the standard Retry-After/X-RateLimit-* headers.
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
 
 # Added for FEAT-014 (Documents UI wiring) — the frontend calls this API
 # directly from the browser (NEXT_PUBLIC_API_URL), and no CORS middleware

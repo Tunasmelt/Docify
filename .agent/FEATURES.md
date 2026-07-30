@@ -934,12 +934,53 @@ This is a real EPA letter about lead service line compliance — confirms both t
 
 ---
 
+### [FEAT-024] Rate limiting on POST /ingest and POST /query (+ /query/stream)
+**Phase:** 5 (real deploy prompted this — see below)
+**Status:** tested
+**Owner:** claude-code
+**Depends on:** FEAT-003 (JWT middleware, `request.state.user_id`), FEAT-012/016 (`/query`, `/query/stream`), the real Render deploy (its own OOM investigation is what surfaced the real vendor-quota numbers this feature is calibrated against)
+**Files:**
+- `apps/api/rate_limit.py` (new) — `Limiter` (keyed by `request.state.user_id`, `headers_enabled=True`), `rate_limit_exceeded_handler()` matching `API_CONTRACT.md`'s standard error envelope
+- `apps/api/main.py` — `app.state.limiter`, `RateLimitExceeded` exception handler, `SlowAPIMiddleware`
+- `apps/api/routes/ingest.py` — `INGEST_MINUTE_LIMIT`/`INGEST_DAY_LIMIT`, two stacked `@limiter.limit(...)` decorators on `post_ingest`
+- `apps/api/routes/query.py` — `QUERY_MINUTE_LIMIT`/`QUERY_DAY_LIMIT`/`QUERY_RATE_LIMIT_SCOPE`, two stacked `@limiter.shared_limit(...)` decorators on both `post_query` and `post_query_stream`
+- `apps/api/tests/conftest.py` — `app.state.limiter.enabled = False` at module load, so the pre-existing suite (which legitimately makes several real requests per session) isn't accidentally throttled
+- `apps/api/tests/test_rate_limit.py` (new)
+- `apps/api/pyproject.toml` (`slowapi` added)
+**Tests:**
+- `apps/api/tests/test_rate_limit.py` — 7 fast tests + 1 real, slow (~65s), env-gated window-reset test
+
+**Real vendor-quota-derived limits, not round numbers:**
+- `POST /ingest`: **2/minute + 10/day** per user. Each ingest makes ~1 Voyage embed call (`Embedder.embed()` batches a whole document's chunks into as few calls as its 1000-input/300K-token ceiling allows) against Voyage's real, confirmed 3 RPM free-tier ceiling (`.agent/MEMORY.md`) — a budget shared across every user of this app, not per-user, so per-user limits are deliberately tight. The day cap protects `gemini-2.5-flash`'s real, confirmed 20/day OCR-tier-1 ceiling (also `.agent/MEMORY.md`) — a single scanned document can trigger many tier-1 calls (one per low-confidence page), so this bounds documents-per-day-per-user rather than precisely bounding total Gemini calls.
+- `POST /query` + `POST /query/stream`: **3/minute + 40/day** per user, sharing ONE combined counter via `limiter.shared_limit(scope="query_action")` rather than two independent ones — confirmed live (`test_query_and_query_stream_share_one_rate_limit`) that alternating between the two routes hits the same shared limit, not double the effective quota. Each real call makes one Voyage `embed_query` call (same shared 3 RPM pool) plus one `gemini-3.6-flash` generation call and one `gemini-3.5-flash-lite` verification call per cited claim — a separate, unconfirmed-ceiling quota bucket from `/ingest`'s OCR cap (per-model, not shared — `.agent/MEMORY.md`'s 2026-07-26 entry), so 40/day is a deliberately generous-but-real bound rather than a derived vendor number.
+- **Stated, honest limitation:** these are per-user, per-route (or per-shared-action) limits, not a single global counter across `/ingest` and `/query` combined — a determined single user hammering both simultaneously could still, in the worst case, exceed the true shared vendor budget alone. A mathematically airtight guarantee would need one unified counter across both routes, which this feature was scoped against per-route, not as one combined budget.
+
+**Design decision — in-memory storage, not Redis:** `Limiter(key_func=user_id_key)` with no `storage_uri=` — slowapi's default. Explicit, examined tradeoff, not an unexamined default: single Render instance, no Redis anywhere else in the stack, adding one just for this would be real new infrastructure for a problem that doesn't need it yet. **Known, accepted limitation, logged in `.agent/SCOPE.md`'s rate-limiting entry, not left implicit:** limits reset on every redeploy/cold-start restart (acceptable at this scale — a fresh window after a restart isn't a real gap), and this stops being correct the moment the service ever runs as more than one instance (each instance tracks its own separate counters, silently multiplying the effective limit).
+
+**A real bug found and fixed via live testing, not caught by reading slowapi's docs:** `headers_enabled` defaults to `False` in `Limiter.__init__` — confirmed live that `_inject_headers()` (called from the custom 429 handler) was a silent no-op without it, so real 429 responses had no `Retry-After`/`X-RateLimit-*` headers at all despite the handler appearing to call the right function. Fixed by passing `headers_enabled=True` explicitly; re-verified the header is genuinely present on a real 429.
+
+**Auth-before-limit ordering, confirmed live, not assumed from middleware registration order alone:** `user_id_key()` reads `request.state.user_id`, set only by `JWTAuthMiddleware` after a JWT actually verifies — since that middleware rejects with 401 *before* any route (and therefore any `@limiter.limit(...)` decorator) ever runs, an invalid/missing JWT can never reach the limiter at all. `test_invalid_or_missing_jwt_never_reaches_the_rate_limiter` fires more requests than the real limit with no/bad auth and confirms every single one 401s, never flipping to 429.
+
+**`/query/stream`-specific verification (task's own explicit concern — an SSE connection stays open longer than a normal request, could the check be bypassed by holding one open?):** confirmed live that slowapi's decorator wraps the *entire* route function, so the limit check runs and can raise `RateLimitExceeded` before `_stream_query_events()`'s async generator (or the `StreamingResponse` wrapping it) is ever constructed — a rate-limited streaming request gets a plain `429`/`application/json` response with no `event:`-framed bytes anywhere in the body, never a connection that opens and then errors (`test_query_stream_rate_limited_returns_clean_429_not_a_stream`).
+
+**Test-mode handling (task's own explicit concern):** the limiter is disabled globally at `conftest.py` module-load time — the real production values (2-3/minute) are tight enough by design that the pre-existing suite's normal several-real-requests-per-session pattern would start failing almost immediately otherwise. `test_rate_limit.py` is the one place it's re-enabled, via an autouse fixture that also calls `limiter.reset()` before and after every test in that file so tests can't leak state into each other or into whatever runs next in the same session.
+
+**Real regression confirmation:** full backend suite, 278 passed / 12 skipped / 0 failed (the 12th skip being the new window-reset test, gated behind `RUN_RATE_LIMIT_WINDOW_TEST=1` the same way this project gates other slow-but-not-quota-costly real tests) — zero impact on the rest of the suite. `documents`/`conversations` routes confirmed live to have no rate limit at all (many rapid real calls, zero 429s), matching `.agent/SCOPE.md`'s explicit scope of just `/ingest` and `/query`.
+
+**Run:**
+- `pytest apps/api/tests/test_rate_limit.py -v` (fast, 7 tests)
+- `RUN_RATE_LIMIT_WINDOW_TEST=1 pytest apps/api/tests/test_rate_limit.py::test_ingest_rate_limit_window_resets_after_real_time_passes -v -s` (real, ~65s)
+
+**Changelog:** See CHANGELOG.md 2026-07-28 "feature: rate limiting on /ingest and /query (FEAT-024)"
+
+---
+
 ## Phase 5 — Deploy (see SCOPE.md for full list)
 
 - [FEAT-021] Vercel prod deploy — planned
 - [FEAT-022] Render prod deploy — planned
 - [FEAT-023] Landing page + demo — planned
-- [FEAT-024] Rate limiting — planned
+- (FEAT-024 built 2026-07-28 — see its entry above, filed after FEAT-020, its most recent code dependency)
 - [FEAT-025] Error tracking (Sentry free) — planned
 
 ---
