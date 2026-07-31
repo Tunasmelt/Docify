@@ -347,6 +347,180 @@ def test_unsupported_citation_is_still_persisted_for_audit_even_though_dropped_f
     assert citations[0]["verdict"] == "unsupported"
 
 
+# --- Regression: real production incident, 2026-07-31 ----------------------
+#
+# A real streaming turn (a broad "summarize the provided paper" request)
+# crashed persistence with "null value in column 'marker' of relation
+# 'citations' violates not-null constraint" — create_query_turn is one
+# atomic function, so this rolled back the message rows too, losing the
+# whole turn (directly connected to a separate "chat history doesn't
+# persist" report). Extensive live reproduction against real Gemini
+# summarization answers never found a path where the CURRENT
+# _extract_claim_spans+persist-loop logic actually produces this — every
+# citation the client-facing generate() call reports is already
+# range-validated. These tests exercise the two independent defenses
+# added anyway (routes/query.py's _is_resolvable_marker guard, and the
+# SQL-level per-citation exception handling in
+# migrations/20260731_002_citation_persistence_defensive.sql), using a
+# hand-built GenerateResult to force the exact unresolvable-position shape
+# a future regression (in Generator, claim-span extraction, or anywhere
+# upstream) could plausibly reintroduce — proving the system fails safe
+# rather than losing the whole turn, without depending on being able to
+# coax that exact shape out of a live, non-deterministic model call.
+
+
+def test_unresolvable_citation_position_is_dropped_not_crashed_rest_of_turn_persists(app_client, admin, user_a):
+    """Simulates a broad summarization answer where Gemini's reported
+    citation positions include one that doesn't correspond to any
+    actually-retrieved chunk (the shape a real citation-integrity bug —
+    Generator/Retriever disagreeing on chunk count, a future refactor,
+    anything — would produce). Only 1 chunk was retrieved, but the
+    generator claims citations to both [1] (real) and [7] (nonexistent),
+    each with real resolvable sentence text around it so both pass
+    claim-span extraction and reach the defensive guard directly."""
+    user_id, token = user_a
+    document_id = _ingest_doc_with_content(
+        app_client, admin, user_id, token, "paper.pdf", "The paper demonstrates a new method for X."
+    )
+    chunk_row = _real_chunk_row(admin, document_id)
+
+    retrieved = [
+        RetrievedChunk(
+            chunk_id=chunk_row["id"], content=chunk_row["content"], page=1, document_id=document_id,
+            document_name="paper.pdf", document_mime_type="application/pdf", element_type="text", score=0.9,
+        )
+    ]
+    gen_result = GenerateResult(
+        answer=(
+            "This paper demonstrates a broad new method for solving X [1]. "
+            "It also builds on findings from an earlier section of the same work [7]."
+        ),
+        cited_indices=[1, 7],
+        hallucinated_markers=[],
+        model="gemini-3.6-flash", input_tokens=100, output_tokens=20, latency_ms=500.0,
+    )
+    _override(
+        retriever=FakeRetriever(retrieved),
+        generator=FakeGenerator(gen_result),
+        verifier=FakeVerifier({chunk_row["id"]: _verdict(VerdictLabel.SUPPORTED, "demonstrates a new method for X")}),
+    )
+
+    response = app_client.post(
+        "/query",
+        json={"question": "Summarize the provided paper.", "document_ids": [document_id]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    # No crash — 200, not 500, and the turn is genuinely persisted.
+    assert response.status_code == 200
+    body = response.json()
+    assert "message_id" in body and body["message_id"]
+    assert "conversation_id" in body and body["conversation_id"]
+
+    # The valid [1] citation survives untouched.
+    assert len(body["citations"]) == 1
+    assert body["citations"][0]["marker"] == 1
+    assert body["citations"][0]["chunk_id"] == chunk_row["id"]
+    assert "[1]" in body["answer"]
+    # The unresolvable [7] never made it into the response at all — AND
+    # its marker is stripped from the visible answer text, not left
+    # dangling with no matching citation (the separate cosmetic bug
+    # found and fixed alongside this one — .agent/GAPS.md 2026-07-31).
+    assert all(c["marker"] != 7 for c in body["citations"])
+    assert "[7]" not in body["answer"]
+
+    # And the rest of the turn — both messages, the one valid citation —
+    # genuinely committed to the DB; nothing rolled back.
+    messages = admin.table("messages").select("*").eq("conversation_id", body["conversation_id"]).order("created_at").execute().data
+    assert len(messages) == 2
+    assert messages[1]["id"] == body["message_id"]
+
+    citations = admin.table("citations").select("*").eq("message_id", body["message_id"]).execute().data
+    assert len(citations) == 1
+    assert citations[0]["marker"] == 1
+
+
+def test_create_query_turn_sql_skips_a_malformed_citation_without_losing_the_turn(admin, user_a):
+    """Defense-in-depth at the SQL layer itself (migration
+    20260731_002_citation_persistence_defensive.sql) — bypasses the
+    Python-side guard entirely and calls db.queries.create_query_turn
+    directly with a citations payload containing one entry whose
+    'marker' is None, proving the DB function itself never lets one
+    malformed citation take the whole turn down, independent of whether
+    the Python layer is ever proven airtight."""
+    user_id, _token = user_a
+    document_id = _ingest_doc_with_content_no_query(admin, user_id, "raw.pdf", "Some real content.")
+    chunk_row = _real_chunk_row(admin, document_id)
+
+    citations = [
+        {
+            "chunk_id": chunk_row["id"],
+            "marker": None,  # the exact real-incident shape
+            "claim_span": "a claim",
+            "claim_start": None,
+            "claim_end": None,
+            "verdict": "supported",
+            "supporting_quote": "Some real content",
+            "verifier_model": "gemini-3.5-flash-lite",
+        },
+        {
+            "chunk_id": chunk_row["id"],
+            "marker": 1,
+            "claim_span": "a different, valid claim",
+            "claim_start": None,
+            "claim_end": None,
+            "verdict": "supported",
+            "supporting_quote": "Some real content",
+            "verifier_model": "gemini-3.5-flash-lite",
+        },
+    ]
+
+    persisted = queries.create_query_turn(
+        admin,
+        user_id=user_id,
+        conversation_id=None,
+        document_ids=[document_id],
+        question="Summarize the provided paper.",
+        answer_content="A broad summary [1].",
+        answer_raw_content="A broad summary [1].",
+        retrieved_chunk_ids=[chunk_row["id"]],
+        answer_metadata={"model": "gemini-3.6-flash", "input_tokens": 1, "output_tokens": 1, "latency_ms": 1},
+        citations=citations,
+    )  # must not raise
+
+    messages = admin.table("messages").select("*").eq("conversation_id", persisted["conversation_id"]).execute().data
+    assert len(messages) == 2, "both messages must persist even though one citation was malformed"
+
+    saved_citations = admin.table("citations").select("*").eq("message_id", persisted["message_id"]).execute().data
+    assert len(saved_citations) == 1, "the malformed (null-marker) citation must be skipped, not persisted"
+    assert saved_citations[0]["marker"] == 1
+
+
+def _ingest_doc_with_content_no_query(admin, user_id, filename, content):
+    """Same shape as _ingest_doc_with_content but skips the real
+    /ingest HTTP round trip — this test calls db.queries.create_query_turn
+    directly, never through the app, so it only needs a real document +
+    chunk row to satisfy citations' FK to chunks(id)."""
+    doc = admin.table("documents").insert({
+        "user_id": user_id,
+        "filename": filename,
+        "storage_path": f"uploads/{user_id}/{filename}",
+        "mime_type": "application/pdf",
+        "size_bytes": len(content),
+        "status": "ready",
+    }).execute().data[0]
+    admin.table("chunks").insert({
+        "document_id": doc["id"],
+        "user_id": user_id,
+        "chunk_index": 0,
+        "element_type": "text",
+        "page_number": 1,
+        "content": content,
+        "embedding": _DUMMY_EMBEDDING,
+    }).execute()
+    return doc["id"]
+
+
 # Acceptance criterion: Continuing an existing conversation appends messages correctly
 def test_continuing_an_existing_conversation_appends_messages_correct(app_client, admin, user_a):
     user_id, token = user_a

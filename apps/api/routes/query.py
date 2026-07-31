@@ -151,6 +151,38 @@ def _strip_dropped_markers(answer: str, dropped_positions: set[int]) -> str:
     return stripped.strip()
 
 
+def _is_resolvable_marker(position, num_chunks: int) -> bool:
+    """Defense-in-depth guard (2026-07-31), added after a real production
+    incident: a streaming turn crashed persistence with "null value in
+    column 'marker'... violates not-null constraint," rolling back the
+    entire turn (message text included — create_query_turn is one atomic
+    function) because one citation reached the DB insert with an
+    unresolvable marker.
+
+    Live reproduction (real Gemini calls, broad-summarization prompts,
+    both single-turn and history-carrying follow-ups, plus hand-built
+    adversarial answer shapes fed through the real parsing functions)
+    never found a path where the CURRENT `_extract_claim_spans`+persist-
+    loop logic actually produces this — every position in
+    `cited_indices` is, by construction, a plain int already range-
+    validated by `_parse_citations` (1..num_chunks), and a position with
+    no resolvable claim-bearing sentence is already filtered out before
+    `citations_to_persist.append()` is ever reached (see the `if
+    claim_text:` gate below). But "not reproduced today" is not the same
+    as "provably cannot happen," and citation-integrity bugs are exactly
+    the class this project has adversarially audited hardest, precisely
+    because they're silent, not crashing, until they aren't. This is the
+    second, independent layer: even if some future change to Generator/
+    claim-span extraction ever DID produce an unresolvable position, it
+    gets dropped here — the same fail-safe treatment FEAT-010 already
+    gives a hallucinated (out-of-range) marker — rather than ever
+    reaching the DB. The SQL-side fix (migration
+    20260731_002_citation_persistence_defensive.sql) is the other layer:
+    even if a bad marker DID reach the DB, one bad citation can no
+    longer take the whole turn down with it."""
+    return isinstance(position, int) and not isinstance(position, bool) and 1 <= position <= num_chunks
+
+
 def _validate_payload(payload: QueryRequest) -> JSONResponse | None:
     if not payload.document_ids:
         return JSONResponse(status_code=422, content=error_envelope("VALIDATION_ERROR", "document_ids must not be empty"))
@@ -284,13 +316,46 @@ async def post_query(
     cited_positions = set(gen_result.cited_indices)
     claim_spans = _extract_claim_spans(gen_result.answer, cited_positions)
 
+    # Declared here, not after verify_batch(), so BOTH loops below can add
+    # to the same set — a position dropped for ANY reason (unresolvable
+    # marker, no resolvable claim text, or a real UNSUPPORTED verdict)
+    # must have its [N] stripped from the final answer text the same way.
+    # Previously only the UNSUPPORTED case did this; a citation dropped by
+    # either guard below left a dangling, unclickable [N] visible in the
+    # answer with no matching citation object — a real, separate (non-
+    # data-loss) bug found while adding these guards, fixed here too.
+    dropped_positions: set[int] = set()
+
     verify_pairs: list[tuple[str, GeneratorChunk]] = []
     verify_positions: list[int] = []
     for position in gen_result.cited_indices:
+        # Guards `generator_chunks[position - 1]` below, not just the
+        # later DB-insert loop — a real Generator's cited_indices is
+        # already range-validated against len(chunks) by
+        # Generator._parse_citations, so this should never fire given
+        # the current pipeline, but an out-of-range position reaching
+        # this line would otherwise raise an uncaught IndexError (this
+        # route has no surrounding try/except past this point, unlike
+        # the streaming path). See _is_resolvable_marker's docstring.
+        if not _is_resolvable_marker(position, len(generator_chunks)):
+            logger.warning(
+                "post_query: dropping an unresolvable citation position (%r) for user %s before verification",
+                position,
+                user_id,
+            )
+            dropped_positions.add(position)
+            continue
         claim_text = claim_spans.get(position)
         if claim_text:
             verify_pairs.append((claim_text, generator_chunks[position - 1]))
             verify_positions.append(position)
+        else:
+            # No resolvable claim-bearing sentence anywhere in the
+            # answer for this position (e.g. a trailing standalone [N]
+            # after the final sentence) — never verified, never
+            # persisted, same as before; the difference is its marker
+            # now gets stripped too instead of dangling in the answer.
+            dropped_positions.add(position)
 
     verdicts: list[Verdict] = verifier.verify_batch(verify_pairs)
 
@@ -302,13 +367,29 @@ async def post_query(
     # client-side (ARCHITECTURE.md's verify flow; API_CONTRACT.md now
     # documents this explicitly after the 2026-07-24 full-flow audit
     # found it was previously undocumented there).
-    dropped_positions: set[int] = set()
     citation_responses: list[CitationResponse] = []
     citations_to_persist: list[dict] = []
 
     retrieved_by_chunk_id = {r.chunk_id: r for r in retrieved}
 
     for position, verdict in zip(verify_positions, verdicts, strict=True):
+        if not _is_resolvable_marker(position, len(generator_chunks)):
+            # See _is_resolvable_marker's docstring — defense-in-depth,
+            # never expected to fire given the current upstream logic
+            # (verify_positions only ever contains positions that
+            # already passed the identical check above), but a citation
+            # that can't resolve to a real marker must fail the same
+            # safe way a hallucinated marker already does, not reach
+            # the DB insert at all.
+            logger.warning(
+                "post_query: dropping a citation with an unresolvable marker (%r) for user %s — "
+                "never persisted, never returned to the client",
+                position,
+                user_id,
+            )
+            dropped_positions.add(position)
+            continue
+
         chunk = generator_chunks[position - 1]
         retrieved_chunk = retrieved_by_chunk_id[chunk.chunk_id]
         claim_text = claim_spans[position]
@@ -521,22 +602,56 @@ async def _stream_query_events(
         cited_positions = set(final_result.cited_indices)
         claim_spans = _extract_claim_spans(final_result.answer, cited_positions)
 
+        # Declared here, not after verify_batch(), so BOTH loops below can
+        # add to the same set — see post_query's identical comment. Same
+        # dangling-marker fix applied identically to both paths.
+        dropped_positions: set[int] = set()
+
         verify_pairs: list[tuple[str, GeneratorChunk]] = []
         verify_positions: list[int] = []
         for position in final_result.cited_indices:
+            # Same guard as post_query — see _is_resolvable_marker's
+            # docstring. Here it's belt-and-suspenders (this whole block
+            # is already inside the outer try/except below), but kept
+            # identical to post_query's copy so the two paths can never
+            # silently drift on which citations get dropped.
+            if not _is_resolvable_marker(position, len(generator_chunks)):
+                logger.warning(
+                    "post_query_stream: dropping an unresolvable citation position (%r) for user %s before verification",
+                    position,
+                    user_id,
+                )
+                dropped_positions.add(position)
+                continue
             claim_text = claim_spans.get(position)
             if claim_text:
                 verify_pairs.append((claim_text, generator_chunks[position - 1]))
                 verify_positions.append(position)
+            else:
+                dropped_positions.add(position)
 
         verdicts: list[Verdict] = await asyncio.to_thread(verifier.verify_batch, verify_pairs)
 
-        dropped_positions: set[int] = set()
         citation_responses: list[CitationResponse] = []
         citations_to_persist: list[dict] = []
         retrieved_by_chunk_id = {r.chunk_id: r for r in retrieved}
 
         for position, verdict in zip(verify_positions, verdicts, strict=True):
+            if not _is_resolvable_marker(position, len(generator_chunks)):
+                # See _is_resolvable_marker's docstring — same
+                # defense-in-depth guard as post_query, kept identical
+                # between the streaming and non-streaming paths on
+                # purpose (the one thing that must never drift between
+                # them is which citations get dropped/kept).
+                logger.warning(
+                    "post_query_stream: dropping a citation with an unresolvable marker (%r) for user %s — "
+                    "never persisted, never returned to the client",
+                    position,
+                    user_id,
+                )
+                dropped_positions.add(position)
+                continue
+
             chunk = generator_chunks[position - 1]
             retrieved_chunk = retrieved_by_chunk_id[chunk.chunk_id]
             claim_text = claim_spans[position]

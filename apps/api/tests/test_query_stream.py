@@ -326,3 +326,64 @@ def test_stream_verification_failure_emits_error_and_stops(app_client, admin, us
     assert error_data["code"] == "VERIFY_FAILED"
     assert "citations-resolved" not in event_names
     assert "done" not in event_names
+
+
+# --- Regression: real production incident, 2026-07-31 ----------------------
+#
+# The real incident this project hit was specifically on THIS endpoint
+# (POST /query/stream, a broad "summarize the provided paper" request) —
+# see test_query.py's mirrored non-streaming version for the full
+# incident writeup. Streaming and non-streaming share the identical
+# _is_resolvable_marker guard and identical SQL-level defense
+# (migrations/20260731_002_citation_persistence_defensive.sql) — this
+# test exists specifically because streaming is where it was actually
+# observed, not assumed safe by analogy to the non-streaming test alone.
+def test_stream_unresolvable_citation_position_is_dropped_turn_still_persists(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id = _ingest_doc_with_content(app_client, admin, user_id, token, "paper.pdf", "A paper about a new method.")
+    chunk_row = _real_chunk_row(admin, document_id)
+
+    final = GenerateStreamResult(
+        answer=(
+            "This paper broadly demonstrates a new method for solving X [1]. "
+            "It also builds on findings from an earlier section of the same work [7]."
+        ),
+        cited_indices=[1, 7],  # only 1 chunk was ever retrieved — 7 is unresolvable
+        hallucinated_markers=[],
+        model="gemini-3.6-flash", input_tokens=100, output_tokens=20, latency_ms=500.0,
+    )
+    _override(
+        retriever=FakeRetriever([_retrieved_chunk(document_id, chunk_row)]),
+        generator=FakeStreamingGenerator(["This paper broadly demonstrates a new method for solving X [1]. "], final),
+        verifier=type(
+            "V", (), {"verify_batch": staticmethod(lambda pairs: [_verdict(VerdictLabel.SUPPORTED, "demonstrates a new method")])}
+        )(),
+    )
+
+    with app_client.stream(
+        "POST", "/query/stream", json={"question": "Summarize the provided paper.", "document_ids": [document_id]},
+        headers={"Authorization": f"Bearer {token}"},
+    ) as response:
+        assert response.status_code == 200
+        events = _parse_sse(response)
+
+    event_names = [name for name, _ in events]
+    # No crash, no error event — resolves cleanly through to done, exactly
+    # like a normal successful turn.
+    assert event_names == ["retrieving", "token", "verifying", "citations-resolved", "done"]
+
+    resolved_data = dict(events)["citations-resolved"]
+    assert len(resolved_data["citations"]) == 1
+    assert resolved_data["citations"][0]["marker"] == 1
+    assert resolved_data["citations"][0]["chunk_id"] == chunk_row["id"]
+    assert all(c["marker"] != 7 for c in resolved_data["citations"])
+    assert "[7]" not in resolved_data["answer"], "dangling marker must be stripped, not left with no matching citation"
+
+    message_id = resolved_data["message_id"]
+    conversation_id = resolved_data["conversation_id"]
+    messages = admin.table("messages").select("*").eq("conversation_id", conversation_id).execute().data
+    assert len(messages) == 2, "both messages must persist even though one citation was unresolvable"
+
+    saved_citations = admin.table("citations").select("*").eq("message_id", message_id).execute().data
+    assert len(saved_citations) == 1
+    assert saved_citations[0]["marker"] == 1
