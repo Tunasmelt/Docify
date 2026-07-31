@@ -236,7 +236,7 @@ export default function ChatPage({ params }: { params: { conversation_id: string
   const headerTitle = title ?? messages.find((m) => m.role === "user")?.text ?? "New conversation";
 
   return (
-    <div className="grid h-screen grid-cols-1 overflow-hidden bg-bg text-ink md:grid-cols-[248px_1fr]">
+    <div className="grid h-screen grid-cols-1 grid-rows-[minmax(0,1fr)] overflow-hidden bg-bg text-ink md:grid-cols-[248px_1fr]">
       <Sidebar
         librarySection={librarySection}
         user={USER}
