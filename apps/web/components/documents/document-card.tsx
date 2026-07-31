@@ -1,8 +1,9 @@
 "use client";
 
-import { Check, Trash2 } from "lucide-react";
+import { Trash2 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
+import { Checkbox } from "@/components/ui/checkbox";
 import { DOCUMENT_STATUS_STYLES, type DocumentStatus } from "@/lib/status-styles";
 
 export interface DocumentCardData {
@@ -35,16 +36,12 @@ export function DocumentCard({ doc, onDelete, selected, onToggleSelect }: Docume
     <div className="flex items-center gap-4 border-b border-line px-[18px] py-3.5 last:border-b-0 hover:bg-panel-hover">
       {onToggleSelect ? (
         selectable ? (
-          <button
-            type="button"
+          <Checkbox
             title="Select for a conversation"
-            onClick={() => onToggleSelect(doc.id)}
-            className={`flex h-[18px] w-[18px] flex-shrink-0 items-center justify-center rounded border ${
-              selected ? "border-accent bg-accent text-on-accent" : "border-border bg-transparent"
-            }`}
-          >
-            {selected ? <Check size={11} strokeWidth={3} /> : null}
-          </button>
+            checked={selected}
+            onCheckedChange={() => onToggleSelect(doc.id)}
+            className="flex-shrink-0"
+          />
         ) : (
           <div className="h-[18px] w-[18px] flex-shrink-0" />
         )
