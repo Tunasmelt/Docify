@@ -4,7 +4,7 @@ import logging
 import re
 import time
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from db import queries
@@ -198,10 +198,21 @@ def _load_history(client, payload: QueryRequest, user_id: str) -> tuple[list[dic
 async def post_query(
     payload: QueryRequest,
     request: Request,
+    response: Response,
     retriever: Retriever = Depends(get_retriever),
     generator: Generator = Depends(get_generator),
     verifier: Verifier = Depends(get_verifier),
 ):
+    # `response` is never touched directly below — same reason as
+    # routes/ingest.py's post_ingest: this route returns a plain
+    # QueryResponse Pydantic model (via response_model=), not a raw
+    # Response, so @limiter.limit(...)/shared_limit(...) below has
+    # nothing to attach its rate-limit headers to without this
+    # parameter. Confirmed live (2026-07-30) — post_query_stream does
+    # NOT need this fix, since every path it returns (JSONResponse for
+    # validation/ownership errors, StreamingResponse for the real
+    # success path) is already a real Response instance.
+    #
     # request.state.user_id (FEAT-003, JWT-verified) is THE tenant
     # boundary for this entire endpoint — the 2026-07-24 full-flow audit
     # (item 1) found Generator/Verifier have no user_id concept at all

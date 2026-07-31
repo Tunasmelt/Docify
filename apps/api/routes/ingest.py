@@ -3,7 +3,7 @@ import posixpath
 import re
 from io import BytesIO
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Request, Response
 from fastapi.responses import JSONResponse
 
 from db import queries
@@ -206,9 +206,23 @@ def get_pipeline_runner():
 async def post_ingest(
     payload: IngestRequest,
     request: Request,
+    response: Response,
     background_tasks: BackgroundTasks,
     pipeline_runner=Depends(get_pipeline_runner),
 ):
+    # `response` is never touched directly below — it exists purely so
+    # FastAPI injects an empty Response object for @limiter.limit(...) to
+    # attach its X-RateLimit-*/Retry-After headers to. This route returns
+    # a plain IngestResponse Pydantic model (via response_model=), not a
+    # raw Response, so slowapi has nothing to inject headers into without
+    # this parameter — confirmed live (2026-07-30): a real successful
+    # /ingest call 500'd with "parameter `response` must be an instance
+    # of starlette.responses.Response" until this was added. Caught by
+    # actually running a real ingest against a live server with the
+    # limiter enabled — every existing test ran with the limiter
+    # disabled (conftest.py) or only exercised error paths that already
+    # return a real Response (403/422/429), so this gap was invisible to
+    # the test suite until now.
     user_id = request.state.user_id
 
     # storage_path validated before anything else is created — per

@@ -24,6 +24,11 @@ import pytest
 from main import app
 from routes.ingest import INGEST_MINUTE_LIMIT
 from routes.query import QUERY_MINUTE_LIMIT
+from services.generator import GenerateResult, GenerateStreamResult
+from services.retriever import RetrievedChunk
+from services.verifier import VerdictLabel
+from tests.conftest import override_pipeline, clear_pipeline_override, ingest_real_document, upload_placeholder
+from tests.test_query import FakeGenerator, FakeRetriever, _clear_overrides, _override, _real_chunk_row, _verdict
 
 NIL_UUID = "00000000-0000-0000-0000-000000000000"
 
@@ -236,3 +241,118 @@ def test_ingest_rate_limit_window_resets_after_real_time_passes(app_client, admi
 
     recovered = _ingest_request(app_client, token)
     assert recovered.status_code == 403, f"expected the window to have reset (403, not 429) after 65s, got {recovered.status_code}: {recovered.text}"
+
+
+# --- Regression: the real SUCCESS path with the limiter enabled --------
+#
+# Every test above deliberately triggers the limiter via a request that
+# gets rejected downstream (403) so it never needs the real pipeline —
+# which meant NOTHING in this file ever exercised a genuine 200/202
+# response with the limiter enabled. That gap let a real, production-
+# breaking bug through: slowapi's headers_enabled=True requires any
+# route returning a plain Pydantic model (via response_model=, not a
+# raw Response) to also declare a `response: Response` parameter for
+# FastAPI to inject — without it, a real successful call 500s with
+# "parameter `response` must be an instance of starlette.responses.
+# Response" the moment slowapi tries to attach rate-limit headers to a
+# non-Response return value. Found live (2026-07-30) running a real
+# /ingest call against a live server with the limiter enabled — not by
+# reading slowapi's docs. These tests exercise exactly that path so it
+# can never regress silently again.
+
+
+def test_ingest_success_path_with_limiter_enabled_returns_202_not_500(app_client, admin, user_a):
+    user_id, token = user_a
+    storage_path = upload_placeholder(user_id, token, filename="real.pdf")
+    override_pipeline()
+    try:
+        resp = app_client.post(
+            "/ingest",
+            json={"storage_path": storage_path, "filename": "real.pdf", "mime_type": "application/pdf", "size_bytes": 17},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    finally:
+        clear_pipeline_override()
+
+    assert resp.status_code == 202, f"real success path must return 202, not 500: {resp.status_code} {resp.text}"
+    body = resp.json()
+    assert "document_id" in body
+    # headers_enabled=True must produce real headers on a SUCCESSFUL
+    # response too, not just on a 429 (rate_limit.py's own comment) —
+    # confirmed here since this is the response path that broke.
+    assert any(h.lower() == "x-ratelimit-limit" for h in resp.headers), f"missing X-RateLimit-* headers on a real success response: {dict(resp.headers)}"
+
+
+def test_query_success_path_with_limiter_enabled_returns_200_not_500(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id = ingest_real_document(app_client, user_id, token, filename="doc.pdf", chunks=None, elements=None)
+    chunk_row = _real_chunk_row(admin, document_id)
+
+    retrieved = [
+        RetrievedChunk(
+            chunk_id=chunk_row["id"], content=chunk_row["content"], page=1, document_id=document_id,
+            document_name="doc.pdf", document_mime_type="application/pdf", element_type="text", score=0.9,
+        )
+    ]
+    gen_result = GenerateResult(
+        answer="Revenue grew 12% [1].", cited_indices=[1], hallucinated_markers=[],
+        model="gemini-3.6-flash", input_tokens=100, output_tokens=20, latency_ms=500.0,
+    )
+    _override(
+        retriever=FakeRetriever(retrieved),
+        generator=FakeGenerator(gen_result),
+        verifier=type("V", (), {"verify_batch": staticmethod(lambda pairs: [_verdict(VerdictLabel.SUPPORTED) for _ in pairs])})(),
+    )
+    try:
+        resp = app_client.post(
+            "/query",
+            json={"question": "What was revenue growth?", "document_ids": [document_id]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    finally:
+        _clear_overrides()
+
+    assert resp.status_code == 200, f"real success path must return 200, not 500: {resp.status_code} {resp.text}"
+    assert resp.json()["answer"] == "Revenue grew 12% [1]."
+    assert any(h.lower() == "x-ratelimit-limit" for h in resp.headers), f"missing X-RateLimit-* headers on a real success response: {dict(resp.headers)}"
+
+
+def test_query_stream_success_path_with_limiter_enabled_streams_correctly(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id = ingest_real_document(app_client, user_id, token, filename="doc.pdf", chunks=None, elements=None)
+    chunk_row = _real_chunk_row(admin, document_id)
+
+    retrieved = [
+        RetrievedChunk(
+            chunk_id=chunk_row["id"], content=chunk_row["content"], page=1, document_id=document_id,
+            document_name="doc.pdf", document_mime_type="application/pdf", element_type="text", score=0.9,
+        )
+    ]
+
+    class FakeStreamingGenerator:
+        async def generate_stream(self, question, chunks, history=None):
+            yield "Revenue grew 12% [1]."
+            yield GenerateStreamResult(
+                answer="Revenue grew 12% [1].", cited_indices=[1], hallucinated_markers=[],
+                model="gemini-3.6-flash", input_tokens=100, output_tokens=20, latency_ms=500.0,
+            )
+
+    _override(
+        retriever=FakeRetriever(retrieved),
+        generator=FakeStreamingGenerator(),
+        verifier=type("V", (), {"verify_batch": staticmethod(lambda pairs: [_verdict(VerdictLabel.SUPPORTED) for _ in pairs])})(),
+    )
+    try:
+        with app_client.stream(
+            "POST",
+            "/query/stream",
+            json={"question": "What was revenue growth?", "document_ids": [document_id]},
+            headers={"Authorization": f"Bearer {token}"},
+        ) as resp:
+            assert resp.status_code == 200, f"real success path must return 200, not 500: {resp.status_code}"
+            assert "text/event-stream" in resp.headers.get("content-type", "")
+            body = resp.read()
+    finally:
+        _clear_overrides()
+
+    assert b"done" in body, f"expected a real done event in the stream, got: {body!r}"
