@@ -42,12 +42,25 @@ class FakeQueryEmbedder:
     """Returns a fixed, caller-controlled vector regardless of the query
     text — these tests are about retrieval mechanics, not semantic
     quality, so the actual embedding content doesn't matter, only that
-    it's precisely controllable."""
+    it's precisely controllable.
 
-    def __init__(self, vector):
+    vectors_by_provider (2026-07-31): most tests only care about a single
+    provider and pass `vector=` for backward compatibility (returned
+    regardless of which provider is requested). Mixed-provider tests pass
+    `vectors_by_provider={"voyage": ..., "gemini": ...}` instead, so each
+    provider's query gets its own controllable vector. `calls` records
+    every (text, provider) pair for cost/scope-guard assertions — e.g.
+    confirming a provider with no chunks in scope never gets queried."""
+
+    def __init__(self, vector=None, vectors_by_provider=None):
         self._vector = vector
+        self._vectors_by_provider = vectors_by_provider
+        self.calls = []
 
-    def embed_query(self, text: str):
+    def embed_query(self, text: str, *, provider: str = "voyage"):
+        self.calls.append((text, provider))
+        if self._vectors_by_provider is not None:
+            return self._vectors_by_provider[provider]
         return self._vector
 
 
@@ -135,6 +148,7 @@ def _insert_chunk(
     embedding: list[float],
     page_number: int = 1,
     element_type: str = "text",
+    embedding_provider: str = "voyage",
 ) -> str:
     return (
         admin.table("chunks")
@@ -147,6 +161,7 @@ def _insert_chunk(
                 "page_number": page_number,
                 "content": content,
                 "embedding": embedding,
+                "embedding_provider": embedding_provider,
             }
         )
         .execute()
@@ -175,7 +190,7 @@ def test_merges_via_reciprocal_rank_fusion_k_60_default():
         {"id": "balanced", "content": "f2"},
     ]
 
-    fused = _reciprocal_rank_fusion(vector_results, fts_results, rrf_k=60)
+    fused = _reciprocal_rank_fusion([vector_results, fts_results], rrf_k=60)
     fused_ids = [row["id"] for row, _score in fused]
 
     assert fused_ids[0] == "balanced"
@@ -196,11 +211,28 @@ def test_reciprocal_rank_fusion_handles_a_chunk_found_by_only_one_method():
     vector_results = []
     fts_results = [{"id": "fts-only", "content": "x"}]
 
-    fused = _reciprocal_rank_fusion(vector_results, fts_results, rrf_k=60)
+    fused = _reciprocal_rank_fusion([vector_results, fts_results], rrf_k=60)
 
     assert len(fused) == 1
     assert fused[0][0]["id"] == "fts-only"
     assert fused[0][1] == pytest.approx(1 / 61)
+
+
+def test_reciprocal_rank_fusion_handles_more_than_two_ranked_lists():
+    # Mixed-provider support (2026-07-31): N independent vector rankings
+    # (one per embedding_provider) plus FTS, not a fixed vector+FTS pair.
+    # A chunk found by 2 of 3 lists must outscore one found by only 1.
+    voyage_results = [{"id": "in-two", "content": "a"}]
+    gemini_results = [{"id": "in-two", "content": "a"}, {"id": "gemini-only", "content": "b"}]
+    fts_results = [{"id": "fts-only", "content": "c"}]
+
+    fused = _reciprocal_rank_fusion([voyage_results, gemini_results, fts_results], rrf_k=60)
+    fused_ids = [row["id"] for row, _score in fused]
+
+    assert fused_ids[0] == "in-two"
+    assert set(fused_ids[1:]) == {"gemini-only", "fts-only"}
+    expected_in_two_score = 1 / 61 + 1 / 61  # rank 1 in both voyage_results and gemini_results
+    assert fused[0][1] == pytest.approx(expected_in_two_score)
 
 
 # Acceptance criterion: `Retriever.retrieve(question, document_ids, user_id, k) -> list[Chunk]`
@@ -347,10 +379,18 @@ def test_document_mime_type_round_trips_a_real_non_pdf_value(admin, user_a):
 
 # Acceptance criterion: user_id is included in every SQL WHERE clause explicitly
 def test_user_id_is_included_in_every_sql_where_clause_explicitly(admin, user_a):
-    """Direct check that both RPC calls actually pass match_user_id —
+    """Direct check that every RPC call actually passes match_user_id —
     complements (not replaces) the full behavioral isolation test below,
     since that's the only way to observe *why* isolation holds rather
-    than just that it does."""
+    than just that it does.
+
+    Expects 3 calls, not 2 (pre-2026-07-31 shape): distinct_embedding_
+    providers (retriever's own cost-guard lookup, run before deciding
+    which query-embed/vector-search calls to make) plus one
+    match_chunks_by_vector and one match_chunks_by_fts — this document
+    has no chunks yet, so distinct_embedding_providers correctly finds
+    nothing and the {"voyage"} default kicks in for exactly one vector
+    search."""
     user_id, _token = user_a
     document_id = _create_document(admin, user_id, "param-check.pdf")
 
@@ -369,7 +409,8 @@ def test_user_id_is_included_in_every_sql_where_clause_explicitly(admin, user_a)
     finally:
         admin.rpc = original_rpc
 
-    assert len(captured_params) == 2
+    func_names = [func_name for func_name, _params in captured_params]
+    assert sorted(func_names) == ["distinct_embedding_providers", "match_chunks_by_fts", "match_chunks_by_vector"]
     for func_name, params in captured_params:
         assert params["match_user_id"] == user_id, f"{func_name} call did not receive match_user_id"
         assert params["match_document_ids"] == [document_id], f"{func_name} call did not receive match_document_ids"
@@ -449,7 +490,165 @@ def test_document_ids_scoping_excludes_the_same_users_other_documents(admin, use
     assert results[0].chunk_id == included_chunk_id
 
 
+# --- Mixed-provider retrieval (2026-07-31, Voyage-fallback task item 4) ----
+#
+# HIGH SCRUTINY (task brief): structural proof (fast, local Postgres, fake
+# query embedder — no real network) that the mechanism itself is right:
+# distinct_embedding_providers finds the right providers, each gets its
+# own vector search partition, RRF merges everything, and a provider with
+# no chunks in scope never gets queried at all. See
+# test_real_mixed_provider_retrieval_surfaces_chunks_from_either_provider
+# below (Part 2) for the real, non-mocked proof this actually works
+# end-to-end against genuine Voyage/Gemini embeddings.
+
+
+def test_retrieval_scope_with_only_voyage_chunks_never_queries_gemini(admin, user_a):
+    """Cost/scope guard at the retriever level (task item 4: 'skip
+    Gemini's query-embed call entirely if no Gemini-tagged chunks are in
+    scope'). A scope containing only voyage-tagged chunks must produce
+    exactly one embed_query call, for provider="voyage" — never a
+    speculative "just in case" call for gemini."""
+    user_id, _token = user_a
+    document_id = _create_document(admin, user_id, "voyage-only.pdf")
+    _insert_chunk(
+        admin,
+        document_id=document_id,
+        user_id=user_id,
+        chunk_index=0,
+        content="some retrievable content",
+        embedding=_vector_along_dimension(0),
+        embedding_provider="voyage",
+    )
+
+    fake_embedder = FakeQueryEmbedder(_vector_along_dimension(0))
+    retriever = Retriever(client=admin, embedder=fake_embedder)
+    retriever.retrieve("some question", [document_id], user_id, k=5)
+
+    assert fake_embedder.calls == [("some question", "voyage")]
+
+
+def test_mixed_provider_scope_fuses_chunks_from_both_providers(admin, user_a):
+    """The core structural proof: a scope with BOTH a voyage-tagged chunk
+    and a gemini-tagged chunk runs two independent vector searches (one
+    per provider's own embedding space) and RRF-merges both into one
+    result set — a query that matches the gemini-space chunk best must
+    still surface it, even though its raw distance was never compared to
+    the voyage-space chunk's distance (only ranks were fused)."""
+    user_id, _token = user_a
+    document_id = _create_document(admin, user_id, "mixed-provider.pdf")
+
+    voyage_vector = _vector_along_dimension(0)
+    gemini_vector = _vector_along_dimension(1)
+    voyage_chunk_id = _insert_chunk(
+        admin,
+        document_id=document_id,
+        user_id=user_id,
+        chunk_index=0,
+        content="voyage-embedded content",
+        embedding=voyage_vector,
+        embedding_provider="voyage",
+    )
+    gemini_chunk_id = _insert_chunk(
+        admin,
+        document_id=document_id,
+        user_id=user_id,
+        chunk_index=1,
+        content="gemini-embedded content",
+        embedding=gemini_vector,
+        embedding_provider="gemini",
+    )
+
+    # The query vector matches BOTH chunks perfectly in their respective
+    # (fake, orthogonal-by-construction) spaces — proves both partitions
+    # are searched and merged, not just whichever provider happens to be
+    # tried first.
+    fake_embedder = FakeQueryEmbedder(vectors_by_provider={"voyage": voyage_vector, "gemini": gemini_vector})
+    retriever = Retriever(client=admin, embedder=fake_embedder)
+    results = retriever.retrieve("question matching either chunk", [document_id], user_id, k=10)
+
+    result_ids = {r.chunk_id for r in results}
+    assert result_ids == {voyage_chunk_id, gemini_chunk_id}
+    assert sorted(provider for _text, provider in fake_embedder.calls) == ["gemini", "voyage"]
+
+
+def test_mixed_provider_scope_a_query_only_matching_the_gemini_chunk_still_surfaces_it(admin, user_a):
+    """Sharper version of the fusion proof above: the voyage-space chunk
+    is embedded ORTHOGONALLY to the query in voyage space (irrelevant),
+    while the gemini-space chunk is embedded PARALLEL to the query in
+    gemini space (highly relevant) — if cross-provider comparison were
+    happening anywhere, or if the gemini partition were silently dropped,
+    the gemini chunk would fail to rank well. It must still come back
+    top-ranked based purely on its own partition's real cosine distance."""
+    user_id, _token = user_a
+    document_id = _create_document(admin, user_id, "mixed-provider-precision.pdf")
+
+    _insert_chunk(
+        admin,
+        document_id=document_id,
+        user_id=user_id,
+        chunk_index=0,
+        content="irrelevant voyage-embedded filler",
+        embedding=_vector_along_dimension(5),  # orthogonal to the voyage query vector below
+        embedding_provider="voyage",
+    )
+    gemini_chunk_id = _insert_chunk(
+        admin,
+        document_id=document_id,
+        user_id=user_id,
+        chunk_index=1,
+        content="the actually relevant gemini-embedded content",
+        embedding=_vector_along_dimension(0),
+        embedding_provider="gemini",
+    )
+
+    fake_embedder = FakeQueryEmbedder(
+        vectors_by_provider={
+            "voyage": _vector_along_dimension(0),  # orthogonal to the stored voyage chunk -> poor match
+            "gemini": _vector_along_dimension(0),  # parallel to the stored gemini chunk -> best match
+        }
+    )
+    retriever = Retriever(client=admin, embedder=fake_embedder)
+    results = retriever.retrieve("question", [document_id], user_id, k=1)
+
+    assert len(results) == 1
+    assert results[0].chunk_id == gemini_chunk_id
+
+
 # --- Reranking (FEAT-009 follow-up): Reranker unit tests --------------------
+
+
+# Task item 6: confirm explicitly, not assumed, that reranking is
+# provider-agnostic. Reranker.rerank() only ever reads row["content"]
+# (services/retriever.py) — it never looks at embedding_provider at all,
+# so a candidate pool mixing voyage- and gemini-tagged rows should rerank
+# purely on real Voyage relevance-to-content, with no special handling
+# needed or present. This test proves it by construction: the two
+# candidate rows carry different embedding_provider values, and the fake
+# rerank client's response order is the only thing that determines the
+# result — if provider tagging leaked into reranking somehow, this
+# specific assertion (result order == Voyage's stated order, regardless
+# of which provider embedded which row) would catch it.
+def test_reranker_is_provider_agnostic_reranks_mixed_provider_candidates_by_content_alone():
+    voyage_row = {"id": "v1", "content": "voyage-embedded alpha", "embedding_provider": "voyage"}
+    gemini_row = {"id": "g1", "content": "gemini-embedded beta", "embedding_provider": "gemini"}
+    candidates = [(voyage_row, 0.01), (gemini_row, 0.01)]  # tied RRF scores — only rerank can break the tie
+
+    fake_client = _FakeVoyageRerankClient(
+        response=_FakeRerankResponse(
+            [
+                _FakeRerankResult(index=1, relevance_score=0.95),  # gemini_row wins on real relevance
+                _FakeRerankResult(index=0, relevance_score=0.2),
+            ]
+        )
+    )
+    reranker = Reranker(client=fake_client)
+
+    result = reranker.rerank("a question about beta", candidates, k=2)
+
+    assert result == [(gemini_row, 0.95), (voyage_row, 0.2)]
+    # Confirms what was actually sent to Voyage: real content strings
+    # only, no provider field or other metadata leaking into the request.
+    assert fake_client.calls[0]["documents"] == ["voyage-embedded alpha", "gemini-embedded beta"]
 
 
 def test_reranker_maps_relevance_scores_back_to_original_rows_in_returned_order():
@@ -686,11 +885,11 @@ def test_retrieval_quality_against_real_table_heavy_pdf(admin, user_a):
     parsed = Parser().parse(pdf_bytes)
     chunks = Chunker().chunk(parsed)
     embedder = Embedder()
-    vectors = embedder.embed(chunks)
+    embedded_chunks = embedder.embed(chunks)
 
     document_id = _create_document(admin, user_id, "table_heavy.pdf")
     rows = []
-    for chunk, vector in zip(chunks, vectors, strict=True):
+    for chunk, embedded in zip(chunks, embedded_chunks, strict=True):
         rows.append(
             {
                 "document_id": document_id,
@@ -699,7 +898,8 @@ def test_retrieval_quality_against_real_table_heavy_pdf(admin, user_a):
                 "element_type": chunk.element_type.value,
                 "page_number": min(chunk.page_numbers),
                 "content": chunk.content,
-                "embedding": vector,
+                "embedding": embedded.vector,
+                "embedding_provider": embedded.provider,
             }
         )
     admin.table("chunks").insert(rows).execute()
@@ -782,11 +982,11 @@ def test_reranking_effect_on_real_table_heavy_pdf_quality_questions(admin, user_
     parsed = Parser().parse(pdf_bytes)
     chunks = Chunker().chunk(parsed)
     embedder = Embedder()
-    vectors = embedder.embed(chunks)
+    embedded_chunks = embedder.embed(chunks)
 
     document_id = _create_document(admin, user_id, "table_heavy_rerank.pdf")
     rows = []
-    for chunk, vector in zip(chunks, vectors, strict=True):
+    for chunk, embedded in zip(chunks, embedded_chunks, strict=True):
         rows.append(
             {
                 "document_id": document_id,
@@ -795,7 +995,8 @@ def test_reranking_effect_on_real_table_heavy_pdf_quality_questions(admin, user_
                 "element_type": chunk.element_type.value,
                 "page_number": min(chunk.page_numbers),
                 "content": chunk.content,
-                "embedding": vector,
+                "embedding": embedded.vector,
+                "embedding_provider": embedded.provider,
             }
         )
     admin.table("chunks").insert(rows).execute()
@@ -826,9 +1027,9 @@ def test_reranking_effect_on_real_table_heavy_pdf_quality_questions(admin, user_
 
         query_vector = retriever._embedder.embed_query(spec["question"])
         pool_size = _candidate_pool_size(k)
-        vector_results = retriever._vector_search(query_vector, [document_id], user_id, pool_size)
+        vector_results = retriever._vector_search(query_vector, [document_id], user_id, pool_size, "voyage")
         fts_results = retriever._fts_search(spec["question"], [document_id], user_id, pool_size)
-        fused = _reciprocal_rank_fusion(vector_results, fts_results, rrf_k=RRF_K)
+        fused = _reciprocal_rank_fusion([vector_results, fts_results], rrf_k=RRF_K)
 
         def rank_of_expected(rows_with_scores, substring=spec["expect_substring"]):
             return next(
@@ -884,3 +1085,109 @@ def test_reranking_effect_on_real_table_heavy_pdf_quality_questions(admin, user_
 
     admin.table("chunks").delete().eq("document_id", document_id).execute()
     admin.table("documents").delete().eq("id", document_id).execute()
+
+
+# --- Real mixed-provider retrieval (2026-07-31, Voyage-fallback task item 5) -
+#
+# THE test the task brief calls out by name as mandatory before this
+# feature can be marked complete: real embeddings from BOTH Voyage and
+# Gemini in the same scope, a real question per chunk, confirming the
+# expected chunk from EITHER provider surfaces in the merged top-k — not
+# just that the code runs without erroring, but that mixed-provider RRF
+# fusion genuinely finds the right content in each provider's own space.
+#
+# Real API calls, real quota on both accounts: 1 real Voyage document
+# embed + 2 real Voyage query embeds (one per question, since both
+# questions run against a scope containing a voyage-tagged chunk) = 3
+# Voyage calls total, paced with the same 25s margin
+# test_retrieval_quality_against_real_table_heavy_pdf already established
+# empirically holds against this account's real 3 RPM ceiling. Gemini's
+# free tier is far less constrained (100 RPM, .agent/api-docs/gemini.md)
+# so its 1 document embed + 2 query embeds need no special pacing.
+@pytest.mark.skipif(
+    os.environ.get("RUN_MIXED_PROVIDER_TEST") != "1",
+    reason="set RUN_MIXED_PROVIDER_TEST=1 to run real mixed Voyage+Gemini retrieval checks (slow, uses both providers' quota)",
+)
+def test_real_mixed_provider_retrieval_surfaces_chunks_from_either_provider(admin, user_a):
+    from services.chunker import Chunk, ElementType
+    from services.embedder import Embedder, _chunk_to_gemini_content, _default_gemini_client, _gemini_embed_contents
+
+    user_id, _token = user_a
+    document_id = _create_document(admin, user_id, "mixed-provider-real.pdf")
+
+    voyage_chunk = Chunk(
+        chunk_index=0,
+        element_type=ElementType.TEXT,
+        page_numbers=[1],
+        source_element_indices=[0],
+        content="The Eiffel Tower is a wrought-iron lattice tower located in Paris, France.",
+    )
+    gemini_chunk = Chunk(
+        chunk_index=1,
+        element_type=ElementType.TEXT,
+        page_numbers=[1],
+        source_element_indices=[1],
+        content="Mount Everest, on the border of Nepal and Tibet, is the tallest mountain on Earth above sea level.",
+    )
+
+    embedder = Embedder()
+    voyage_embedded = embedder.embed([voyage_chunk])
+    assert voyage_embedded[0].provider == "voyage"
+
+    gemini_client = _default_gemini_client()
+    gemini_vector = _gemini_embed_contents(
+        gemini_client, [_chunk_to_gemini_content(gemini_chunk)], task_type="RETRIEVAL_DOCUMENT"
+    )[0]
+
+    voyage_chunk_id = _insert_chunk(
+        admin,
+        document_id=document_id,
+        user_id=user_id,
+        chunk_index=0,
+        content=voyage_chunk.content,
+        embedding=voyage_embedded[0].vector,
+        embedding_provider="voyage",
+    )
+    gemini_chunk_id = _insert_chunk(
+        admin,
+        document_id=document_id,
+        user_id=user_id,
+        chunk_index=1,
+        content=gemini_chunk.content,
+        embedding=gemini_vector,
+        embedding_provider="gemini",
+    )
+
+    retriever = Retriever(client=admin)  # real Embedder -> real embed_query() for both providers
+
+    print("\n" + "=" * 90)
+    print("Real mixed-provider retrieval — one voyage-tagged chunk, one gemini-tagged chunk")
+    print("=" * 90)
+
+    time.sleep(25)  # same real 3 RPM margin as the other real-quota tests in this file
+
+    questions = [
+        ("Where is the Eiffel Tower located?", voyage_chunk_id, "voyage"),
+        ("What is the tallest mountain on Earth?", gemini_chunk_id, "gemini"),
+    ]
+    all_passed = True
+    for i, (question, expected_chunk_id, expected_provider) in enumerate(questions):
+        if i > 0:
+            time.sleep(25)
+        results = retriever.retrieve(question, [document_id], user_id, k=2)
+        top_id = results[0].chunk_id if results else None
+        passed = top_id == expected_chunk_id
+        all_passed = all_passed and passed
+        print(f"\nQ: {question}")
+        print(f"   expected top-1: {expected_provider}-tagged chunk {expected_chunk_id}")
+        print(f"   actual results: {[(r.chunk_id, r.score) for r in results]}")
+        print(f"   -> {'PASS' if passed else 'FAIL'}")
+
+    print("\n" + "=" * 90)
+    print(f"Overall: {'ALL' if all_passed else 'NOT ALL'} questions surfaced their expected chunk as top-1")
+    print("=" * 90)
+
+    admin.table("chunks").delete().eq("document_id", document_id).execute()
+    admin.table("documents").delete().eq("id", document_id).execute()
+
+    assert all_passed

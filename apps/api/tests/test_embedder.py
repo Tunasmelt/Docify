@@ -97,6 +97,44 @@ class FakeVoyageClient:
         return FakeVoyageResult(vectors)
 
 
+class FakeGeminiEmbedding:
+    def __init__(self, values):
+        self.values = values
+
+
+class FakeGeminiResponse:
+    def __init__(self, embeddings):
+        self.embeddings = embeddings
+
+
+class FakeGeminiModels:
+    """Stands in for genai.Client().models — records every embed_content
+    call for fallback-wiring assertions. Returns a distinct, index-derived
+    vector per Content (same discipline as FakeVoyageClient) so tests can
+    assert real correspondence, not just count equality."""
+
+    def __init__(self, dim=1024, fail=False):
+        self.dim = dim
+        self.fail = fail
+        self.calls = []
+        self._next_id = 0
+
+    def embed_content(self, *, model, contents, config=None):
+        self.calls.append({"model": model, "contents": contents, "config": config})
+        if self.fail:
+            raise RuntimeError("simulated Gemini failure")
+        embeddings = []
+        for _ in contents:
+            embeddings.append(FakeGeminiEmbedding(values=[float(self._next_id)] * self.dim))
+            self._next_id += 1
+        return FakeGeminiResponse(embeddings)
+
+
+class FakeGeminiClient:
+    def __init__(self, dim=1024, fail=False):
+        self.models = FakeGeminiModels(dim=dim, fail=fail)
+
+
 class ShortCountVoyageClient:
     """Always returns fewer embeddings than inputs submitted — simulates
     the exact bug Codex found: no error, just a misaligned response."""
@@ -162,11 +200,12 @@ def test_returns_1024_dim_vectors():
     fake = FakeVoyageClient()
     embedder = make_embedder(fake)
 
-    vectors = embedder.embed([make_chunk(content="a"), make_chunk(content="b")])
+    embedded = embedder.embed([make_chunk(content="a"), make_chunk(content="b")])
 
-    assert len(vectors) == 2
-    for v in vectors:
-        assert len(v) == 1024
+    assert len(embedded) == 2
+    for ec in embedded:
+        assert len(ec.vector) == 1024
+        assert ec.provider == "voyage"
     assert fake.calls[0]["model"] == "voyage-multimodal-3.5"
     assert fake.calls[0]["output_dimension"] == 1024
     assert fake.calls[0]["input_type"] == "document"
@@ -191,14 +230,15 @@ def test_each_chunk_maps_to_its_own_distinct_vector():
     embedder = make_embedder(fake)
     chunks = [make_chunk(content=f"chunk number {i}", chunk_index=i) for i in range(5)]
 
-    vectors = embedder.embed(chunks)
+    embedded = embedder.embed(chunks)
 
-    assert len(vectors) == 5
+    assert len(embedded) == 5
     # FakeVoyageClient assigns strictly increasing id-derived vectors in
     # call order — every chunk's vector must be distinct from every other.
-    first_values = [v[0] for v in vectors]
+    first_values = [ec.vector[0] for ec in embedded]
     assert len(set(first_values)) == 5, "expected 5 distinct vectors, got duplicates/collisions"
     assert first_values == sorted(first_values), "vector order must match input chunk order"
+    assert all(ec.provider == "voyage" for ec in embedded)
 
 
 # Acceptance criterion: Batches API calls (verified real limit: 1,000 inputs / ~320,000 tokens per call, not the earlier unverified 128 guess)
@@ -230,12 +270,12 @@ def test_batching_preserves_order_and_uses_multiple_calls():
     embedder = make_embedder(fake)
     chunks = [make_chunk(content=f"chunk-{i}", chunk_index=i) for i in range(MAX_INPUTS_PER_BATCH + 10)]
 
-    vectors = embedder.embed(chunks)
+    embedded = embedder.embed(chunks)
 
-    assert len(vectors) == len(chunks)
+    assert len(embedded) == len(chunks)
     assert len(fake.calls) == 2  # confirms multiple batches actually dispatched as separate calls
     # Correspondence holds across batch boundaries too, not just within one.
-    first_values = [v[0] for v in vectors]
+    first_values = [ec.vector[0] for ec in embedded]
     assert first_values == sorted(first_values)
     assert len(set(first_values)) == len(chunks)
 
@@ -299,7 +339,13 @@ def test_retries_on_rate_limit_then_succeeds():
     assert call_count == 3  # 2 failures + 1 success, all within the SDK's own retry loop
 
 
-def test_retries_exhausted_raises_embed_error():
+def test_retries_exhausted_raises_embed_error_when_gemini_fallback_also_fails():
+    # Gemini fallback deliberately also fails here (FakeGeminiClient(fail=True))
+    # so this test stays fast/deterministic (no real network to either
+    # provider) while still proving the real end state: with BOTH
+    # providers exhausted, embed() raises EmbedError, not a silent partial
+    # result. See test_falls_back_to_gemini_when_voyage_retries_exhausted
+    # below for the case where the Gemini fallback succeeds.
     call_count = 0
 
     def always_rate_limited(*args, **kwargs):
@@ -308,13 +354,15 @@ def test_retries_exhausted_raises_embed_error():
         raise RateLimitError("simulated 429, never recovers")
 
     real_client = voyageai.Client(api_key="dummy-key-never-sent", max_retries=3)
-    embedder = Embedder(client=real_client, tokenizer=FakeTokenizer())
+    fake_gemini = FakeGeminiClient(fail=True)
+    embedder = Embedder(client=real_client, tokenizer=FakeTokenizer(), gemini_client=fake_gemini)
 
     with patch("voyageai.MultimodalEmbedding.create", side_effect=always_rate_limited):
         with pytest.raises(EmbedError):
             embedder.embed([make_chunk(content="hello")])
 
     assert call_count == 3  # confirms max_retries=3 was honored, not more and not fewer
+    assert len(fake_gemini.models.calls) == 1  # fallback was attempted exactly once for this batch
 
 
 # Acceptance criterion: Raises `EmbedError` on non-transient failures
@@ -343,6 +391,127 @@ def test_invalid_request_raises_embed_error():
     with patch("voyageai.MultimodalEmbedding.create", side_effect=InvalidRequestError("bad request")):
         with pytest.raises(EmbedError):
             embedder.embed([make_chunk(content="hello")])
+
+
+# --- Gemini fallback (2026-07-31, EmbedError-on-batch fallback) ------------
+#
+# HIGH SCRUTINY (task brief): unlike FEAT-017's OCR tiers (interchangeable
+# string output regardless of which tier produced it), a bug here could
+# silently corrupt retrieval quality by mixing incomparable embedding
+# spaces. These tests exist specifically to prove the fallback is
+# genuinely last-resort — never triggered on a healthy Voyage call, never
+# triggered on a non-retryable Voyage failure, only on a real exhausted
+# transient failure — and that every fallback vector is tagged
+# provider="gemini" so nothing downstream can mistake it for Voyage's
+# space.
+
+
+def test_falls_back_to_gemini_when_voyage_retries_exhausted():
+    call_count = 0
+
+    def always_rate_limited(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise RateLimitError("simulated 429, never recovers")
+
+    real_client = voyageai.Client(api_key="dummy-key-never-sent", max_retries=3)
+    fake_gemini = FakeGeminiClient()
+    embedder = Embedder(client=real_client, tokenizer=FakeTokenizer(), gemini_client=fake_gemini)
+
+    with patch("voyageai.MultimodalEmbedding.create", side_effect=always_rate_limited):
+        embedded = embedder.embed([make_chunk(content="hello"), make_chunk(content="world", chunk_index=1)])
+
+    assert call_count == 3  # Voyage's own retries genuinely ran to exhaustion first
+    assert len(fake_gemini.models.calls) == 1  # exactly one fallback call for this one batch
+    assert len(embedded) == 2
+    assert all(ec.provider == "gemini" for ec in embedded)
+    assert all(len(ec.vector) == 1024 for ec in embedded)
+    call = fake_gemini.models.calls[0]
+    assert call["model"] == "gemini-embedding-2"
+    assert call["config"]["task_type"] == "RETRIEVAL_DOCUMENT"
+    assert call["config"]["output_dimensionality"] == 1024
+
+
+def test_gemini_fallback_never_triggers_on_a_healthy_voyage_batch():
+    """Cost/scope guard: the fallback must be zero-cost when Voyage simply
+    works. A fake Gemini client is injected specifically so that ANY call
+    to it would be caught here — if this assertion ever starts failing,
+    the fallback has become opportunistic, not last-resort."""
+    fake_voyage = FakeVoyageClient()
+    fake_gemini = FakeGeminiClient()
+    embedder = Embedder(client=fake_voyage, tokenizer=FakeTokenizer(), gemini_client=fake_gemini)
+
+    embedded = embedder.embed([make_chunk(content="a"), make_chunk(content="b")])
+
+    assert len(fake_gemini.models.calls) == 0
+    assert all(ec.provider == "voyage" for ec in embedded)
+
+
+def test_gemini_fallback_never_triggers_on_a_non_retryable_voyage_failure():
+    """AuthenticationError/InvalidRequestError are configuration errors,
+    not a capacity problem — falling back would silently mask a broken
+    Voyage integration behind Gemini instead of surfacing it loudly. A
+    fake Gemini client is injected so this is a real assertion, not just
+    absence-of-crash: if the fallback were ever mistakenly widened to
+    catch all VoyageError, this test would catch it."""
+    fake_gemini = FakeGeminiClient()
+    real_client = voyageai.Client(api_key="dummy-key-never-sent", max_retries=3)
+    embedder = Embedder(client=real_client, tokenizer=FakeTokenizer(), gemini_client=fake_gemini)
+
+    with patch("voyageai.MultimodalEmbedding.create", side_effect=AuthenticationError("invalid API key")):
+        with pytest.raises(EmbedError):
+            embedder.embed([make_chunk(content="hello")])
+
+    assert len(fake_gemini.models.calls) == 0
+
+
+def test_gemini_fallback_cardinality_mismatch_raises_embed_error():
+    class ShortGeminiModels(FakeGeminiModels):
+        def embed_content(self, *, model, contents, config=None):
+            resp = super().embed_content(model=model, contents=contents, config=config)
+            return FakeGeminiResponse(resp.embeddings[:-1])  # one short
+
+    class ShortGeminiClient:
+        def __init__(self):
+            self.models = ShortGeminiModels()
+
+    call_count = 0
+
+    def always_rate_limited(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise RateLimitError("simulated 429, never recovers")
+
+    real_client = voyageai.Client(api_key="dummy-key-never-sent", max_retries=3)
+    embedder = Embedder(client=real_client, tokenizer=FakeTokenizer(), gemini_client=ShortGeminiClient())
+
+    with patch("voyageai.MultimodalEmbedding.create", side_effect=always_rate_limited):
+        with pytest.raises(EmbedError):
+            embedder.embed([make_chunk(content="a"), make_chunk(content="b")])
+
+
+def test_embed_query_uses_voyage_by_default():
+    fake = FakeVoyageClient()
+    embedder = make_embedder(fake)
+
+    embedder.embed_query("what color is the square?")
+
+    assert fake.calls[0]["model"] == "voyage-multimodal-3.5"
+    assert fake.calls[0]["input_type"] == "query"
+
+
+def test_embed_query_uses_gemini_when_provider_is_gemini():
+    fake_voyage = FakeVoyageClient()
+    fake_gemini = FakeGeminiClient()
+    embedder = Embedder(client=fake_voyage, tokenizer=FakeTokenizer(), gemini_client=fake_gemini)
+
+    vector = embedder.embed_query("what color is the square?", provider="gemini")
+
+    assert len(fake_voyage.calls) == 0  # never touches Voyage when provider="gemini"
+    assert len(vector) == 1024
+    call = fake_gemini.models.calls[0]
+    assert call["model"] == "gemini-embedding-2"
+    assert call["config"]["task_type"] == "RETRIEVAL_QUERY"
 
 
 def _fake_sdk_response(n):
@@ -462,12 +631,13 @@ def test_embed_real_chunks_from_table_heavy_pdf():
     fake = FakeVoyageClient()
     embedder = make_embedder(fake)
 
-    vectors = embedder.embed(chunks)
+    embedded = embedder.embed(chunks)
 
-    assert len(vectors) == len(chunks)
-    assert all(len(v) == 1024 for v in vectors)
+    assert len(embedded) == len(chunks)
+    assert all(len(ec.vector) == 1024 for ec in embedded)
+    assert all(ec.provider == "voyage" for ec in embedded)
     # Correspondence, not just count: every chunk's vector must be distinct.
-    first_values = [v[0] for v in vectors]
+    first_values = [ec.vector[0] for ec in embedded]
     assert len(set(first_values)) == len(chunks)
     # table_heavy.pdf has no figures, but does have table chunks with
     # merged caption text — confirm at least one multi-segment input was
@@ -524,8 +694,34 @@ def test_real_voyage_api_call_returns_1024_dim_vector():
     embedder = Embedder()  # real client, reads VOYAGE_API_KEY from env
     chunk = make_chunk(content="Docify integration test: a short real embedding call.")
 
-    vectors = embedder.embed([chunk])
+    embedded = embedder.embed([chunk])
+
+    assert len(embedded) == 1
+    assert embedded[0].provider == "voyage"
+    assert len(embedded[0].vector) == 1024
+    assert all(isinstance(x, float) for x in embedded[0].vector)
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_REAL_GEMINI_EMBED_TEST") != "1",
+    reason="set RUN_REAL_GEMINI_EMBED_TEST=1 to run a real Gemini embedding API call (uses free-tier quota)",
+)
+def test_real_gemini_fallback_produces_1024_dim_normalized_vector():
+    """Real, opt-in confirmation of Step 0's live findings: gemini-embedding-2
+    accepts multimodal Content over GEMINI_API_KEY (no Vertex auth) and
+    returns an already-normalized 1024-dim vector after Matryoshka
+    truncation."""
+    import math
+
+    from services.embedder import _chunk_to_gemini_content, _default_gemini_client, _gemini_embed_contents
+
+    client = _default_gemini_client()
+    chunk = make_chunk(content="Docify integration test: a short real Gemini embedding call.")
+    content = _chunk_to_gemini_content(chunk)
+
+    vectors = _gemini_embed_contents(client, [content], task_type="RETRIEVAL_DOCUMENT")
 
     assert len(vectors) == 1
     assert len(vectors[0]) == 1024
-    assert all(isinstance(x, float) for x in vectors[0])
+    norm = math.sqrt(sum(v * v for v in vectors[0]))
+    assert norm == pytest.approx(1.0, abs=1e-3)

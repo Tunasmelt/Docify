@@ -88,3 +88,45 @@ parsed: MyResponse | None = response.parsed
 ```
 
 **Critical failure-mode detail, easy to miss** (`types.py:3018-3046`, `GenerateContentResponse._from_response`): if the model's JSON doesn't parse or doesn't validate against the schema, the SDK catches `pydantic.ValidationError`/`json.decoder.JSONDecodeError` **internally and silently** (`except ...: pass`) rather than raising — `response.parsed` is simply left `None`. Code that assumes `response.parsed` is populated whenever the API call itself succeeds will crash on `None` access, or worse, silently treat a malformed response as some falsy-but-valid state. Always explicitly check `response.parsed is None` as its own failure branch, separate from and in addition to catching `APIError` around the call itself.
+
+## Embeddings (`gemini-embedding-2`) — verified live 2026-07-31, services/embedder.py's Voyage fallback
+
+**Docs:** https://ai.google.dev/gemini-api/docs/embeddings
+
+**Model:** `gemini-embedding-2` (also `gemini-embedding-2-preview`, `gemini-embedding-001`). **Use `gemini-embedding-2` specifically, not `-001`** — two real, live-confirmed differences that matter for this project:
+
+| | `gemini-embedding-001` | `gemini-embedding-2` |
+|---|---|---|
+| Accepts image `Part` content | **No** — real call returns `400 INVALID_ARGUMENT: The text content is empty` when sent an image | **Yes** — confirmed live with both an image-only `Content` and a mixed text+image `Content` |
+| `output_dimensionality=1024` truncation result | NOT unit-normalized (real norm ≈0.61–0.62, varies by input) | Unit-normalized (real norm ≈1.0000, consistent) |
+
+**Auth: the plain `GEMINI_API_KEY`/`genai.Client(api_key=...)` path works — NOT Vertex AI/service-account auth**, despite that historically being Google's pattern for multimodal embeddings. Confirmed live: the exact same client construction this project's OCR tier (`services/parser.py`) already uses successfully calls `gemini-embedding-2` with real image content. No new credential needed for a Gemini embedding fallback.
+
+**Call shape** (`Client.models.embed_content`, confirmed live with the full real shape together — task_type + output_dimensionality + multimodal content + batching, not each piece verified in isolation):
+```python
+response = client.models.embed_content(
+    model="gemini-embedding-2",
+    contents=[
+        types.Content(parts=[
+            types.Part.from_text(text="a description"),
+            types.Part.from_bytes(data=png_bytes, mime_type="image/png"),
+        ]),
+        # additional Content entries batch natively in one call — confirmed
+        # live, multiple entries return multiple embeddings, in order, via
+        # the same batchEmbedContents endpoint models.py routes through
+    ],
+    config={
+        "task_type": "RETRIEVAL_DOCUMENT",   # or "RETRIEVAL_QUERY" for query-side — same
+                                              # asymmetric embedding pattern as Voyage's
+                                              # input_type="document"/"query"
+        "output_dimensionality": 1024,
+    },
+)
+vectors = [list(e.values) for e in response.embeddings]  # one per `contents` entry, in order
+```
+
+**Response shape:** `response.embeddings` — a list, one entry per `contents` item, each with `.values` (the float vector). The installed SDK's `embed_content` docstring says "Only text is supported" — this is stale for `gemini-embedding-2`/`-2-preview` (confirmed live to accept images); it's accurate for `-001`.
+
+**Free tier rate limit:** 100 RPM / 1,000 RPD (per public reporting, not independently hit-live the way Voyage's 3 RPM and `gemini-2.5-flash`'s 20 RPD were — re-verify if this becomes a real bottleneck) — far less constrained than Voyage's real, empirically-observed 3 RPM ceiling on this project's account, which is the entire reason this is viable as a fallback target.
+
+**Do not compare a `gemini-embedding-2` vector to a `voyage-multimodal-3.5` vector via cosine similarity, even at matching 1024 dimensionality** — they are different, unrelated embedding spaces. See `.agent/MEMORY.md`'s 2026-07-31 standing anti-pattern entry.

@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 from services.chunker import Chunk
-from services.embedder import Vector
+from services.embedder import EmbeddedChunk
 from services.parser import ParsedElement
 
 
@@ -56,7 +56,7 @@ def build_chunk_rows(
     document_id: str,
     user_id: str,
     chunks: list[Chunk],
-    vectors: list[Vector],
+    embedded_chunks: list[EmbeddedChunk],
     figure_paths: dict[int, str],
     elements: list[ParsedElement],
 ) -> list[dict]:
@@ -69,9 +69,17 @@ def build_chunk_rows(
     chunks, or the first grouped element for TEXT/HEADING/LIST/CAPTION
     chunks). The full page list and provenance (source element indices,
     caption association) are never dropped — they go into metadata.
+
+    embedding_provider (2026-07-31) is stamped per-row from each
+    EmbeddedChunk, not a single document-wide value — embedder.py's
+    Gemini fallback can tag only SOME of a document's chunks differently
+    (a mid-batch Voyage RPM exhaustion, not a clean whole-document
+    failure), so this must stay per-chunk to match. See .agent/MEMORY.md
+    before assuming any two chunks' embeddings are comparable regardless
+    of this column.
     """
     rows = []
-    for chunk, vector in zip(chunks, vectors, strict=True):
+    for chunk, embedded in zip(chunks, embedded_chunks, strict=True):
         source_element = elements[chunk.source_element_indices[0]]
         bbox = source_element.bbox
         rows.append(
@@ -84,7 +92,8 @@ def build_chunk_rows(
                 "bbox": {"x0": bbox.x0, "y0": bbox.y0, "x1": bbox.x1, "y1": bbox.y1},
                 "content": chunk.content,
                 "figure_path": figure_paths.get(chunk.chunk_index),
-                "embedding": vector,
+                "embedding": embedded.vector,
+                "embedding_provider": embedded.provider,
                 "metadata": {
                     "page_numbers": chunk.page_numbers,
                     "source_element_indices": chunk.source_element_indices,

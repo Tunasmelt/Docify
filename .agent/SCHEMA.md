@@ -19,10 +19,11 @@ create extension if not exists pgcrypto;    -- gen_random_uuid()
 ## Enums
 
 ```sql
-create type document_status as enum ('uploaded', 'parsing', 'embedded', 'ready', 'failed');
-create type element_type    as enum ('text', 'heading', 'table', 'figure', 'caption', 'list');
-create type message_role    as enum ('user', 'assistant');
-create type verdict         as enum ('supported', 'partial', 'unsupported');
+create type document_status     as enum ('uploaded', 'parsing', 'embedded', 'ready', 'failed');
+create type element_type       as enum ('text', 'heading', 'table', 'figure', 'caption', 'list');
+create type message_role       as enum ('user', 'assistant');
+create type verdict            as enum ('supported', 'partial', 'unsupported');
+create type embedding_provider as enum ('voyage', 'gemini');  -- 2026-07-31, see chunks.embedding_provider below
 ```
 
 ---
@@ -55,23 +56,24 @@ create index documents_status_idx  on documents(status) where status in ('upload
 ```
 
 ### `chunks`
-One row per retrievable unit. Text and figure-caption chunks both go here; the embedding is Voyage's (1024 dims by default, matryoshka-truncated if needed later).
+One row per retrievable unit. Text and figure-caption chunks both go here; the embedding is Voyage's by default (1024 dims), or Gemini's (`gemini-embedding-2`, truncated to the same 1024 dims) for a chunk that hit the fallback — see `embedding_provider` below.
 
 ```sql
 create table chunks (
-  id             uuid primary key default gen_random_uuid(),
-  document_id    uuid not null references documents(id) on delete cascade,
-  user_id        uuid not null references auth.users(id) on delete cascade,
-  chunk_index    int not null,              -- ordinal position within document
-  element_type   element_type not null,
-  page_number    int not null,
-  bbox           jsonb,                     -- {x0,y0,x1,y1} on the source page
-  content        text not null,             -- the extracted text
-  figure_path    text,                      -- storage path if element_type='figure'
-  embedding      vector(1024) not null,
-  ts             tsvector generated always as (to_tsvector('english', content)) stored,
-  metadata       jsonb not null default '{}'::jsonb,
-  created_at     timestamptz not null default now(),
+  id                 uuid primary key default gen_random_uuid(),
+  document_id        uuid not null references documents(id) on delete cascade,
+  user_id            uuid not null references auth.users(id) on delete cascade,
+  chunk_index        int not null,              -- ordinal position within document
+  element_type       element_type not null,
+  page_number        int not null,
+  bbox               jsonb,                     -- {x0,y0,x1,y1} on the source page
+  content            text not null,             -- the extracted text
+  figure_path        text,                      -- storage path if element_type='figure'
+  embedding          vector(1024) not null,
+  embedding_provider embedding_provider not null default 'voyage',  -- 2026-07-31, see note below
+  ts                 tsvector generated always as (to_tsvector('english', content)) stored,
+  metadata           jsonb not null default '{}'::jsonb,
+  created_at         timestamptz not null default now(),
   unique (document_id, chunk_index)
 );
 
@@ -82,6 +84,10 @@ create index chunks_embedding_idx on chunks
   using hnsw (embedding vector_cosine_ops)
   with (m = 16, ef_construction = 64);
 ```
+
+**`embedding_provider` (2026-07-31, migration `20260731_001_embedding_provider_fallback.sql`) — CRITICAL constraint, not an implementation detail.** `services/embedder.py`'s `Embedder.embed()` falls back to Gemini (`gemini-embedding-2`) for a batch only once Voyage's own SDK-internal retries (`RateLimitError`/`ServiceUnavailableError`/`Timeout`, `MAX_RETRIES=3`) are genuinely exhausted for that batch — the real motivating scenario is this account's empirically-observed 3 RPM free-tier ceiling (`.agent/MEMORY.md`) being hit mid-ingest, not a whole-document failure. Tracking is per CHUNK, not per document, because that's the real failure granularity: a single document's chunks can legitimately end up split across both providers if only some batches hit the fallback.
+
+**A Voyage-embedded vector and a Gemini-embedded vector are NOT comparable via cosine similarity, even though both are `vector(1024)`** — they are points in two different, unrelated embedding spaces that merely happen to share a dimension count. `match_chunks_by_vector` takes an explicit `match_provider` parameter and filters on it; `services/retriever.py`'s `Retriever.retrieve()` runs one independent vector search PER distinct provider actually present in a given `document_ids` scope (via `distinct_embedding_providers`), and RRF-fuses all of them together with FTS purely on RANK — it never compares a raw distance across the filter. See `.agent/MEMORY.md`'s standing anti-pattern entry before touching any of this.
 
 **`page_number`'s real meaning depends on the source document's format (FEAT-020, 2026-07-27), confirmed live per format, not assumed:**
 - **PDF:** the real PDF page number (unchanged, as before FEAT-020).

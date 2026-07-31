@@ -343,7 +343,13 @@ def run_ingest_pipeline(
         chunks = chunker.chunk(parsed)
         opened_images = [c.image for c in chunks if c.image is not None]
 
-        vectors = embedder.embed(chunks)  # [] chunks -> [] vectors; raises EmbedError on failure
+        # [] chunks -> [] embedded_chunks; raises EmbedError only once BOTH
+        # Voyage (its own exhausted retries) and, for the affected batch,
+        # the Gemini fallback have failed (services/embedder.py). Each
+        # EmbeddedChunk carries its own provider tag — a single document
+        # can end up with a mix of "voyage" and "gemini" rows if only some
+        # batches hit the fallback.
+        embedded_chunks = embedder.embed(chunks)
         queries.mark_embedded(resolved_client, document_id)
 
         figure_paths = _upload_figures(resolved_client, user_id, document_id, chunks)
@@ -352,7 +358,7 @@ def run_ingest_pipeline(
             document_id=document_id,
             user_id=user_id,
             chunks=chunks,
-            vectors=vectors,
+            embedded_chunks=embedded_chunks,
             figure_paths=figure_paths,
             elements=parsed.elements,
         )

@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 from main import app
 from routes import ingest
 from services.chunker import Chunk
-from services.embedder import EmbedError
+from services.embedder import EmbedError, EmbeddedChunk
 from services.parser import BBox, ElementType, ParsedDocument, ParsedElement
 from tests._local_supabase import LOCAL_POSTGRES_DSN, admin_client, create_test_user, delete_test_user, login, upload_via_rest
 
@@ -150,7 +150,7 @@ class FakeEmbedder:
             partially_computed = [[0.5] * 1024 for _ in range(min(self.fail_after, len(chunks)))]
             del partially_computed  # never returned — this is the point of the test
             raise EmbedError(f"simulated embedder failure after computing {self.fail_after} of {len(chunks)} chunks")
-        return [[float(i) / 1000] * 1024 for i in range(len(chunks))]
+        return [EmbeddedChunk(vector=[float(i) / 1000] * 1024, provider="voyage") for i in range(len(chunks))]
 
 
 def upload_placeholder(user_id: str, token: str, filename: str = "placeholder.pdf") -> str:
