@@ -1130,6 +1130,50 @@ def test_real_mixed_provider_retrieval_surfaces_chunks_from_either_provider(admi
         content="Mount Everest, on the border of Nepal and Tibet, is the tallest mountain on Earth above sea level.",
     )
 
+    # 2026-08-02 (Voyage/Gemini limit-verification follow-up) — a THIRD
+    # chunk, genuinely at chunker.py's real MAX_CHUNK_TOKENS ceiling
+    # (~16,000 chars via the char/4 proxy), embedded via the ACTUAL
+    # fallback function (_embed_batch_with_gemini_fallback), not a direct
+    # embed_content call like gemini_chunk above. Proves the whole point
+    # of this task's real finding: a ceiling-sized chunk (measured live,
+    # .agent/api-docs/gemini.md, at ~6,365 real Gemini tokens — under the
+    # real 8,192 limit but with real, non-trivial utilization, not a
+    # trivially-small test string) still retrieves correctly through the
+    # actual production code path, not just that small hand-picked
+    # strings work. Real content, not synthetic filler: built from this
+    # project's own real fixture text, repeated to reach the target size
+    # (fixtures are small; .agent/api-docs/gemini.md documents this same
+    # necessary construction technique), with one real, distinctive,
+    # independently-askable fact appended at the end so a real question
+    # can target THIS specific chunk and nothing else in scope.
+    from services.chunker import MAX_CHUNK_TOKENS
+    from services.parser import Parser as _Parser
+
+    _real_texts = []
+    for _f in ("clean_digital.pdf", "table_heavy.pdf", "table.docx", "slides.pptx", "page.html"):
+        with open(os.path.join(FIXTURES, _f), "rb") as _fh:
+            _doc = _Parser().parse(_fh.read(), filename=_f)
+        _real_texts.extend(e.content for e in _doc.elements if isinstance(e.content, str) and e.content.strip())
+
+    def _real_padding(target_chars: int) -> str:
+        out, total, i = [], 0, 0
+        while total < target_chars:
+            t = _real_texts[i % len(_real_texts)]
+            out.append(t)
+            total += len(t) + 1
+            i += 1
+        return " ".join(out)[:target_chars]
+
+    distinctive_fact = "The capital city of Australia is Canberra, not Sydney."
+    ceiling_content = _real_padding(MAX_CHUNK_TOKENS * 4) + " " + distinctive_fact
+    ceiling_chunk = Chunk(
+        chunk_index=2,
+        element_type=ElementType.TEXT,
+        page_numbers=[1],
+        source_element_indices=[2],
+        content=ceiling_content,
+    )
+
     embedder = Embedder()
     voyage_embedded = embedder.embed([voyage_chunk])
     assert voyage_embedded[0].provider == "voyage"
@@ -1138,6 +1182,11 @@ def test_real_mixed_provider_retrieval_surfaces_chunks_from_either_provider(admi
     gemini_vector = _gemini_embed_contents(
         gemini_client, [_chunk_to_gemini_content(gemini_chunk)], task_type="RETRIEVAL_DOCUMENT"
     )[0]
+
+    from services.embedder import _embed_batch_with_gemini_fallback
+
+    ceiling_embedded = _embed_batch_with_gemini_fallback([ceiling_chunk], gemini_client)
+    assert ceiling_embedded[0].provider == "gemini"
 
     voyage_chunk_id = _insert_chunk(
         admin,
@@ -1157,11 +1206,20 @@ def test_real_mixed_provider_retrieval_surfaces_chunks_from_either_provider(admi
         embedding=gemini_vector,
         embedding_provider="gemini",
     )
+    ceiling_chunk_id = _insert_chunk(
+        admin,
+        document_id=document_id,
+        user_id=user_id,
+        chunk_index=2,
+        content=ceiling_chunk.content,
+        embedding=ceiling_embedded[0].vector,
+        embedding_provider="gemini",
+    )
 
     retriever = Retriever(client=admin)  # real Embedder -> real embed_query() for both providers
 
     print("\n" + "=" * 90)
-    print("Real mixed-provider retrieval — one voyage-tagged chunk, one gemini-tagged chunk")
+    print("Real mixed-provider retrieval — voyage-tagged, gemini-tagged, and a ceiling-sized gemini-fallback chunk")
     print("=" * 90)
 
     time.sleep(25)  # same real 3 RPM margin as the other real-quota tests in this file
@@ -1169,6 +1227,7 @@ def test_real_mixed_provider_retrieval_surfaces_chunks_from_either_provider(admi
     questions = [
         ("Where is the Eiffel Tower located?", voyage_chunk_id, "voyage"),
         ("What is the tallest mountain on Earth?", gemini_chunk_id, "gemini"),
+        ("What is the capital city of Australia?", ceiling_chunk_id, "gemini (ceiling-sized, via fallback path)"),
     ]
     all_passed = True
     for i, (question, expected_chunk_id, expected_provider) in enumerate(questions):

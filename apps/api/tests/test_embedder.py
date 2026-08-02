@@ -29,7 +29,18 @@ from PIL import Image
 from voyageai.error import AuthenticationError, InvalidRequestError, RateLimitError
 
 from services.chunker import Chunk, Chunker
-from services.embedder import MAX_INPUTS_PER_BATCH, Embedder, EmbedError, _batch_chunks, _chunk_to_input
+from services.embedder import (
+    GEMINI_MAX_INPUT_TOKENS,
+    GEMINI_MAX_INPUTS_PER_BATCH,
+    MAX_INPUTS_PER_BATCH,
+    Embedder,
+    EmbedError,
+    _batch_chunks,
+    _chunk_to_input,
+    _estimate_gemini_input_tokens,
+    _gemini_image_tokens,
+    _GEMINI_SAFE_INPUT_TOKENS,
+)
 from services.parser import ElementType, Parser
 
 FIXTURES = "tests/fixtures"
@@ -488,6 +499,120 @@ def test_gemini_fallback_cardinality_mismatch_raises_embed_error():
     with patch("voyageai.MultimodalEmbedding.create", side_effect=always_rate_limited):
         with pytest.raises(EmbedError):
             embedder.embed([make_chunk(content="a"), make_chunk(content="b")])
+
+
+# --- 2026-08-02: Gemini fallback made provider-aware (real, live-verified
+# findings — see .agent/api-docs/gemini.md and the module comment in
+# services/embedder.py) --------------------------------------------------
+
+
+def test_gemini_fallback_rebatches_above_gemini_s_real_100_request_cap():
+    """The batch handed to the fallback is sized against VOYAGE's real
+    limits (up to MAX_INPUTS_PER_BATCH=1,000) — this confirms it gets
+    correctly re-batched against GEMINI's own real, empirically-confirmed
+    100-request cap (GEMINI_MAX_INPUTS_PER_BATCH) before anything is sent,
+    rather than forwarded as one oversized call that would have hard-
+    failed against the real API (confirmed live: 100 succeeds, 101 fails
+    with a clean 400 INVALID_ARGUMENT)."""
+    call_count = 0
+
+    def always_rate_limited(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise RateLimitError("simulated 429, never recovers")
+
+    n_chunks = GEMINI_MAX_INPUTS_PER_BATCH + 50  # 150 — spans two Gemini sub-batches (100 + 50)
+    chunks = [make_chunk(content=f"chunk {i}", chunk_index=i) for i in range(n_chunks)]
+
+    real_client = voyageai.Client(api_key="dummy-key-never-sent", max_retries=3)
+    fake_gemini = FakeGeminiClient()
+    embedder = Embedder(client=real_client, tokenizer=FakeTokenizer(), gemini_client=fake_gemini)
+
+    with patch("voyageai.MultimodalEmbedding.create", side_effect=always_rate_limited):
+        embedded = embedder.embed(chunks)
+
+    assert len(fake_gemini.models.calls) == 2, "expected exactly 2 real Gemini calls (100 + 50), not 1 oversized call"
+    assert len(fake_gemini.models.calls[0]["contents"]) == GEMINI_MAX_INPUTS_PER_BATCH
+    assert len(fake_gemini.models.calls[1]["contents"]) == 50
+    assert len(embedded) == n_chunks
+    assert all(ec.provider == "gemini" for ec in embedded)
+    # Order preserved across the re-batch split — vector values are
+    # index-derived (FakeGeminiModels), so a distinct, monotonically
+    # assigned value per chunk proves nothing was dropped or reordered.
+    assert [ec.vector[0] for ec in embedded] == [float(i) for i in range(n_chunks)]
+
+
+def test_gemini_fallback_warns_when_a_chunk_risks_the_real_token_limit(caplog):
+    """A chunk whose content is long enough that the conservative local
+    estimate exceeds _GEMINI_SAFE_INPUT_TOKENS must produce a visible log
+    warning — converting Gemini's real, confirmed SILENT truncation (no
+    error, no signal at all — see the module comment) into something an
+    operator can actually see, even though it isn't prevented outright."""
+    call_count = 0
+
+    def always_rate_limited(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise RateLimitError("simulated 429, never recovers")
+
+    # Comfortably over the safe threshold under the conservative 2.0
+    # chars/token estimate (services/embedder.py) — real chunker.py content
+    # would never reach this size at MAX_CHUNK_TOKENS=4,000 in the common
+    # case, but this proves the check itself actually fires when it should.
+    huge_content = "real fixture-shaped text content. " * 1000
+    assert _estimate_gemini_input_tokens(make_chunk(content=huge_content)) > _GEMINI_SAFE_INPUT_TOKENS
+
+    real_client = voyageai.Client(api_key="dummy-key-never-sent", max_retries=3)
+    fake_gemini = FakeGeminiClient()
+    embedder = Embedder(client=real_client, tokenizer=FakeTokenizer(), gemini_client=fake_gemini)
+
+    with patch("voyageai.MultimodalEmbedding.create", side_effect=always_rate_limited):
+        with caplog.at_level("WARNING", logger="services.embedder"):
+            embedder.embed([make_chunk(content=huge_content, chunk_index=0)])
+
+    warnings = [r for r in caplog.records if "over the safe" in r.message and str(GEMINI_MAX_INPUT_TOKENS) in r.message]
+    assert warnings, f"expected a visible warning for the at-risk chunk, got log records: {[r.message for r in caplog.records]}"
+
+
+def test_gemini_fallback_does_not_warn_for_a_normal_sized_chunk(caplog):
+    real_client = voyageai.Client(api_key="dummy-key-never-sent", max_retries=3)
+    fake_gemini = FakeGeminiClient()
+    embedder = Embedder(client=real_client, tokenizer=FakeTokenizer(), gemini_client=fake_gemini)
+
+    with patch("voyageai.MultimodalEmbedding.create", side_effect=RateLimitError("simulated 429, never recovers")):
+        with caplog.at_level("WARNING", logger="services.embedder"):
+            embedder.embed([make_chunk(content="a completely ordinary, short real chunk of text", chunk_index=0)])
+
+    assert not any("over the safe" in r.message for r in caplog.records)
+
+
+# Real, live-measured finding (2026-08-02): gemini-embedding-2's image
+# tokenization is a FLAT 258 tokens regardless of size — confirmed across
+# 13 distinct real sizes via count_tokens, from 1x1 through 8000x6000,
+# every one identical. Google's own docs describe a size-dependent tiled
+# formula (e.g. 960x540 -> 1,548 tokens) — real, but for a GENERATION
+# model's image understanding, confirmed NOT to apply to this embedding
+# endpoint; a first attempt at this formula assumed it did and was wrong
+# (caught by this project's own two real fixture figures — table.docx's
+# 300x200 and slides.pptx's 400x300 — both measuring a real, identical 258
+# despite the tiled formula predicting different values for each; see
+# .agent/api-docs/gemini.md for the full methodology and correction).
+@pytest.mark.parametrize(
+    "width,height",
+    [
+        (300, 200),  # real fixture: table.docx's figure
+        (400, 300),  # real fixture: slides.pptx's figure
+        (1, 1),
+        (2000, 2000),
+        (8000, 6000),
+    ],
+)
+def test_gemini_image_tokens_matches_the_real_verified_flat_constant(width, height):
+    image = Image.new("RGB", (width, height))
+    try:
+        assert _gemini_image_tokens(image) == 258
+    finally:
+        image.close()
 
 
 def test_embed_query_uses_voyage_by_default():

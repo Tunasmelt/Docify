@@ -23,6 +23,14 @@ class CitationResponse(BaseModel):
     document_mime_type: str
     page_number: int
     element_type: str
+    # Real citation-confidence signal (added 2026-08-02) — see
+    # services/retriever.py's RetrievedChunk.association_method docstring
+    # for the full meaning of each value. None whenever not applicable
+    # (most citations — this is a table/figure-caption-specific signal).
+    # response_model_exclude_none=True (same routes as figure_url below)
+    # means a None value is omitted from the response entirely, not sent
+    # as "association_method": null.
+    association_method: str | None = None
     snippet: str
     verdict: str
     supporting_quote: str | None

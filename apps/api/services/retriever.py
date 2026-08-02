@@ -77,6 +77,23 @@ class RetrievedChunk:
     # (routes/query.py, generator.py) currently reads .score at all, so
     # there's no compatibility concern in swapping its meaning per call.
     score: float
+    # "explicit" (parser's own Tier-1 heuristic linked this table/figure's
+    # caption), "heuristic" (chunker.py's Tier-2 proximity fallback
+    # matched it), "unmatched" (a caption that could not be plausibly
+    # placed), or None (not applicable — a plain text/heading/list chunk,
+    # or a table/figure with no caption at all involved). Added
+    # 2026-08-02: this was already computed and stored in every chunk row
+    # (chunks.metadata->>'association_method', db/queries.py's
+    # build_chunk_rows) but never SELECTED by match_chunks_by_vector/
+    # match_chunks_by_fts — a real, free citation-confidence signal
+    # (was this table/figure caption a confident explicit link, or a
+    # weaker proximity guess?) that was being silently discarded at the
+    # retrieval boundary. See migration 20260802_002_citation_association_
+    # method.sql. Defaults to None (not required at every call site — most
+    # existing tests construct this directly and don't care about this
+    # field). Not yet surfaced in the frontend UI as of this pass —
+    # deliberately scoped to the API boundary only; see CHANGELOG.md.
+    association_method: str | None = None
 
 
 def _candidate_pool_size(k: int) -> int:
@@ -272,6 +289,7 @@ class Retriever:
                 document_name=row["document_name"],
                 document_mime_type=row["document_mime_type"],
                 element_type=row["element_type"],
+                association_method=row["association_method"],
                 score=score,
             )
             for row, score in final

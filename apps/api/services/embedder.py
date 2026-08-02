@@ -176,6 +176,120 @@ def _default_client() -> voyageai.Client:
 # speculatively, never a first choice, never opportunistic. See
 # tests/test_embedder.py's cost/scope guard tests for live proof this
 # never fires on a healthy Voyage call.
+#
+# 2026-08-02 — real, EMPIRICALLY VERIFIED Gemini limits (never checked
+# when this fallback was originally built; the batch handed to this path
+# was sized ONLY against Voyage's real limits — MAX_INPUTS_PER_BATCH=1000,
+# _SAFE_TOTAL_TOKENS_PER_BATCH=300,000 — and sent to Gemini as-is,
+# unvalidated against Gemini's own, different, real limits):
+#
+# - Per-input token limit: 8,192 (Google's own docs; confirmed live via
+#   `client.models.count_tokens` AND by direct observation of the failure
+#   mode) — 4x TIGHTER than Voyage's real 32,000. Critically, exceeding it
+#   does NOT raise an error: Gemini SILENTLY TRUNCATES. Proven live, not
+#   just per docs: a real 32,000-char chunk (real fixture text, repeated —
+#   this project's own fixtures don't contain 32,000 distinct real chars)
+#   measured at 13,195 real Gemini tokens (60% over the limit) embedded
+#   successfully with no error; cosine(full input, an independently-
+#   embedded ~8,192-token-equivalent prefix of the SAME text) = 0.999999
+#   — for contrast, cosine(full input, genuinely unrelated real text) =
+#   0.777. A near-1.0 match against the truncated-equivalent prefix, that
+#   far above the "different content" baseline, is direct proof the extra
+#   ~5,000 tokens were silently dropped server-side, not that the model
+#   "handled" them some other way. A single chunk at chunker.py's own
+#   MAX_CHUNK_TOKENS=4,000 (proxy) ceiling measured at 6,365 REAL Gemini
+#   tokens in this same test (77.7% of the real 8,192 limit) — comfortably
+#   under it for THIS content, but with materially less margin than the
+#   ~29% worst-case utilization already verified against Voyage's real
+#   32,000 limit (.agent/FEATURES.md's FEAT-006 entry) — MAX_CHUNK_TOKENS
+#   was never re-validated against Gemini's tighter ceiling, and different
+#   (denser) real content could plausibly exceed it. Not raised to a hard
+#   block here (chunker.py's splitting-by-sentence/row logic isn't
+#   duplicated in this module, and MAX_CHUNK_TOKENS itself doesn't need to
+#   shrink for Voyage's own real, much larger limit) — instead, a
+#   conservative local estimate flags and LOGS any at-risk chunk before it
+#   silently loses content with zero signal.
+# - Per-batch REQUEST COUNT: exactly 100 (Google's own docs: "at most 100
+#   requests can be in one batch") — CONFIRMED live at the exact boundary:
+#   100 real inputs in one batchEmbedContents call succeeded, 101 failed
+#   with a clean `400 INVALID_ARGUMENT`. This is a real, CONFIRMED bug in
+#   the pre-2026-08-02 fallback, not a theoretical one: a Voyage batch
+#   above 100 chunks (a real, reachable case — Voyage batches up to 1,000)
+#   that fell back to Gemini would have hard-failed the ENTIRE fallback
+#   outright, even though Gemini could handle the same chunks fine once
+#   correctly re-batched. No separate lower aggregate-token cap was found
+#   up to ~119,000 real tokens across 50 real inputs in the same live
+#   test — the 100-request cap is the actual binding constraint for
+#   typical chunk sizes, not a total-token budget.
+# - Image tokenization: a COMPLETELY DIFFERENT scheme from Voyage's
+#   documented pixels/560 formula — confirmed NOT to transfer, empirically.
+#   `gemini-embedding-2` costs a FLAT, CONSTANT 258 tokens per image,
+#   REGARDLESS of size — confirmed live across 1x1 through 8000x6000 (13
+#   distinct sizes via `count_tokens`, every single one returned exactly
+#   258). Google's own docs describe a size-dependent tiled scheme
+#   (crop-unit tiling, up to ~1,548 tokens for a 960x540 image) — that
+#   formula is real, but for a GENERATION model's image understanding, not
+#   this embedding endpoint; naively applying it here would have been
+#   just as wrong as assuming Voyage's formula transfers. Two real fixture
+#   figures (300x200, 400x300) that Voyage's pixels/560 formula predicts
+#   at 107 and 214 tokens respectively both measured the same real 258.
+#
+# Full findings, real numbers, and methodology: .agent/api-docs/gemini.md.
+#
+# FIX: this fallback path is now provider-aware, sized against GEMINI's
+# own real limits (below), not inherited from whatever Voyage-sized batch
+# it happens to receive.
+
+GEMINI_MAX_INPUTS_PER_BATCH = 100
+GEMINI_MAX_INPUT_TOKENS = 8_192
+
+# Local, no-extra-API-call estimate for the pre-send safety check below —
+# deliberately conservative (i.e. deliberately overestimates token count),
+# calibrated against the two real live measurements above: 16,000 real
+# chars -> 6,365 real tokens (~2.51 chars/token), 32,000 chars -> 13,195
+# real tokens (~2.43 chars/token). 2.0 is picked BELOW both measured
+# ratios on purpose, so this estimate should never UNDERCOUNT relative to
+# content resembling what was actually measured — it is a calibrated
+# proxy, not a promise, since Gemini's real tokenizer was never called
+# per-chunk here (that would add a real API round trip to every fallback
+# embed, for a check whose only job is emitting a log warning).
+_GEMINI_CHARS_PER_TOKEN_CONSERVATIVE = 2.0
+# Safety margin below the real 8,192 ceiling, absorbing estimate error.
+_GEMINI_SAFE_INPUT_TOKENS = 7_500
+
+
+GEMINI_IMAGE_TOKENS = 258  # flat, confirmed live regardless of size — see module comment
+
+
+def _gemini_image_tokens(image) -> int:
+    """Gemini's REAL, empirically-verified image tokenization for
+    `gemini-embedding-2` specifically (see the module-level comment
+    above): a flat constant, NOT Voyage's pixels/560 formula, and NOT the
+    size-dependent tiled formula Google's own docs describe for
+    generation-model image understanding — confirmed live that formula
+    does not apply to this embedding endpoint (tested 1x1 through
+    8000x6000: every size returned the identical 258)."""
+    return GEMINI_IMAGE_TOKENS
+
+
+def _estimate_gemini_input_tokens(chunk: Chunk) -> int:
+    tokens = int(len(chunk.content) / _GEMINI_CHARS_PER_TOKEN_CONSERVATIVE) if chunk.content else 0
+    if chunk.image is not None:
+        tokens += _gemini_image_tokens(chunk.image)
+    return tokens
+
+
+def _batch_for_gemini(chunks: list[Chunk]) -> list[list[Chunk]]:
+    """Re-batches an already-Voyage-sized batch (up to MAX_INPUTS_PER_BATCH
+    = 1,000 chunks, sized against Voyage's real limits by _batch_chunks
+    above) into Gemini-legal sub-batches of <=GEMINI_MAX_INPUTS_PER_BATCH
+    (100, empirically confirmed hard cap — see module comment) before any
+    of it reaches Gemini's batchEmbedContents endpoint. The batch this
+    receives was never sized with Gemini in mind; this is what makes it
+    safe to actually send there."""
+    return [
+        chunks[i : i + GEMINI_MAX_INPUTS_PER_BATCH] for i in range(0, len(chunks), GEMINI_MAX_INPUTS_PER_BATCH)
+    ]
 
 
 def _default_gemini_client() -> genai.Client:
@@ -238,14 +352,42 @@ def _embed_batch_with_gemini_fallback(batch: list[Chunk], client: genai.Client |
     here (missing GEMINI_API_KEY, Gemini's own quota, network) raises
     EmbedError same as Voyage's own exhausted-retries path — this is
     genuinely last-resort, not a second safety net with its own further
-    fallback."""
+    fallback.
+
+    Provider-aware as of 2026-08-02 (see the module comment above for the
+    real, live-verified findings this responds to): re-batches against
+    Gemini's own real 100-request cap (_batch_for_gemini) before sending
+    anything — the incoming `batch` was sized against Voyage's limits and
+    would otherwise silently violate Gemini's tighter one — and logs a
+    visible warning for any chunk estimated at real risk of Gemini's
+    silent per-input truncation, so that failure mode is no longer a
+    total black box even though it isn't (and can't cheaply be) prevented
+    outright here."""
     try:
         resolved_client = client or _default_gemini_client()
     except KeyError as exc:
         raise EmbedError(f"Gemini fallback unavailable: {exc}") from exc
-    contents = [_chunk_to_gemini_content(c) for c in batch]
-    vectors = _gemini_embed_contents(resolved_client, contents, task_type="RETRIEVAL_DOCUMENT")
-    return [EmbeddedChunk(vector=v, provider="gemini") for v in vectors]
+
+    for chunk in batch:
+        estimated = _estimate_gemini_input_tokens(chunk)
+        if estimated > _GEMINI_SAFE_INPUT_TOKENS:
+            logger.warning(
+                "chunk_index=%s estimated at ~%d Gemini tokens, over the safe %d-token threshold "
+                "(real hard limit %d) — Gemini silently truncates over-limit input with no error "
+                "(confirmed live, .agent/api-docs/gemini.md), so this chunk's embedding may reflect "
+                "only part of its real content",
+                chunk.chunk_index,
+                estimated,
+                _GEMINI_SAFE_INPUT_TOKENS,
+                GEMINI_MAX_INPUT_TOKENS,
+            )
+
+    embedded: list[EmbeddedChunk] = []
+    for sub_batch in _batch_for_gemini(batch):
+        contents = [_chunk_to_gemini_content(c) for c in sub_batch]
+        vectors = _gemini_embed_contents(resolved_client, contents, task_type="RETRIEVAL_DOCUMENT")
+        embedded.extend(EmbeddedChunk(vector=v, provider="gemini") for v in vectors)
+    return embedded
 
 
 class Embedder:
@@ -387,6 +529,19 @@ class Embedder:
         is meaningless compared against a Gemini-space chunk vector and
         vice versa (.agent/MEMORY.md)."""
         if provider == "gemini":
+            # Same real 8,192-token limit and silent-truncation risk as
+            # the document-side path above applies here too — a query is
+            # realistically far too short to ever approach it, but the
+            # check is cheap enough to apply uniformly rather than assume.
+            estimated = int(len(text) / _GEMINI_CHARS_PER_TOKEN_CONSERVATIVE)
+            if estimated > _GEMINI_SAFE_INPUT_TOKENS:
+                logger.warning(
+                    "query text estimated at ~%d Gemini tokens, over the safe %d-token threshold "
+                    "(real hard limit %d) — Gemini silently truncates over-limit input with no error",
+                    estimated,
+                    _GEMINI_SAFE_INPUT_TOKENS,
+                    GEMINI_MAX_INPUT_TOKENS,
+                )
             vectors = _gemini_embed_contents(
                 self._get_gemini_client(),
                 [types.Content(parts=[types.Part.from_text(text=text)])],
