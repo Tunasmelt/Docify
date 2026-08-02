@@ -112,7 +112,7 @@ already been deleted while the pipeline was still mid-flight.
   predates it, just not exercised live until real delete requests started flowing from a real UI
   against real in-flight pipelines.
 
-## FEAT-024 (2026-07-28) — rate limiting closes ONE facet of SCOPE.md's "Production job execution" gap, not the whole thing
+## FEAT-024 (2026-07-28, extended 2026-08-02) — two of SCOPE.md's three "Production job execution" facets now closed
 
 `.agent/SCOPE.md`'s Phase 5 "Production job execution for `/ingest` (and `/query`)" entry has
 tracked three facets of the same underlying problem since it was written: durability, a real
@@ -120,17 +120,104 @@ worker-pool/queue architecture, and rate-limiting. This real Render deploy — t
 app ran against real, live, shared-quota vendor APIs in production — surfaced concrete evidence
 of exactly why the rate-limiting facet mattered (Voyage's real 3 RPM ceiling, Gemini's real
 20/day `gemini-2.5-flash` ceiling, both confirmed live in earlier sessions per `.agent/MEMORY.md`)
-and made it worth building ahead of the other two.
+and made it worth building ahead of the other two. **2026-08-02 update:** durability is now
+closed too (lazy reaper + `POST /reindex`, below) — only worker-pool/queue architecture remains
+open of the original three.
 
 - [x] **Rate-limiting on `/ingest` and `/query` (+ `/query/stream`) — done.** `apps/api/rate_limit.py`,
   real vendor-quota-derived per-user limits, verified live end-to-end (`test_rate_limit.py`).
   Full reasoning and numbers in `.agent/FEATURES.md`'s FEAT-024 entry and `.agent/SCOPE.md`.
-- [ ] **Durability and worker-pool/queue architecture — still open, NOT addressed by this
-  feature.** Rate-limiting only bounds how much NEW load can *start* — it does nothing for a
-  request already in flight. This gap is not hypothetical: this same deploy session's own
-  real-workload test against the live Render instance found `/ingest` OOM-crashing mid-Docling-
-  parse, silently leaving its document stuck at `status='parsing'` forever with the background
-  task simply gone (Render auto-restarted the container with zero record of the original
-  request) — exactly the "a process restart silently loses in-flight work" failure mode this
-  entry has named since before any real deploy existed to prove it. Rate-limiting a route that
-  can still crash mid-request once it starts is a real, separate, larger piece of work.
+- [x] **Durability — closed 2026-08-02 (FEAT-024 follow-up), lazy/reactive approach, not a
+  real worker-pool/queue.** Rate-limiting alone never addressed this — it bounds how much NEW
+  load can *start*, not what happens to a request already in flight. Closed via two additive
+  pieces: (1) `GET /documents` (`routes/documents.py`) opportunistically reaps any of the
+  requesting user's own documents still stuck in `'parsing'`/`'embedded'` past a justified
+  30-minute threshold (`STUCK_DOCUMENT_THRESHOLD_SECONDS`, `routes/ingest.py`) to `'failed'`,
+  with an honest error message ("processing timed out, possibly interrupted by a service
+  restart") — no scheduler, no cron, fires exactly when a user looks at their own document
+  list; (2) `POST /reindex/{document_id}` (new, `routes/ingest.py`) re-runs the pipeline from
+  the file already in Storage, recovering a reaped document (or any document, for other real
+  reasons — re-embedding one with Gemini-fallback chunks once Voyage quota recovers, retrying
+  FEAT-017's OCR chain on a pre-existing document).
+
+  **Proven against the ACTUAL failure mode, not a hand-crafted row:**
+  `apps/api/tests/test_reindex.py::test_reaper_and_reindex_recover_a_document_whose_pipeline_was_really_killed`
+  interrupts a real call to `run_ingest_pipeline()` via a `BaseException` subclass mid-parse —
+  deliberately NOT an `Exception`, so the function's own `except Exception: ... _fail_document(...)`
+  cleanup block never runs, the same way a real SIGKILL/OOM-kill bypasses Python's exception
+  handling entirely — confirms the document is left genuinely stuck at `'parsing'` with no error
+  message (proving interruption, not a handled failure, actually happened — this is exactly the
+  2026-07-27 OOM-crash's real observed shape), then drives the real `GET /documents` and
+  `POST /reindex/{id}` HTTP routes end-to-end to confirm full recovery to `'ready'` with real
+  chunk rows produced.
+
+  **Explicit, stated tradeoff — this is NOT a real crash-recovery system:** no automatic retry,
+  no dead-letter queue, no proactive detection (a document stays visibly stuck until a user's
+  own `GET /documents` call happens to run past the threshold — could be seconds or days later
+  depending on when they next look). Acceptable at this project's real scale (solo-dev
+  portfolio project, one Render free-tier instance, no meaningful concurrent-user load) and for
+  the failure this specifically closes — a rare backstop, not a load-bearing system. Full
+  reasoning and the tradeoff's explicit justification: `.agent/SCOPE.md`'s "Production job
+  execution" entry.
+- [ ] **Worker-pool/queue architecture — still open, NOT addressed by durability's fix above.**
+  Heavy Docling/Voyage work still runs on the request-serving process; no timeout/backpressure/
+  per-user concurrency cap exists for a task that's genuinely HUNG (not crashed) — the lazy
+  reaper only recovers a document once it's been stuck past the threshold, it does nothing to
+  stop a runaway task from consuming resources indefinitely in the meantime. A real, separate,
+  larger piece of work than either durability or rate-limiting.
+
+## 2026-07-31 — Real production data-loss incident: null citation marker crashed `create_query_turn`, losing an entire conversation turn
+
+**Report:** a real `POST /query/stream` turn (a broad "summarize the provided paper" request, not
+a narrow factual question) failed to persist with `null value in column 'marker' of relation
+'citations' violates not-null constraint`. Because `create_query_turn` (migrations/20260724_002,
+20260725_002) is ONE atomic plpgsql function — the citation INSERT loop runs after the
+user-question and assistant-answer message INSERTs in the same function body — any exception in
+that loop rolled back the message rows too, losing the entire turn (the generated answer had
+already streamed to the client's screen before the persist step failed). Directly connects to a
+separate report that chat history "doesn't persist."
+
+**Root cause — honestly reported, not overstated:** extensive live reproduction did NOT find a
+path where the current `routes/query.py` `_extract_claim_spans()` + persist-loop logic actually
+produces a null/unresolvable marker. Tested against 6+ real Gemini-generated broad-summarization
+answers (single-turn, multi-topic, and conversation-history-carrying follow-ups, one real run
+citing 20 distinct positions in dense nested-markdown-list prose) plus 8 hand-constructed
+adversarial answer shapes fed directly through the real parsing functions (trailing standalone
+`[N]` after the final sentence, leading brackets, markdown bullets/headers/numbered-list-as-
+bracket formatting, bracket-only sentences) — every citation the client-facing `generate()` call
+reports is already range-validated by `Generator._parse_citations`, and a position with no
+resolvable claim-bearing sentence is already silently dropped before ever reaching the persist
+loop (confirmed: this IS a real, separate, smaller bug — the dropped citation's `[N]` marker
+stays visible in the delivered answer text with no matching `CitationResponse`, since
+`dropped_positions` only tracks verified-UNSUPPORTED citations, not never-verified ones — logged
+here, not separately fixed, since it's cosmetic, not data-loss).
+
+**"Not reproduced today" is not "cannot happen," and this is exactly the class of bug (silent
+citation-integrity corruption, not a crash) this project has adversarially audited hardest.**
+Fixed defensively at both layers regardless of the unconfirmed exact trigger:
+- [x] **Python:** `routes/query.py`'s new `_is_resolvable_marker()` guard, applied identically in
+  `/query` and `/query/stream`, in BOTH the pre-verification loop (closes a previously-unguarded
+  `IndexError` risk on `generator_chunks[position-1]` — `post_query` has no surrounding
+  try/except past generation, unlike the streaming path) and the persist loop. A citation that
+  fails the guard is dropped the same fail-safe way a hallucinated out-of-range marker already
+  is — logged, never persisted, never returned to the client.
+- [x] **SQL:** `migrations/20260731_002_citation_persistence_defensive.sql` — each citation
+  INSERT inside `create_query_turn`'s loop is now wrapped in its own `BEGIN/EXCEPTION WHEN
+  OTHERS` block. A malformed citation (null marker, or any other cause) is logged via `RAISE
+  WARNING` and skipped; the message rows and every other valid citation in the same turn still
+  commit. This is the structural fix that actually satisfies "one bad citation must never cost
+  the whole turn," independent of whether the Python layer is ever proven airtight.
+- [x] **Regression tests** (both layers, both endpoints): `test_query.py`'s
+  `test_unresolvable_citation_position_is_dropped_not_crashed_rest_of_turn_persists` and
+  `test_create_query_turn_sql_skips_a_malformed_citation_without_losing_the_turn`, mirrored in
+  `test_query_stream.py` — use a hand-built `GenerateResult`/`GenerateStreamResult` to force the
+  exact unresolvable-position shape directly (since it can't be reliably coaxed out of a live,
+  non-deterministic model call), proving the turn survives with the valid citation intact and
+  the bad one silently dropped, in both streaming and non-streaming.
+
+**Follow-up worth doing, not done here (separate, smaller, cosmetic bug found along the way):**
+the "dropped, no resolvable claim text" citation case leaves its `[N]` marker visible in the
+answer text sent to the client with no matching citation object — should be added to
+`dropped_positions`/`_strip_dropped_markers` the same way an UNSUPPORTED verdict already is, so
+the visible answer never shows a dangling, unclickable marker. Not the data-loss bug reported
+here; logged for whoever picks it up next.

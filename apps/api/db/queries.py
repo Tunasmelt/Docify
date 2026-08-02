@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from services.embedder import EmbeddedChunk
@@ -49,7 +49,13 @@ def create_document(client, *, user_id: str, filename: str, storage_path: str, m
 # and page_count are stamped as milestones within the 'parsing' phase
 # rather than driving their own status value.
 def mark_parsing(client, document_id: str) -> None:
-    client.table("documents").update({"status": "parsing"}).eq("id", document_id).execute()
+    # `error` cleared explicitly (2026-08-02, FEAT-024 follow-up): a
+    # fresh document already has error=None, so this is a no-op for the
+    # normal /ingest path — but POST /reindex/{document_id} calls this on
+    # a document that may be sitting at status='failed' with a real error
+    # string from its last attempt, and that stale message must not
+    # linger once a fresh attempt is genuinely underway.
+    client.table("documents").update({"status": "parsing", "error": None}).eq("id", document_id).execute()
 
 
 def mark_parsed(client, document_id: str, *, page_count: int | None) -> None:
@@ -146,6 +152,78 @@ def get_document(client, *, document_id: str, user_id: str) -> dict | None:
     response either way)."""
     rows = client.table("documents").select(DOCUMENT_RESPONSE_COLUMNS).eq("id", document_id).eq("user_id", user_id).execute().data
     return rows[0] if rows else None
+
+
+def get_document_for_reindex(client, *, document_id: str, user_id: str) -> dict | None:
+    """Separate from get_document()/DOCUMENT_RESPONSE_COLUMNS deliberately
+    — POST /reindex/{document_id} (routes/ingest.py) needs storage_path
+    (to re-download the already-uploaded file) and created_at (to echo
+    back in the response), neither of which belongs in the public
+    DocumentResponse shape get_document() serves to GET /documents/{id}.
+    Scoped to user_id in the query itself, same discipline as
+    get_document() — a document that doesn't exist and one that belongs
+    to someone else both produce the same empty result, so the caller
+    can return an identical 404 for both."""
+    rows = (
+        client.table("documents")
+        .select("id,status,storage_path,created_at")
+        .eq("id", document_id)
+        .eq("user_id", user_id)
+        .execute()
+        .data
+    )
+    return rows[0] if rows else None
+
+
+def reap_stale_documents(client, *, user_id: str, threshold_seconds: int) -> list[str]:
+    """Marks any of this user's documents still stuck in 'parsing' or
+    'embedded' well past a reasonable processing time as 'failed', with
+    an honest, specific error message — the real, lazy alternative to a
+    worker-queue/scheduler this project doesn't have (routes/documents.py's
+    GET /documents calls this before returning results; see
+    STUCK_DOCUMENT_THRESHOLD_SECONDS in routes/ingest.py for the threshold
+    and its justification, and .agent/SCOPE.md for why this reactive
+    approach is an accepted tradeoff rather than a real job-queue fix).
+
+    Two separate status-specific checks, not one: 'parsing' has no
+    dedicated "started" timestamp of its own (created_at doubles as the
+    reference point, since parsing begins immediately after creation in
+    the real pipeline), while 'embedded' has a real, reliably-set
+    embedded_at (mark_embedded, routes/ingest.py) that's a tighter, more
+    accurate reference than created_at would be for a document that
+    already made it that far. Scoped to user_id — this fires
+    opportunistically from one user's own GET /documents call and has no
+    reason to touch any other user's rows.
+
+    Returns the ids of every document actually reaped (for logging);
+    empty list if nothing was stale.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=threshold_seconds)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    error_message = "processing timed out, possibly interrupted by a service restart"
+
+    reaped_ids: list[str] = []
+
+    stuck_parsing = (
+        client.table("documents")
+        .update({"status": "failed", "error": error_message})
+        .eq("user_id", user_id)
+        .eq("status", "parsing")
+        .lt("created_at", cutoff)
+        .execute()
+    )
+    reaped_ids.extend(row["id"] for row in stuck_parsing.data)
+
+    stuck_embedded = (
+        client.table("documents")
+        .update({"status": "failed", "error": error_message})
+        .eq("user_id", user_id)
+        .eq("status", "embedded")
+        .lt("embedded_at", cutoff)
+        .execute()
+    )
+    reaped_ids.extend(row["id"] for row in stuck_embedded.data)
+
+    return reaped_ids
 
 
 def list_documents(

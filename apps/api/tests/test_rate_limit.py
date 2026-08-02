@@ -22,7 +22,7 @@ import time
 import pytest
 
 from main import app
-from routes.ingest import INGEST_MINUTE_LIMIT
+from routes.ingest import INGEST_GLOBAL_MINUTE_LIMIT, INGEST_MINUTE_LIMIT
 from routes.query import QUERY_MINUTE_LIMIT
 from services.generator import GenerateResult, GenerateStreamResult
 from services.retriever import RetrievedChunk
@@ -57,6 +57,13 @@ def _ingest_request(app_client, token, filename="probe.pdf"):
         },
         headers={"Authorization": f"Bearer {token}"},
     )
+
+
+def _reindex_request(app_client, token):
+    # A nonexistent document_id -- reaches the route (and therefore the
+    # rate limiter, which runs before the route body via the decorator)
+    # but 404s immediately after, never touching a real pipeline.
+    return app_client.post(f"/reindex/{NIL_UUID}", headers={"Authorization": f"Bearer {token}"})
 
 
 def _query_request(app_client, token):
@@ -97,7 +104,24 @@ def test_ingest_rate_limit_exceeded_returns_429_with_error_envelope(app_client, 
     assert "Retry-After" in resp.headers or "retry-after" in resp.headers
 
 
-# Acceptance criterion: rate limiting is keyed per-user, not shared/per-IP -- one user hitting their limit never blocks another
+# Acceptance criterion: rate limiting is keyed per-user, not shared/per-IP -- one user's own per-user counter never blocks another user's own per-user counter
+#
+# 2026-08-02 (FEAT-024 follow-up): this test used to also drive user_a one
+# request PAST their own per-user limit (a 3rd, 429'd request) before
+# testing user_b -- that additional request is deliberately NOT made here
+# anymore. INGEST_GLOBAL_MINUTE_LIMIT ("3/minute", checked before the
+# per-user limit -- see test_global_rate_limit_trips_on_combined_usage_
+# across_two_users below for why decorator order matters here) means a
+# 3rd real attempt from user_a, even a per-user-rejected one, still
+# increments the shared global counter to 3 -- exactly the shared account-
+# level ceiling this same feature exists to protect. Combined with a 4th
+# request from user_b, that combination WOULD legitimately trip the
+# global limit -- correct new behavior, not a bug, but a different claim
+# than "per-user counters are independent," which is this test's own,
+# narrower scope. Staying at exactly `per_minute` requests for user_a
+# keeps the global counter at 2 (well under its own 3/minute cap), so
+# user_b's first request here is only ever gated by user_b's OWN
+# per-user counter, isolating the claim this test actually makes.
 def test_ingest_rate_limit_is_per_user_not_shared(app_client, admin, user_a, user_b):
     user_id_a, token_a = user_a
     user_id_b, token_b = user_b
@@ -106,13 +130,76 @@ def test_ingest_rate_limit_is_per_user_not_shared(app_client, admin, user_a, use
     for _ in range(per_minute):
         resp = _ingest_request(app_client, token_a)
         assert resp.status_code == 403
-    limited = _ingest_request(app_client, token_a)
-    assert limited.status_code == 429
 
     # A completely different real user, same TestClient, same in-memory
-    # limiter instance -- must NOT be affected by user_a's exhausted limit.
+    # limiter instance -- must NOT be affected by user_a's own per-user
+    # usage (user_a is AT their own cap here, not yet rejected by it).
     resp_b = _ingest_request(app_client, token_b)
-    assert resp_b.status_code == 403, f"user_b was incorrectly rate-limited by user_a's usage: {resp_b.status_code} {resp_b.text}"
+    assert resp_b.status_code == 403, f"user_b was incorrectly rate-limited by user_a's per-user usage: {resp_b.status_code} {resp_b.text}"
+
+
+# Acceptance criterion (Part 1, item 2): the GLOBAL limit trips on COMBINED
+# usage across different real users, independent of either user's own
+# per-user count -- the specific scenario a per-user-only design
+# structurally cannot catch (N users each within their own limit still
+# collectively exceeding the real shared vendor ceiling).
+def test_global_rate_limit_trips_on_combined_usage_across_two_users(app_client, admin, user_a, user_b):
+    user_id_a, token_a = user_a
+    user_id_b, token_b = user_b
+    global_per_minute = int(INGEST_GLOBAL_MINUTE_LIMIT.split("/")[0])
+
+    # 3 requests alternating between two different real users -- user_a
+    # makes 2 (their own full per-user allowance), user_b makes 1 (well
+    # under theirs). Neither user's OWN counter is exceeded by this, but
+    # combined they exactly exhaust the shared 3/minute global budget.
+    resp = _ingest_request(app_client, token_a)
+    assert resp.status_code == 403
+    resp = _ingest_request(app_client, token_b)
+    assert resp.status_code == 403
+    resp = _ingest_request(app_client, token_a)
+    assert resp.status_code == 403
+
+    # A 4th combined request, from user_b again -- user_b's OWN per-user
+    # count would only reach 2 (still within their own 2/minute cap), but
+    # the SHARED global counter reaches 4, over its 3/minute cap. Must be
+    # rejected, and specifically by the GLOBAL limit (verified via its
+    # own distinct value in the message, not either user's per-user one).
+    resp = _ingest_request(app_client, token_b)
+    assert resp.status_code == 429, f"expected the 4th combined request (within both users' own per-user caps) to trip the global limit: {resp.status_code} {resp.text}"
+    message = resp.json()["error"]["message"]
+    assert f"{global_per_minute} per 1 minute" in message, f"expected the GLOBAL limit's own value ({global_per_minute}/minute) to be what bound here, got: {message!r}"
+
+
+# Acceptance criterion (Part 1, item 3): the global limit must never bind
+# for a single active user well under their own per-user limit -- it
+# should only ever be the tighter constraint when combined usage genuinely
+# warrants it, never as an accidental side effect of existing alongside
+# the per-user limit.
+def test_global_rate_limit_does_not_bind_for_a_single_user_under_their_own_limit(app_client, admin, user_a):
+    user_id, token = user_a
+    per_minute = int(INGEST_MINUTE_LIMIT.split("/")[0])
+    global_per_minute = int(INGEST_GLOBAL_MINUTE_LIMIT.split("/")[0])
+    assert per_minute < global_per_minute, (
+        "this test's premise (global should never bind for a lone user) requires the per-user "
+        "cap to stay strictly tighter than the global one -- re-check these constants if this fires"
+    )
+
+    for _ in range(per_minute):
+        resp = _ingest_request(app_client, token)
+        assert resp.status_code == 403
+
+    # One more, past user_a's OWN cap -- rejected, but by the PER-USER
+    # limit specifically. user_a is the only active user in this test, so
+    # the shared global counter is nowhere near its own, looser cap --
+    # confirmed by checking which limit's value shows up in the message,
+    # not just that SOME 429 happened.
+    resp = _ingest_request(app_client, token)
+    assert resp.status_code == 429
+    message = resp.json()["error"]["message"]
+    assert f"{per_minute} per 1 minute" in message, (
+        f"expected the PER-USER limit to be what bound here (global must never fire for a lone "
+        f"user under it), got: {message!r}"
+    )
 
 
 # Acceptance criterion: an invalid/missing JWT is always rejected with 401 before the limiter ever runs -- never counted, never 429
@@ -216,6 +303,133 @@ def test_documents_and_conversations_routes_are_not_rate_limited(app_client, adm
     for _ in range(calls):
         resp = app_client.get("/conversations", headers={"Authorization": f"Bearer {token}"})
         assert resp.status_code == 200, f"conversations route was unexpectedly rate-limited: {resp.status_code} {resp.text}"
+
+
+# --- Part 2 (2026-08-02 FEAT-024 follow-up): Postgres-backed daily counters ---
+#
+# Acceptance criterion (Part 2, item 3): the DAILY limit must survive the
+# real failure mode that motivates moving it off slowapi's in-memory
+# storage — Render's free tier wiping all in-memory state on every
+# ~15-minute idle spin-down. app.state.limiter.reset() (this file's own
+# established stand-in for "the process restarted", already used by the
+# _enable_rate_limiter fixture above for setup/teardown isolation) clears
+# every in-memory per-minute/global counter; the daily Postgres counter
+# must NOT reset alongside it.
+def test_daily_limit_count_survives_in_memory_state_being_cleared(app_client, admin, user_a):
+    user_id, token = user_a
+
+    def real_ingest_request(filename):
+        storage_path = upload_placeholder(user_id, token, filename=filename)
+        override_pipeline()  # Fake parser/chunker/embedder — no real Voyage/Gemini calls, fast
+        try:
+            return app_client.post(
+                "/ingest",
+                json={"storage_path": storage_path, "filename": filename, "mime_type": "application/pdf", "size_bytes": 17},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        finally:
+            clear_pipeline_override()
+
+    # 2 real, successful ingests (a valid storage_path this time, not the
+    # wrong-owner one _ingest_request uses elsewhere in this file — the
+    # daily-limit check runs AFTER storage_path validation in post_ingest,
+    # so a request that 403s there never reaches it) — both within the
+    # per-minute limits, daily Postgres counter should now read 2.
+    for i in range(2):
+        resp = real_ingest_request(f"daily-pre-restart-{i}.pdf")
+        assert resp.status_code == 202, f"expected a real successful ingest, got {resp.status_code}: {resp.text}"
+
+    app.state.limiter.reset()
+
+    # 2 more, post-"restart" — per-minute counters are fresh again
+    # (proving the reset genuinely cleared them, since 2 more requests
+    # succeed instead of immediately 429ing), but the DAILY count must
+    # NOT be — it should now read 4, not have reset back to 2.
+    for i in range(2):
+        resp = real_ingest_request(f"daily-post-restart-{i}.pdf")
+        assert resp.status_code == 202, f"post-restart request unexpectedly failed: {resp.status_code}: {resp.text}"
+
+    rows = admin.table("usage_counters").select("count").eq("user_id", user_id).eq("route", "ingest").execute().data
+    assert rows, "expected a usage_counters row for this user/route to exist"
+    assert rows[0]["count"] == 4, (
+        f"expected the daily count to have survived the simulated restart at 4 (2 before + 2 after), "
+        f"got {rows[0]['count']} — a value of 2 would mean the count was lost/reset, defeating the "
+        f"whole point of moving this off in-memory storage"
+    )
+
+
+# Acceptance criterion (Part 2, item 2 — explicit statement, not silence):
+# per-minute limits deliberately stay on slowapi's in-memory storage; only
+# the daily ones moved to Postgres. Confirms the per-minute limit is
+# genuinely unaffected by usage_counters existing at all — same real 429
+# behavior as before this feature, on the same request shape the original
+# FEAT-024 tests already use.
+def test_per_minute_limit_still_uses_in_memory_storage_not_postgres(app_client, admin, user_a):
+    user_id, token = user_a
+    per_minute = int(INGEST_MINUTE_LIMIT.split("/")[0])
+
+    for _ in range(per_minute):
+        resp = _ingest_request(app_client, token)
+        assert resp.status_code == 403
+
+    resp = _ingest_request(app_client, token)
+    assert resp.status_code == 429
+    # The per-minute rejection happens at storage_path validation time
+    # (wrong-owner path), strictly BEFORE post_ingest ever constructs a
+    # client or calls check_daily_limit — so no usage_counters row should
+    # exist for this user at all yet.
+    rows = admin.table("usage_counters").select("count").eq("user_id", user_id).eq("route", "ingest").execute().data
+    assert rows == [], f"expected no usage_counters row (per-minute rejection never reaches the daily check), got {rows}"
+
+
+# --- Part 3, item 4 (2026-08-02 FEAT-024 follow-up): POST /reindex shares --
+# --- /ingest's rate-limit infrastructure, not a separate, looser budget ---
+
+
+# Acceptance criterion: /reindex and /ingest share ONE per-user per-minute
+# counter (INGEST_RATE_LIMIT_SCOPE) -- exhausting one via one route trips
+# the other immediately, the same discipline query.py already proves for
+# /query + /query/stream sharing QUERY_RATE_LIMIT_SCOPE.
+def test_reindex_and_ingest_share_one_per_user_per_minute_limit(app_client, admin, user_a):
+    user_id, token = user_a
+    per_minute = int(INGEST_MINUTE_LIMIT.split("/")[0])
+
+    hits = 0
+    while hits < per_minute:
+        resp = _ingest_request(app_client, token) if hits % 2 == 0 else _reindex_request(app_client, token)
+        assert resp.status_code in (403, 404), f"expected pre-limit request #{hits} to reach its route body, got {resp.status_code}: {resp.text}"
+        hits += 1
+
+    # Whichever route comes next, on a counter already exhausted by the
+    # OTHER route, must be rejected -- proving one shared counter, not two.
+    over_limit = _reindex_request(app_client, token)
+    assert over_limit.status_code == 429, "expected /reindex to be rate-limited by /ingest's own prior usage (shared per-user counter)"
+
+
+# Acceptance criterion: /reindex also draws on the SAME global per-minute
+# counter as /ingest -- combined usage across both routes trips it, not
+# just combined usage within one route.
+def test_reindex_and_ingest_share_the_global_per_minute_limit(app_client, admin, user_a, user_b):
+    user_id_a, token_a = user_a
+    user_id_b, token_b = user_b
+    global_per_minute = int(INGEST_GLOBAL_MINUTE_LIMIT.split("/")[0])
+
+    # 3 requests across both routes AND both users -- reaching the global
+    # cap exactly, none of it from a single route or a single user alone.
+    resp = _ingest_request(app_client, token_a)
+    assert resp.status_code in (403, 404)
+    resp = _reindex_request(app_client, token_b)
+    assert resp.status_code in (403, 404)
+    resp = _ingest_request(app_client, token_a)
+    assert resp.status_code in (403, 404)
+
+    # A 4th, on /reindex, from user_b (whose own per-user count would
+    # only reach 2, still within their own cap) -- must trip the shared
+    # global limit.
+    resp = _reindex_request(app_client, token_b)
+    assert resp.status_code == 429, f"expected /reindex to be bound by the shared global limit: {resp.status_code} {resp.text}"
+    message = resp.json()["error"]["message"]
+    assert f"{global_per_minute} per 1 minute" in message, f"expected the GLOBAL limit's own value to be what bound here, got: {message!r}"
 
 
 # Real, slow: confirms the per-minute window genuinely resets after real

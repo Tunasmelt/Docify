@@ -10,7 +10,7 @@ from db import queries
 from db.client import get_service_role_client
 from errors import error_envelope
 from models.ingest import IngestRequest, IngestResponse
-from rate_limit import limiter
+from rate_limit import DailyLimitExceeded, check_daily_limit, daily_limit_exceeded_response, global_key, limiter
 from services.chunker import Chunker
 from services.embedder import Embedder
 
@@ -43,20 +43,57 @@ router = APIRouter()
 # room for at least one other real user to also ingest several
 # documents before the shared 20/day ceiling is at risk.
 #
-# Known, stated limitation: these are per-user, per-route limits, not a
-# single global counter shared across /ingest and /query together —
-# slowapi's per-route decorators can't perfectly enforce the TRUE
-# combined cross-endpoint 3 RPM/20-per-day ceiling on their own (one
-# user hammering both /ingest and /query simultaneously could still,
-# in the worst case, exceed the shared vendor budget alone). What these
-# values DO guarantee: no single accidental loop (a UI bug, a naive
-# script) or casual abuser can silently exhaust either vendor quota
-# without being throttled almost immediately. A mathematically airtight
-# global guarantee would need a single shared counter across both
-# routes, which the task scoped this feature against per-route, not as
-# one unified budget.
+# Still-stated limitation, narrowed 2026-08-02 (see INGEST_GLOBAL_MINUTE_
+# LIMIT below): these are per-user, per-route limits, not a single global
+# counter shared across /ingest and /query together — one user hammering
+# both routes simultaneously could still, in the worst case, exceed the
+# shared vendor budget alone (that specific cross-ENDPOINT gap remains
+# open, matching this feature's original scope of one route at a time).
+# What's now closed is the narrower, more common version of the same
+# problem WITHIN /ingest: N different users, each individually well
+# under their own per-user limit, collectively exceeding the true
+# account-level ceiling — INGEST_GLOBAL_MINUTE_LIMIT is a second,
+# independent limit keyed by a fixed "global" key (rate_limit.py),
+# enforced alongside (not instead of) the per-user ones below.
 INGEST_MINUTE_LIMIT = "2/minute"
 INGEST_DAY_LIMIT = "10/day"
+INGEST_RATE_LIMIT_SCOPE = "ingest_action"
+
+# 2026-08-02 (FEAT-024 follow-up) — real account-level Voyage ceiling
+# (3 RPM, .agent/MEMORY.md), enforced as ONE counter across every user
+# combined, not per-user. Deliberately equal to the real vendor ceiling
+# itself (not a fraction of it, unlike the per-user 2/minute above) —
+# this is the last line of defense specifically for the scenario the
+# per-user limit structurally cannot catch: e.g. 2 users each making
+# their own individually-fine 2/minute of requests still sum to 4/minute
+# against a real 3/minute shared budget. Shared with POST /reindex under
+# the same scope (INGEST_GLOBAL_RATE_LIMIT_SCOPE) — reindex draws on the
+# identical real Voyage embed call, and the account-level ceiling doesn't
+# care which route the call came from.
+INGEST_GLOBAL_MINUTE_LIMIT = "3/minute"
+INGEST_GLOBAL_RATE_LIMIT_SCOPE = "ingest_global"
+
+# 2026-08-02 (FEAT-024 follow-up) — how long a document can sit in
+# 'parsing'/'embedded' before GET /documents treats it as dead and reaps
+# it to 'failed' (routes/documents.py). No dedicated ingest-pipeline
+# latency benchmark exists in this project (FEAT-012's latency work is
+# /query's end-to-end budget, ~4-8.3s — a different pipeline); derived
+# instead from this pipeline's own real measured components: parsing
+# itself is ~1-2s post-FEAT-027 (was up to 86.55s under the old Docling
+# parser, .agent/SCOPE.md), and the real bottleneck is FEAT-017's OCR
+# fallback chain — up to ~3 minutes worst-case PER low-confidence page
+# (three sequential 60s per-tier timeouts, .agent/SCOPE.md's 2026-07-26
+# update). A document with several bad pages could legitimately take
+# 15-20+ real minutes. 30 minutes gives that generous headroom (a
+# document would need ~10 consecutive worst-case OCR pages to
+# legitimately still be running at that point — possible but not a
+# realistic fixture/user document seen in this project so far) while
+# still recovering a genuinely dead document within a bounded, honest
+# window rather than leaving it stuck indefinitely. Documented, accepted
+# tradeoff, not a proven-optimal number: a pathological real document
+# could still be a false-positive reap — POST /reindex/{document_id}
+# recovers it immediately if so.
+STUCK_DOCUMENT_THRESHOLD_SECONDS = 30 * 60
 
 # FEAT-020 (2026-07-27): extended from PDF-only to also accept DOCX,
 # PPTX, and HTML — verified per-format against real fixtures, not assumed
@@ -200,8 +237,8 @@ def get_pipeline_runner():
 
 
 @router.post("/ingest", status_code=202, response_model=IngestResponse)
-@limiter.limit(INGEST_MINUTE_LIMIT)
-@limiter.limit(INGEST_DAY_LIMIT)
+@limiter.shared_limit(INGEST_MINUTE_LIMIT, scope=INGEST_RATE_LIMIT_SCOPE)
+@limiter.shared_limit(INGEST_GLOBAL_MINUTE_LIMIT, scope=INGEST_GLOBAL_RATE_LIMIT_SCOPE, key_func=global_key)
 async def post_ingest(
     payload: IngestRequest,
     request: Request,
@@ -255,6 +292,16 @@ async def post_ingest(
         )
 
     client = get_service_role_client()
+
+    # Postgres-backed daily limit (rate_limit.py) — NOT slowapi's
+    # in-memory storage, replacing the old @limiter.limit(INGEST_DAY_LIMIT)
+    # decorator. Shares one counter (route="ingest") with POST /reindex —
+    # both draw on the identical real Voyage/Gemini daily budget.
+    try:
+        check_daily_limit(client, user_id=user_id, route="ingest", limit=int(INGEST_DAY_LIMIT.split("/")[0]))
+    except DailyLimitExceeded:
+        return daily_limit_exceeded_response()
+
     document = queries.create_document(
         client,
         user_id=user_id,
@@ -269,6 +316,109 @@ async def post_ingest(
     )
 
     return IngestResponse(document_id=document["id"], status=document["status"], created_at=document["created_at"])
+
+
+@router.post("/reindex/{document_id}", status_code=202, response_model=IngestResponse)
+@limiter.shared_limit(INGEST_MINUTE_LIMIT, scope=INGEST_RATE_LIMIT_SCOPE)
+@limiter.shared_limit(INGEST_GLOBAL_MINUTE_LIMIT, scope=INGEST_GLOBAL_RATE_LIMIT_SCOPE, key_func=global_key)
+async def post_reindex(
+    document_id: str,
+    request: Request,
+    response: Response,
+    background_tasks: BackgroundTasks,
+    pipeline_runner=Depends(get_pipeline_runner),
+):
+    """Re-runs the full ingest pipeline for an EXISTING document, from the
+    file already sitting in Storage — no new upload. Real use cases this
+    unlocks (2026-08-02, FEAT-024 follow-up):
+
+    1. Recovering a document GET /documents just reaped to 'failed'
+       (routes/documents.py's lazy stuck-document reaper) after a crashed
+       or interrupted background task — this is what closes the durability
+       gap `.agent/SCOPE.md`/`.agent/GAPS.md` have tracked since FEAT-024.
+    2. Re-embedding a document that has one or more Gemini-fallback
+       chunks (`chunks.embedding_provider = 'gemini'`) once Voyage's own
+       quota has recovered. Real, honestly-stated behavior: this does NOT
+       guarantee a Voyage-only result — `run_ingest_pipeline` calls the
+       same `Embedder.embed()` FEAT-031 already uses, which falls back to
+       Gemini again under the identical real conditions (Voyage's retries
+       genuinely exhausted for a batch) if they're still true at reindex
+       time. What reindex guarantees is a FRESH ATTEMPT against Voyage
+       first, not a forced provider.
+    3. Retrying FEAT-017's OCR fallback chain on a document that predates
+       it, or that failed OCR the first time — same mechanism as (2): a
+       fresh parse re-runs the current `Parser`, OCR chain included.
+
+    Shares its rate limits with POST /ingest (same INGEST_RATE_LIMIT_SCOPE/
+    INGEST_GLOBAL_RATE_LIMIT_SCOPE, same Postgres daily counter under
+    route="ingest") — it triggers the identical real Voyage/Gemini calls
+    /ingest does and draws on the same real vendor budgets, so it should
+    be bound by the same real constraints, not a separate, looser set.
+    """
+    user_id = request.state.user_id
+    client = get_service_role_client()
+
+    document = queries.get_document_for_reindex(client, document_id=document_id, user_id=user_id)
+    if document is None:
+        # Same response whether document_id doesn't exist at all or
+        # belongs to another user — get_document_for_reindex() scopes
+        # user_id in the query itself (same discipline as GET/DELETE
+        # /documents/{id}), so there's nothing here to accidentally leak.
+        return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "document not found"))
+
+    if document["status"] in ("parsing", "embedded"):
+        # Same real conflict DELETE /documents/{id} already guards
+        # against (routes/documents.py) — a still-running background
+        # task's later insert_chunks() call would otherwise race a
+        # reindex's own delete_chunks_for_document() below.
+        return JSONResponse(
+            status_code=409,
+            content=error_envelope("CONFLICT", "document is currently being processed"),
+        )
+
+    try:
+        check_daily_limit(client, user_id=user_id, route="ingest", limit=int(INGEST_DAY_LIMIT.split("/")[0]))
+    except DailyLimitExceeded:
+        return daily_limit_exceeded_response()
+
+    # Existing chunks must go before the pipeline re-runs — chunks.
+    # (document_id, chunk_index) is unique (SCHEMA.md), so a fresh bulk
+    # insert_chunks() would otherwise fail outright on the very first
+    # overlapping index. Done synchronously, before the background task
+    # is even queued, not inside run_ingest_pipeline() itself — keeps
+    # that function's own logic completely untouched (task's explicit
+    # "matching run_ingest_pipeline's existing logic as closely as
+    # possible rather than duplicating it").
+    #
+    # Known, accepted gap (matches this project's existing SCOPE.md
+    # pattern for the figure-upload-before-later-failure gap): old
+    # figure Storage objects are not explicitly deleted here. In the
+    # common case a re-parse produces the same or more figures, and
+    # _upload_figures() reuses the identical {user_id}/{document_id}/
+    # {chunk_index}.png path convention, so the old object is simply
+    # overwritten, not orphaned. A re-parse that produces FEWER figures
+    # than before could leave a stale, unreferenced object at a
+    # higher chunk_index — not cleaned up here, not a correctness bug
+    # (nothing in `chunks` points at it after this reindex), just a
+    # storage-bytes gap, same class of accepted tradeoff as the existing
+    # SCOPE.md entry.
+    queries.delete_chunks_for_document(client, document_id)
+
+    # Synchronous, not left for run_ingest_pipeline()'s own internal
+    # mark_parsing() call — guarantees the response body below reports
+    # the real DB status at the moment it's built (same discipline
+    # POST /ingest's create-then-report already uses), and immediately
+    # signals any concurrent GET /documents call that this document is
+    # back in flight, not still sitting at 'failed'. run_ingest_pipeline()
+    # calling mark_parsing() again internally is a harmless, idempotent
+    # re-set of the same value — not a duplicated side effect.
+    queries.mark_parsing(client, document_id)
+
+    background_tasks.add_task(
+        pipeline_runner, document_id=document_id, user_id=user_id, storage_path=document["storage_path"]
+    )
+
+    return IngestResponse(document_id=document_id, status="parsing", created_at=document["created_at"])
 
 
 def run_ingest_pipeline(

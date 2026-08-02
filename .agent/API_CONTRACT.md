@@ -102,6 +102,40 @@ Kicks off document parsing + embedding for a file already uploaded to Supabase S
 - `403 FORBIDDEN` if `storage_path` does not start with `uploads/{jwt.user_id}/`
 - `422 VALIDATION_ERROR` if mime_type unsupported
 - `429 RATE_LIMITED` (added 2026-07-28, FEAT-024) — **2 requests/minute** and **10 requests/day**, per user (`request.state.user_id`, never IP). Real vendor-quota-derived, not round numbers: each ingest makes ~1 Voyage embed call against Voyage's real, shared 3 RPM free-tier ceiling (`.agent/MEMORY.md`); a scanned document's OCR fallback can make several `gemini-2.5-flash` calls against that model's real, shared 20/day ceiling (also `.agent/MEMORY.md`) — both budgets are shared across every user of this app, not per-user, so per-user limits are deliberately tight. Full reasoning in `apps/api/routes/ingest.py`'s own comment.
+  - **Added 2026-08-02 (FEAT-024 follow-up) — a second, GLOBAL per-minute limit, `3/minute`, checked alongside (not instead of) the per-user one above.** Keyed by a fixed value, not `user_id` — one counter shared across every user of this app. Closes a real, structural gap the per-user limit alone can't: N different users, each individually within their own 2/minute cap, can still collectively exceed the true account-level Voyage 3 RPM ceiling (e.g. 2 users × 2/minute = 4/minute against a real 3/minute shared budget). Shared with `POST /reindex/{document_id}` below under the same scope — both draw on the identical real vendor call.
+  - **Daily limit mechanism changed 2026-08-02 (FEAT-024 follow-up):** the 10/day figure is unchanged, but it's now enforced via a Postgres-backed counter (`usage_counters` table, migration `20260802_001_usage_counters.sql`), not slowapi's in-memory storage — Render's free tier loses all in-memory state on every ~15-minute idle spin-down, which would otherwise let a user ride out a restart and get a fresh daily budget mid-day. The per-minute limits (both the per-user one above and the new global one) deliberately stay in-memory — a 15-minute gap already exceeds any per-minute window, so a restart-induced reset there is indistinguishable from a legitimate one.
+
+---
+
+### `POST /reindex/{document_id}`
+Re-runs the full ingest pipeline for a document already in the system — re-downloads the file from Storage (no new upload), re-parses, re-chunks, re-embeds, replacing its chunks entirely. Added 2026-08-02 (FEAT-024 follow-up); this section replaces the "not-yet-defined" stub this endpoint had carried since the contract was first written.
+
+**Request:** no body — `document_id` is a path parameter, `user_id` comes from the JWT.
+
+**Response 202 (accepted, processing async):**
+```json
+{
+  "document_id": "3f9e...",
+  "status": "parsing",
+  "created_at": "2026-07-22T14:30:00Z"
+}
+```
+Unlike `POST /ingest`'s response (which reports the just-inserted `'uploaded'` status), this reports `'parsing'` — the route synchronously resets the document to that status before returning, since (unlike a fresh ingest) there's an existing status this call is actively moving the document away from.
+
+**Real use cases this unlocks:**
+1. **Recovering a document the lazy stuck-document reaper marked `'failed'`** (see `GET /documents` below) after its background task was interrupted (a crashed process, an OOM-kill, a redeploy mid-flight) — this is the durability recovery mechanism `.agent/SCOPE.md`/`.agent/GAPS.md` have tracked as an open gap since FEAT-024.
+2. **Re-embedding a document with one or more Gemini-fallback chunks** (`chunks.embedding_provider = 'gemini'`, see the embedding-fallback note above) once Voyage's quota has recovered. Real, honestly-stated behavior: this does NOT force a Voyage-only result — it re-runs the same `Embedder.embed()` logic, which falls back to Gemini again under the identical real conditions if they're still true. What it guarantees is a fresh attempt against Voyage first, not a forced provider.
+3. **Retrying FEAT-017's OCR fallback chain** on a document that predates it, or that failed OCR the first time — a fresh parse re-runs the current parser, OCR chain included.
+
+**Behaviour:**
+- Existing `chunks` rows for this document are deleted before the pipeline re-runs (`chunks.(document_id, chunk_index)` is unique — a fresh bulk insert would otherwise fail on the first overlapping index). Old figure Storage objects are not explicitly deleted — in the common case a re-parse reuses the same `{user_id}/{document_id}/{chunk_index}.png` path convention and simply overwrites them; a re-parse producing fewer figures than before can leave a stale, unreferenced object at a higher index (a storage-bytes gap, not a correctness bug — nothing in `chunks` points at it after reindex). Known, accepted tradeoff, same class as the existing figure-upload-before-later-failure gap.
+- `documents.error` is cleared as part of the reset to `'parsing'`, even if the prior attempt left one.
+- Status progresses `parsing` → `embedded` → `ready` (or `failed`) exactly like `POST /ingest` — same background task, same `run_ingest_pipeline()`.
+
+**Errors:**
+- `404 NOT_FOUND` if `document_id` doesn't exist or belongs to another user (same non-distinguishing response as every other document route)
+- `409 CONFLICT` if the document currently has a real in-flight background task — `status in ('parsing', 'embedded')` (same discipline as `DELETE /documents/{document_id}` below)
+- `429 RATE_LIMITED` — shares `POST /ingest`'s rate-limit infrastructure entirely: the same per-user `2/minute` counter, the same global `3/minute` counter, and the same Postgres-backed `10/day` counter (one shared daily total across `/ingest` and `/reindex` combined, not two separate 10/day budgets) — it triggers the identical real Voyage/Gemini calls `/ingest` does, so it draws on the same real vendor budgets rather than a separate, looser set.
 
 ---
 
@@ -142,6 +176,8 @@ Lists the user's documents.
   "next_cursor": "opaque-string-or-null"
 }
 ```
+
+**Behaviour — lazy stuck-document reaper (added 2026-08-02, FEAT-024 follow-up):** before the list above is built, any of this user's documents still sitting in `'parsing'` or `'embedded'` past a 30-minute threshold are flipped to `'failed'` with `error: "processing timed out, possibly interrupted by a service restart"`. No scheduler or cron job — this runs opportunistically, exactly when a user's own document list is requested, scoped to that user's own rows only. Real failure mode this recovers from: a background task that dies mid-flight (a crashed process, an OOM-kill, a redeploy) previously left its document stuck forever with nothing to ever move it out of that state — this is what closes that gap. A reaped document shows up as `'failed'` in the SAME response that reaped it, not one request later. Recover a reaped document via `POST /reindex/{document_id}` above. 30-minute threshold reasoning: `apps/api/routes/ingest.py`'s `STUCK_DOCUMENT_THRESHOLD_SECONDS`.
 
 ---
 
@@ -336,7 +372,6 @@ Deletes the conversation and its messages + citations.
 - `POST /conversations/{id}/rename`
 - `GET /conversations/{id}/export` — markdown export
 - `PATCH /documents/{id}` — rename
-- `POST /reindex/{document_id}` — re-run embedding after model upgrade
 
 ---
 

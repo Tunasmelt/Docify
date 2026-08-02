@@ -8,6 +8,7 @@ from db.client import get_service_role_client
 from errors import error_envelope
 from models.documents import DocumentListResponse, DocumentResponse
 from routes._pagination import decode_cursor, encode_cursor
+from routes.ingest import STUCK_DOCUMENT_THRESHOLD_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,21 @@ async def list_documents(
 
     user_id = request.state.user_id
     client = get_service_role_client()
+
+    # Lazy stuck-document reaper (2026-08-02, FEAT-024 follow-up) — no
+    # scheduler, no cron dependency, fires opportunistically exactly when
+    # a user is looking at their own document list. Real failure mode
+    # this closes: a background task that dies mid-flight (the pre-
+    # FEAT-027 Render OOM crash — .agent/GAPS.md's FEAT-024 entry — being
+    # the proven real example) leaves its document stuck in 'parsing' or
+    # 'embedded' forever, with nothing to ever move it out of that state
+    # on its own. Runs before the real query below so a just-reaped
+    # document shows up as 'failed' (recoverable via POST /reindex) in
+    # THIS same response, not one request later.
+    reaped = queries.reap_stale_documents(client, user_id=user_id, threshold_seconds=STUCK_DOCUMENT_THRESHOLD_SECONDS)
+    if reaped:
+        logger.warning("reaped %d stale document(s) for user %s: %s", len(reaped), user_id, reaped)
+
     rows = queries.list_documents(client, user_id=user_id, status=status, limit=limit, cursor_created_at=cursor_created_at)
 
     # Fetched limit + 1 to detect whether another page exists without a
