@@ -10,6 +10,7 @@ import docx
 import httpx
 import pdfplumber
 import pptx
+from pptx.enum.shapes import PP_PLACEHOLDER
 import pytesseract
 from google import genai
 from google.genai import types
@@ -512,11 +513,20 @@ def _parse_pdf(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
                 # lines into one paragraph-level element (small vertical
                 # gap = still the same paragraph), matching the
                 # granularity real documents' own paragraph structure
-                # actually has — HEADING/LIST/CAPTION lines never merge,
-                # each stays its own element.
+                # actually has — HEADING/LIST lines never merge, each
+                # stays its own element. CAPTION lines DO merge with
+                # immediately-following close-gap lines that don't
+                # themselves start something new (audit finding,
+                # 2026-08-02: a caption's own text was silently truncated
+                # to its first visual line — e.g. "Table 10: ... (multiple"
+                # dropped "layout problems)" — because only the
+                # prefix-matching first line was ever captured; a caption
+                # wrapping onto a second line is common and was never
+                # continued).
                 page_captions: list[dict] = []
                 page_elements: list[dict] = []
                 text_buffer: list[dict] = []
+                caption_buffer: list[dict] = []
 
                 def flush_text_buffer():
                     nonlocal element_counter
@@ -532,24 +542,62 @@ def _parse_pdf(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
                     page_elements.append({"type": ElementType.TEXT, "bbox": bbox, "content": combined_text})
                     text_buffer.clear()
 
+                def flush_caption_buffer():
+                    if not caption_buffer:
+                        return
+                    combined_text = " ".join(l["text"] for l in caption_buffer)
+                    bbox = (
+                        min(l["x0"] for l in caption_buffer),
+                        caption_buffer[0]["top"],
+                        max(l["x1"] for l in caption_buffer),
+                        caption_buffer[-1]["bottom"],
+                    )
+                    page_captions.append({"bbox": bbox, "text": combined_text})
+                    caption_buffer.clear()
+
                 prev_bottom = None
                 for line in non_table_lines:
                     kind = _classify_line(line, body_size, body_x0)
                     line_height = line["bottom"] - line["top"] or 12.0
                     gap = (line["top"] - prev_bottom) if prev_bottom is not None else 0.0
+
+                    # A close-gap line right after an in-progress caption is
+                    # that caption's continuation — a wrapped caption line
+                    # has no "Table N:" prefix of its own, so _classify_line
+                    # reads it as either TEXT or (since it usually shares the
+                    # caption's own bold styling — confirmed live: "layout
+                    # problems)" continuing "Table 10: ... (multiple" is
+                    # short + bold, matching the whole-line-bold heading
+                    # heuristic) HEADING. Absorb both into the caption
+                    # instead of starting a new element; LIST is excluded —
+                    # a bullet-prefixed line is a genuine new list item, not
+                    # a caption wrapping onto another line.
+                    if (
+                        caption_buffer
+                        and kind in (ElementType.TEXT, ElementType.HEADING)
+                        and gap <= line_height * 1.5
+                    ):
+                        caption_buffer.append(line)
+                        prev_bottom = line["bottom"]
+                        continue
+
                     if kind == ElementType.TEXT:
                         if text_buffer and gap > line_height * 1.5:
                             flush_text_buffer()
+                        flush_caption_buffer()
                         text_buffer.append(line)
                     else:
                         flush_text_buffer()
-                        bbox = (line["x0"], line["top"], line["x1"], line["bottom"])
                         if kind == ElementType.CAPTION:
-                            page_captions.append({"bbox": bbox, "text": line["text"]})
+                            flush_caption_buffer()
+                            caption_buffer.append(line)
                         else:
+                            flush_caption_buffer()
+                            bbox = (line["x0"], line["top"], line["x1"], line["bottom"])
                             page_elements.append({"type": kind, "bbox": bbox, "content": line["text"]})
                     prev_bottom = line["bottom"]
                 flush_text_buffer()
+                flush_caption_buffer()
 
                 # Tier 1: match this page's captions to this page's
                 # tables/figures by reading-order + bbox proximity.
@@ -857,8 +905,17 @@ def _parse_pptx(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
                 if not shape.has_text_frame:
                     continue
 
-                is_title = shape.is_placeholder and shape.placeholder_format.type is not None and (
-                    "TITLE" in str(shape.placeholder_format.type)
+                # Exact enum-member comparison, not substring containment —
+                # 2026-08-02 audit finding: `"TITLE" in str(placeholder_type)`
+                # also matched SUBTITLE (python-pptx's str() for that member
+                # is "SUBTITLE (4)", which contains "TITLE" as a substring),
+                # misclassifying real slide subtitles — genuinely
+                # descriptive/body text — as HEADING elements. CENTER_TITLE
+                # is a real distinct title-role placeholder (used on title
+                # slides) and stays included; SUBTITLE does not.
+                is_title = shape.is_placeholder and shape.placeholder_format.type in (
+                    PP_PLACEHOLDER.TITLE,
+                    PP_PLACEHOLDER.CENTER_TITLE,
                 )
                 for paragraph in shape.text_frame.paragraphs:
                     text = paragraph.text.strip()

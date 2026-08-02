@@ -108,6 +108,11 @@ the resulting real session are unverified. Low risk, but not zero — do not ass
 real Google OAuth client (likely at deploy time) and one manual click-through before considering
 OAuth sign-in done, not just "the code looks right."
 
+### 2026-08-02 [claude-code] — FEAT-027 parser: multi-page table handling and multi-column reading order are untested, not confirmed-safe
+**Context:** Independent audit (`.agent/reviews/2026-08-02-parser-rewrite-audit.md`) of the Docling→pdfplumber parser rewrite explicitly checked for two known risk areas and could not verify either, because no current test fixture exercises them: (1) a table whose rows split across a page break — `table_heavy.pdf`'s 29 tables all have bboxes within a single page's height, no continuation case exists; (2) genuine multi-column page layout — checked real word `x0` clustering across every page of `table_heavy.pdf` and `clean_digital.pdf`, both are single-column throughout. The vertical-position interleave fix (2026-08-01, this same feature) targets exactly the multi-column case and is plausible by inspection, but has never been exercised against real side-by-side-column content.
+**Leaning:** Not assumed broken, not assumed correct — genuinely unknown. `_extract_pdf_tables` uses `page.find_tables()` per-page with no cross-page continuation logic at all, so a split table would almost certainly be extracted as two separate, incomplete tables rather than one — but this has not been confirmed against a real fixture.
+**Blocking:** Not blocking for the current fixture set or the OOM fix this rewrite was for. Would become relevant if a real user document with a multi-page table or multi-column layout (e.g. a two-column academic paper, a magazine-style report) is ingested — retrieval quality for that specific document could silently degrade (a split table's rows would land in two disconnected chunks instead of one). Needs either a constructed fixture exercising both cases, or real production ingestion logs showing whether user documents actually hit this shape, before calling it resolved either way.
+
 ---
 
 ## §Decision log

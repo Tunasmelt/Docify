@@ -145,7 +145,16 @@ def test_table_caption_spot_check_five_real_instances_beyond_docling():
     per-instance-verified captions that Docling's real 13-table baseline
     did NOT link, confirmed correct by real content (not just presence of
     a link). See test_parser_rewrite.py's mirrored, more detailed version
-    of this same check for the full per-instance write-up."""
+    of this same check for the full per-instance write-up.
+
+    Locating each table by caption PREFIX is fine (caption numbers are
+    unique, so a prefix match is unambiguous) — the bug the 2026-08-02
+    audit found was that no test ever checked a caption's OWN full text
+    for completeness, only substrings of the TABLE's content. Every
+    caption below is now also asserted for exact full-string equality,
+    not just prefix/substring containment, so a truncated caption (this
+    fixture's real captions can wrap onto a 2nd or 3rd visual line) can't
+    silently pass a prefix-only check again."""
     parser = Parser()
     doc = parser.parse(load("table_heavy.pdf"), filename="table_heavy.pdf")
     tables = [e for e in doc.elements if e.element_type == ElementType.TABLE]
@@ -155,30 +164,68 @@ def test_table_caption_spot_check_five_real_instances_beyond_docling():
         for t in tables:
             for cid in t.associated_caption_ids:
                 if captions[cid].content.startswith(prefix):
-                    return t
-        return None
+                    return t, captions[cid].content
+        return None, None
 
     docling_linked = {"Table 1", "Table 2", "Table 3", "Table 10", "Table 11", "Table 12", "Table 13", "Table 16", "Table 17", "Table 21", "Table 22", "Table 27", "Table 28"}
 
-    t4 = find_by_caption_prefix("Table 4:")
+    t4, cap4 = find_by_caption_prefix("Table 4:")
     assert t4 is not None and "Table 4" not in docling_linked
+    assert cap4 == "Table 4: table 3 with column headers added"
     assert "Role" in t4.content and "Daniel Radcliffe" in t4.content
 
-    t7 = find_by_caption_prefix("Table 7:")
+    t7, cap7 = find_by_caption_prefix("Table 7:")
     assert t7 is not None and "Table 7" not in docling_linked
+    assert cap7 == "Table 7: year-end statement, non-current assets (£, thousands)"
     assert "Non-current assets" in t7.content and "Property" in t7.content
 
-    t14 = find_by_caption_prefix("Table 14:")
+    t14, cap14 = find_by_caption_prefix("Table 14:")
     assert t14 is not None and "Table 14" not in docling_linked
+    assert cap14 == "Table 14: symbols replaced by real text"
     assert "Question" in t14.content and "Respondent" in t14.content
 
-    t19 = find_by_caption_prefix("Table 19:")
+    t19, cap19 = find_by_caption_prefix("Table 19:")
     assert t19 is not None and "Table 19" not in docling_linked
+    # Real 3-line-wrapped caption (2026-08-02 audit finding, fixed
+    # 2026-08-02): would have silently truncated to "Table 19: Human
+    # Development Index (HDI)" under the pre-fix parser.
+    assert cap19 == "Table 19: Human Development Index (HDI) trends, 1980 to 2010. Source: Barro-Lee March, 2010"
     assert "Afghanistan" in t19.content
 
-    t23 = find_by_caption_prefix("Table 23:")
+    t23, cap23 = find_by_caption_prefix("Table 23:")
     assert t23 is not None and "Table 23" not in docling_linked
+    # Real 2-line-wrapped caption — pre-fix, this truncated to "Table 23:
+    # simulated table created using tabs and containing no", silently
+    # dropping the word "structure" that completes the sentence.
+    assert cap23 == "Table 23: simulated table created using tabs and containing no structure"
     assert "Bob" in t23.content and "Sue" in t23.content and "Entered" in t23.content and "Completed" in t23.content
+
+
+# Regression test for the 2026-08-02 independent-audit finding: captions
+# spanning more than one visual line in the source PDF were silently cut
+# to their first line (the caption -> table LINK was always correct; only
+# the caption element's own text content was incomplete). Not caught by
+# the spot-check test above in its original form because it only ever
+# asserted `startswith()`/substring containment on caption text, which
+# passes regardless of trailing truncation — every caption below is
+# checked for exact full-string equality instead.
+def test_multiline_captions_are_not_truncated_to_first_line():
+    parser = Parser()
+    doc = parser.parse(load("table_heavy.pdf"), filename="table_heavy.pdf")
+    captions = {c.content.split(":")[0]: c.content for c in doc.elements if c.element_type == ElementType.CAPTION}
+
+    assert captions["Table 10"] == "Table 10: self-contained year-end statement (£, thousands) (multiple layout problems)"
+    assert captions["Table 11"] == "Table 11: self-contained year-end statement (£, thousands) (multiple problems resolved)"
+    assert captions["Table 15"] == (
+        "Table 15: courses offered by Institution X. A = Bachelor of Science, "
+        "B = Bachelor of Arts, C = Masters, D = Doctorate, E = Diploma"
+    )
+    assert captions["Table 23"] == "Table 23: simulated table created using tabs and containing no structure"
+    assert captions["Table 26"] == (
+        "Table 26: courses offered by Institution X. A = Bachelor of Science, "
+        "B = Bachelor of Arts, C = Masters, D = Doctorate, E = Diploma"
+    )
+    assert captions["Table 28"] == "Table 28: year-end financial table (£, thousands) – headings problem revisited"
 
 
 # Acceptance criterion: Tables are extracted as markdown-formatted content
@@ -363,17 +410,24 @@ def test_element_counts_pinned_table_heavy():
     # (6 — the parenthesized-footnote-marker pattern, "(1) Provisional
     # total..."). caption is 29 vs Docling's 19 — the real, deliberate
     # improvement this rewrite's Tier 1 heuristic achieves (see the
-    # spot-check test above). heading is 10 vs Docling's 8, and this
-    # fixture has 0 standalone `text` elements vs Docling's 4 — nearly all
-    # of this heavily-tabular document's real content is inside a table,
-    # a caption, a heading, or a footnote-list item; what little remained
+    # spot-check test above). heading is 3 (2026-08-02 audit fix: the
+    # multi-line-caption-merge bug meant a caption's own second line —
+    # e.g. "layout problems)" continuing "Table 10: ... (multiple" — was
+    # misread as its own short-bold HEADING element; this count was
+    # previously pinned to >= 8, which was measuring that bug's own
+    # byproduct, not real headings. All 7 of the "missing" headings were
+    # exactly those orphaned caption fragments; verified none were a real
+    # document heading before lowering this bound). This fixture has 0
+    # standalone `text` elements vs Docling's 4 — nearly all of this
+    # heavily-tabular document's real content is inside a table, a
+    # caption, a heading, or a footnote-list item; what little remained
     # "loose" text in Docling's own extraction falls inside this parser's
     # (deliberately generous, to avoid re-duplicating table content) table
     # bbox exclusion zone instead.
     assert type_counts["table"] == 29
     assert type_counts["caption"] == 29
     assert type_counts["list"] == 6
-    assert type_counts.get("heading", 0) >= 8
+    assert type_counts.get("heading", 0) == 3
 
 
 def test_element_counts_pinned_scanned_no_ocr_recovery():
@@ -886,6 +940,22 @@ def test_pptx_real_parse_produces_expected_element_types():
     assert ElementType.TEXT in element_types or ElementType.LIST in element_types
     assert ElementType.FIGURE in element_types  # the chart image on slide 3
     assert doc.dropped_elements == 0
+
+
+# Regression test for the 2026-08-02 independent-audit finding: a real
+# slide-1 subtitle placeholder was misclassified as HEADING because
+# `"TITLE" in str(placeholder_format.type)` also matches SUBTITLE
+# (python-pptx's str() for that enum member is "SUBTITLE (4)", which
+# contains "TITLE" as a substring). Fixed via exact enum-member comparison
+# against PP_PLACEHOLDER.TITLE/CENTER_TITLE only.
+def test_pptx_subtitle_placeholder_is_not_misclassified_as_heading():
+    doc = Parser().parse(load("slides.pptx"), filename="slides.pptx")
+
+    title = next(e for e in doc.elements if e.content == "Docify PPTX Fixture")
+    subtitle = next(e for e in doc.elements if e.content == "A real PPTX created for testing Docling ingestion support")
+
+    assert title.element_type == ElementType.HEADING
+    assert subtitle.element_type == ElementType.TEXT
 
 
 def test_pptx_page_number_is_the_real_slide_index_not_a_sentinel():

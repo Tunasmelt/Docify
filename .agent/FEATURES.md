@@ -183,25 +183,32 @@ Rule: a feature is not `complete` until acceptance criteria pass AND `/gap-check
 - [x] Table 23's extracted content matches Docling's correct reconstruction
 - [x] Real memory measurement shows import main.py no longer includes parser-related memory for routes that never touch it, reported against the old 441MB import / 1144.6MB peak numbers -- see below; caught and fixed a real leak (routes/ingest.py's module-level `Parser` import) that the original two fixes alone did not close
 - [x] docling, torch, torchvision removed from pyproject.toml including the CPU-only index pins, uv.lock re-locked
-- [x] Full backend test suite passes -- 207 passed, 127 skipped (env-gated integration tests), 82.9s
+- [x] Full backend test suite passes -- 209 passed, 127 skipped (env-gated integration tests), 90.5s (2026-08-02, after the audit fix pass below; was 207/127/82.9s at initial completion)
 
 **Per-fixture element counts (new parser vs Docling baseline):**
 | Fixture | Total | Type breakdown | Pages | vs Docling |
 |---|---|---|---|---|
 | clean_digital.pdf | 22 | heading:6 text:6 list:9 table:1 | [1] | heading/list/table match exactly (21→22: one extra text-merge boundary, benign) |
-| table_heavy.pdf | 74 | table:29 caption:29 heading:10 list:6 | [1,2] | table/list match exactly (29/29, 6/6); caption beats Docling 29 vs 19 |
+| table_heavy.pdf | 67 | table:29 caption:29 heading:3 list:6 | [1,2] | table/list match exactly (29/29, 6/6); caption beats Docling 29 vs 19. heading corrected 2026-08-02 from 74/10 to 67/3 — see below |
 | scanned.pdf | 1 (+2 OCR-recovered) | text:1 | [1] | 0 figures (deliberate — `_FIGURE_MAX_PAGE_COVERAGE` filters page-covering "images"; Docling reported 1 small logo figure here, a real trade-off, documented in parser.py) |
 | table.docx | 12 | heading:4 text:4 caption:2 table:1 figure:1 | [1] (sentinel) | |
-| slides.pptx | 8 | heading:4 text:3 figure:1 | [1,2,3] | |
+| slides.pptx | 8 | heading:3 text:4 figure:1 | [1,2,3] | corrected 2026-08-02 (was heading:4 text:3) — see below |
 | page.html | 8 | heading:3 text:3 caption:1 table:1 | [1] (sentinel) | |
+
+**Corrections (2026-08-02, independent audit + fix pass, `.agent/reviews/2026-08-02-parser-rewrite-audit.md`):**
+- **Multi-line caption truncation, fixed.** Captions spanning more than one visual line (common in `table_heavy.pdf` — e.g. `"Table 10: ...(multiple layout problems)"`) were silently cut to their first line. Root cause: `_classify_line` classifies one physical line at a time, and unlike TEXT lines, CAPTION lines never merged with a following continuation line. Worse, the truncated-off continuation line (e.g. `"layout problems)"`) was short and inherited the caption's own bold styling, so it independently matched the whole-line-bold HEADING heuristic and became its own spurious HEADING element — this is why table_heavy.pdf's heading count drops from 10 to 3 above: all 7 "missing" headings were exactly these orphaned caption fragments, not real document headings. Fixed by merging a close-gap TEXT-or-HEADING-classified line into an in-progress caption instead of starting a new element. Table/list/caption-link counts (29/29/6) are unaffected — only caption text completeness and the heading count (a pre-existing bug artifact) changed.
+- **PPTX subtitle misclassified as HEADING, fixed.** `"TITLE" in str(shape.placeholder_format.type)` also matched `SUBTITLE` (python-pptx's `str()` for that enum member is `"SUBTITLE (4)"`, which contains the substring `"TITLE"`). Fixed via exact enum-member comparison (`placeholder_format.type in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE)`). This is why `slides.pptx`'s heading count drops from 4 to 3 above — the real slide-1 subtitle now correctly classifies as TEXT.
+- Both fixes verified with new regression tests: `test_multiline_captions_are_not_truncated_to_first_line`, `test_pptx_subtitle_placeholder_is_not_misclassified_as_heading` (`apps/api/tests/test_parser.py`).
 
 **Real memory measurement (psutil RSS, table_heavy.pdf):**
 | Checkpoint | Old (Docling) | New (pdfplumber) |
 |---|---|---|
-| bare interpreter | ~18MB | 17.6MB |
-| after `import main` | ~441MB (423MB delta) | 103.4MB (85.9MB delta) — `services.parser` confirmed NOT in `sys.modules` |
-| after `Parser()` construction | (included above) | 115.3MB (+11.9MB) |
-| after parsing table_heavy.pdf | 1144.6MB peak | 124.5MB (+9.1MB) |
+| bare interpreter | ~18MB | 17.4MB |
+| after `import main` | ~441MB (423MB delta) | 102.8MB (85.5MB delta) — `services.parser` confirmed NOT in `sys.modules` |
+| after `Parser()` construction | (included above) | 118.3MB (+15.5MB) |
+| after parsing table_heavy.pdf | 1144.6MB peak | ~160MB (+~42MB) |
+
+Peak-parse figure corrected 2026-08-02 (independent audit) — originally reported as 124.5MB, which did not reproduce; ~160MB is the real, reproducible number (4 independent runs across 2 scripts, 159.8–163.3MB range). Still ~7x better than Docling's 1144.6MB baseline and well under Render's 512MB limit — the practical conclusion is unchanged, only the specific number was wrong.
 
 The decoupling proof required three fixes, not the two originally named: `db/queries.py` and `services/embedder.py`'s `Chunk`/`ParsedElement` type-hint-only imports were TYPE_CHECKING-guarded, but `services/chunker.py` needs `ElementType` at genuine runtime (enum comparisons), so it couldn't use that pattern — its dependency on the heavy parsing libraries was cut by extracting the data contract into `services/document_model.py`. Separately, `routes/ingest.py` had a legitimate module-level `from services.parser import Parser`; since `main.py` registers every router eagerly, this alone kept leaking `services.parser` into `import main` until the import was moved inside `run_ingest_pipeline()`. A permanent regression test (`test_import_main_py_does_not_pull_services_parser_into_sys_modules`, `tests/test_parser_rewrite.py`) now guards against this specific class of leak reappearing.
 
