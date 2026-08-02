@@ -1,18 +1,27 @@
 # Tests for [FEAT-005] Chunker
 #
-# Fixtures reused from FEAT-004 (apps/api/tests/fixtures/). None of the
-# three real fixtures contains a FIGURE with a nearby caption (table_heavy
-# has no figures at all; scanned.pdf's one figure is an uncaptioned logo),
-# so "figure chunk with caption prepended" is tested against a hand-built
-# ParsedDocument instead — the only way to exercise that path deterministically.
+# Fixtures reused from FEAT-004/FEAT-027 (apps/api/tests/fixtures/). None
+# of the three real fixtures contains a FIGURE with a nearby caption
+# (table_heavy has no figures at all; scanned.pdf has none since FEAT-027's
+# rewrite — see below), so "figure chunk with caption prepended" is tested
+# against a hand-built ParsedDocument instead — the only way to exercise
+# that path deterministically.
 #
-# Counts below for table_heavy.pdf were observed directly, not assumed:
-# 29 tables, 19 captions, of which 13 explicit (Docling-linked, Tier 1) and
-# 6 resolved by the Tier-2 proximity heuristic here — all 6 landed on a
-# plausible-looking match on manual inspection, 0 left unmatched.
+# Counts below updated 2026-08-01 (FEAT-027, Docling -> pdfplumber/
+# python-docx/python-pptx/selectolax rewrite — .agent/reviews/2026-08-01-
+# parser-research.md): table_heavy.pdf still has 29 real tables, but the
+# new parser's own Tier 1 (text-prefix + bbox proximity) links captions to
+# ALL 29 directly — beating the old Docling-based parser's 13 explicit +
+# chunker's own Tier 2 resolving 6 more (19 total, 10 left uncaptioned).
+# Tier 2's OWN logic is unchanged and still exercised by the hand-built
+# tie-breaking tests further down this file — it simply has nothing left
+# to do on this fixture now that Tier 1 alone resolves everything.
+# scanned.pdf's one figure (a small logo, per the OLD Docling baseline) is
+# no longer extracted at all under the new parser: it was a full-page-
+# covering raster image (the scan itself), not a distinct embedded figure
+# — filtered deliberately, see services/parser.py's _FIGURE_MAX_PAGE_COVERAGE.
 #
-# Each fixture is parsed once per test session (module-scoped fixtures) —
-# table_heavy.pdf alone takes ~50-90s on CPU, and several tests need it.
+# Each fixture is parsed once per test session (module-scoped fixtures).
 
 import pytest
 from PIL import Image
@@ -67,17 +76,21 @@ def scanned_doc():
 def test_groups_text_heading_list_elements_respecting_boundaries(clean_digital_doc):
     chunks = Chunker().chunk(clean_digital_doc)
 
-    # 19 of clean_digital.pdf's 21 elements are text/heading/list and small
-    # enough to fit in one ~500-token chunk together; 1 table always gets
-    # its own chunk; the 1 remaining text element (after the table) starts
-    # a fresh group. Observed directly: 3 chunks total.
+    # FEAT-027 real count: clean_digital.pdf now has 22 elements (6
+    # heading + 6 text + 9 list + 1 table — one more than the old
+    # Docling-based parser's 21, a real minor paragraph-grouping
+    # granularity difference, see test_parser.py). Elements are now built
+    # in real reading order (interleaved by page position, not grouped by
+    # type), so the table sits where it actually appears — after the
+    # "Table" heading/intro text, before the closing paragraph — splitting
+    # the surrounding text into two groups. Observed directly: 3 chunks.
     assert len(chunks) == 3
-    assert chunks[0].element_type == ElementType.HEADING  # first element in the group
+    assert chunks[0].element_type == ElementType.HEADING  # leading group up to the table
     assert len(chunks[0].source_element_indices) == 19
     assert chunks[1].element_type == ElementType.TABLE
     assert len(chunks[1].source_element_indices) == 1  # table never grouped with surrounding text
-    assert chunks[2].element_type == ElementType.TEXT
-    assert len(chunks[2].source_element_indices) == 1
+    assert chunks[2].element_type == ElementType.TEXT  # closing paragraphs after the table
+    assert len(chunks[2].source_element_indices) == 2
 
 
 # FEAT-020 (2026-07-27) real bug, found via the real end-to-end /query
@@ -168,16 +181,41 @@ def test_chunk_index_is_stable_and_sequential(table_heavy_doc):
 
 
 # Acceptance criterion: Figure elements produce their own chunks (one figure = one chunk, with caption prepended if adjacent)
-def test_figure_produces_own_chunk_with_uncaptioned_logo(scanned_doc):
-    chunks = Chunker().chunk(scanned_doc)
+#
+# FEAT-027: scanned.pdf's one figure under the old Docling-based parser
+# (a small logo) is no longer extracted at all — it was actually a
+# full-page-covering raster image (the scan itself), not a distinct
+# embedded figure, filtered deliberately (services/parser.py's
+# _FIGURE_MAX_PAGE_COVERAGE — see test_parser.py's
+# test_scanned_pdf_full_page_images_are_filtered_not_treated_as_figures).
+# No real fixture has a genuine standalone figure element for THIS
+# specific "figure produces its own chunk, no caption" shape anymore —
+# table.docx and slides.pptx both DO have one real figure each, but
+# neither is uncaptioned in quite the same deterministic way, so this is
+# now exercised by hand instead, same reasoning as the captioned-figure
+# test directly below it.
+def test_figure_produces_own_chunk_uncaptioned_hand_built():
+    image = Image.new("RGB", (4, 4))
+    figure = make_element(ElementType.FIGURE, content=image, element_id="#/pictures/0")
+    doc = ParsedDocument(elements=[figure])
+
+    chunks = Chunker().chunk(doc)
 
     figure_chunks = [c for c in chunks if c.element_type == ElementType.FIGURE]
     assert len(figure_chunks) == 1
     figure_chunk = figure_chunks[0]
     assert isinstance(figure_chunk.image, Image.Image)
-    assert figure_chunk.content == ""  # no caption nearby in this fixture
+    assert figure_chunk.content == ""  # no caption linked
     assert figure_chunk.merged_caption_ids == []
     assert len(figure_chunk.source_element_indices) == 1
+
+
+def test_scanned_pdf_no_longer_produces_a_figure_chunk(scanned_doc):
+    # Real, deliberate behavior change from the old Docling-based parser
+    # (confirmed live, not assumed) — see the module docstring above.
+    chunks = Chunker().chunk(scanned_doc)
+    figure_chunks = [c for c in chunks if c.element_type == ElementType.FIGURE]
+    assert figure_chunks == []
 
 
 def test_figure_chunk_has_caption_prepended_when_explicitly_linked():
@@ -220,43 +258,36 @@ def test_explicit_caption_associations_from_parser_are_preserved(table_heavy_doc
     explicit_table_chunks = [
         c for c in chunks if c.element_type == ElementType.TABLE and c.association_method == "explicit"
     ]
-    assert len(explicit_table_chunks) == 13
+    # FEAT-027: the new parser's own Tier 1 heuristic (text-prefix + bbox
+    # proximity) links all 29 real tables directly — beating the old
+    # Docling-based parser's 13 (.agent/reviews/2026-08-01-parser-
+    # research.md, spot-checked individually in test_parser.py). Every
+    # single table/figure<->caption link chunker.py sees for this fixture
+    # is now "explicit" by construction, not "heuristic" — Tier 1 simply
+    # never leaves anything for Tier 2 to do here anymore.
+    assert len(explicit_table_chunks) == 29
     for chunk in explicit_table_chunks:
         assert len(chunk.merged_caption_ids) >= 1
         assert chunk.content.strip() != ""
 
 
-def test_tier2_heuristic_resolves_all_six_remaining_captions_in_table_heavy(table_heavy_doc):
+def test_tier2_heuristic_has_nothing_left_to_resolve_in_table_heavy(table_heavy_doc):
+    # FEAT-027: real, honest consequence of Tier 1 now resolving all 29
+    # tables directly — chunker.py's OWN Tier 2 logic is unchanged (still
+    # exercised directly by the hand-built tie-breaking tests elsewhere in
+    # this file), it simply has zero "association_method == none" captions
+    # left to work with on this specific fixture anymore.
     chunks = Chunker().chunk(table_heavy_doc)
 
     heuristic_table_chunks = [
         c for c in chunks if c.element_type == ElementType.TABLE and c.association_method == "heuristic"
     ]
-    # Observed directly: all 6 non-explicit captions in this fixture found
-    # a same-page match; 0 were left unmatched. This is fixture-specific,
-    # not a general guarantee — a document with a genuinely orphaned
-    # caption should (and does, see the hand-built test below) produce an
-    # "unmatched" standalone chunk instead.
-    assert len(heuristic_table_chunks) == 6
+    assert heuristic_table_chunks == []
     assert not any(c.element_type == ElementType.CAPTION and c.association_method == "unmatched" for c in chunks)
-
-    # Pin exactly which caption matched which table, so a future change to
-    # the heuristic (or to Docling's output) that silently changes a
-    # pairing gets caught here instead of discovered downstream.
-    expected = {
-        "#/texts/17": "Table 14: symbols replaced by real text",
-        "#/texts/18": "Table 15: courses offered by Institution X. A = Bachelor of Science, B = Bachelor of Arts, C = Masters, D = Doctorate, E = Diploma",
-        "#/texts/21": "Table 18: accounts, 2011 (£, thousands)",
-        "#/texts/22": "Table 19: Human Development Index (HDI)",
-        "#/texts/24": "Table 20: footnotes referenced from within a table",
-        "#/texts/30": "Table 23: simulated table created using tabs and containing no structure",
-    }
-    matched_caption_ids = {cid for c in heuristic_table_chunks for cid in c.merged_caption_ids}
-    assert matched_caption_ids == set(expected.keys())
-
-    by_id = {e.element_id: e for e in table_heavy_doc.elements}
-    for caption_id, expected_text in expected.items():
-        assert by_id[caption_id].content == expected_text
+    # Confirms every caption element in this fixture was consumed into a
+    # table/figure chunk (Tier 1) rather than surviving as its own
+    # standalone chunk.
+    assert not any(c.element_type == ElementType.CAPTION for c in chunks)
 
 
 def test_tier2_heuristic_leaves_genuinely_unmatched_caption_standalone():
@@ -287,12 +318,13 @@ def test_uncaptioned_tables_have_no_association_method(table_heavy_doc):
     uncaptioned = [
         c for c in chunks if c.element_type == ElementType.TABLE and c.association_method is None
     ]
-    # 29 tables - 13 explicit - 6 heuristic = 10 tables with no caption at
-    # all in the source document (not a matching failure — there's
-    # genuinely nothing to match).
-    assert len(uncaptioned) == 10
-    for chunk in uncaptioned:
-        assert chunk.merged_caption_ids == []
+    # FEAT-027: 29 tables - 29 explicit (new parser's own Tier 1) - 0
+    # heuristic = 0 tables with no caption at all — every real table in
+    # this fixture does genuinely have a "Table N[:...]" caption line
+    # somewhere on its page; the OLD Docling-based parser's 10
+    # "uncaptioned" tables reflected a gap in ITS OWN layout model, not a
+    # genuine absence of caption text in the source document.
+    assert uncaptioned == []
 
 
 def test_every_chunk_across_all_fixtures_has_a_valid_association_method(clean_digital_doc, table_heavy_doc, scanned_doc):

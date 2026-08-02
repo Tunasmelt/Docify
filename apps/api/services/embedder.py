@@ -1,14 +1,24 @@
+from __future__ import annotations
+
 import logging
 import os
 from dataclasses import dataclass
 from io import BytesIO
+from typing import TYPE_CHECKING
 
 import voyageai
 from google import genai
 from google.genai import types
 from voyageai.error import RateLimitError, ServiceUnavailableError, Timeout, VoyageError
 
-from services.chunker import Chunk
+# 2026-08-01 (FEAT-027): same fix as db/queries.py — Chunk is used only as a
+# type hint here (embed()'s functions duck-type chunk.content/chunk.image,
+# never need the class itself at runtime). A plain import pulled
+# services.chunker -> services.parser -> (formerly) docling into every route
+# that imports services.retriever -> services.embedder, including /query,
+# which never touches parsing at all.
+if TYPE_CHECKING:
+    from services.chunker import Chunk
 
 logger = logging.getLogger(__name__)
 

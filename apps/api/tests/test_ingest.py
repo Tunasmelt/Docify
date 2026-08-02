@@ -383,7 +383,11 @@ def test_dependency_construction_failure_marks_document_failed(admin, user_a):
     # a missing model file). Before this fix, construction happened
     # before the try block and this would have propagated straight out
     # of run_ingest_pipeline, leaving the document stuck at 'uploaded'.
-    with patch("routes.ingest.Parser", FailingParser):
+    # Patched at services.parser (not routes.ingest) — FEAT-027 made the
+    # Parser import local to run_ingest_pipeline (deferred import, see
+    # that function), so "routes.ingest.Parser" no longer exists as a
+    # module-level attribute to patch.
+    with patch("services.parser.Parser", FailingParser):
         ingest.run_ingest_pipeline(
             document_id=document_id,
             user_id=user_id,

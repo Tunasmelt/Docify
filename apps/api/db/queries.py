@@ -1,8 +1,25 @@
-from datetime import datetime, timezone
+from __future__ import annotations
 
-from services.chunker import Chunk
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING
+
 from services.embedder import EmbeddedChunk
-from services.parser import ParsedElement
+
+# 2026-08-01 (FEAT-027): Chunk/ParsedElement are used ONLY as type hints in
+# build_chunk_rows()'s signature below — never accessed for any attribute or
+# logic at runtime in this module. A plain `from services.chunker import
+# Chunk` pulled services.chunker -> services.parser -> (formerly) docling
+# into every route that imports db.queries at all, including /health,
+# /documents, /query — none of which ever touch parsing. `from __future__
+# import annotations` makes every annotation in this module a string at
+# runtime (PEP 563), so these names never need to actually exist when the
+# module runs; TYPE_CHECKING keeps the real import available for static
+# type checkers/IDEs without ever executing it at import time. Confirmed via
+# a real isolation test (tests/test_parser_rewrite.py) that services.parser
+# is not in sys.modules after `import db.queries` alone.
+if TYPE_CHECKING:
+    from services.chunker import Chunk
+    from services.document_model import ParsedElement
 
 
 def _now_iso() -> str:

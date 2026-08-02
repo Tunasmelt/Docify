@@ -1,20 +1,20 @@
 import base64
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from io import BytesIO
 
+import docx
 import httpx
+import pdfplumber
+import pptx
 import pytesseract
-from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions
-from docling.document_converter import DocumentConverter, PdfFormatOption
-from docling_core.types.doc import DocItemLabel
-from docling_core.types.io import DocumentStream
 from google import genai
 from google.genai import types
 from PIL import Image
+from selectolax.parser import HTMLParser
 
 logger = logging.getLogger(__name__)
 
@@ -32,54 +32,6 @@ OCR_SYSTEM_PROMPT = (
     "nothing."
 )
 
-
-def _default_converter() -> DocumentConverter:
-    # do_ocr=False: Docling's own OCR probes every page and downloads OCR
-    # models on first use even for fully digital PDFs — both slow and
-    # redundant now that low-yield pages get a targeted Gemini fallback
-    # instead (FEAT-017) rather than Docling attempting OCR everywhere.
-    # generate_picture_images=True: PictureItem.get_image() returns None
-    # unless this is set — needed to satisfy "figures as PIL Image objects".
-    # generate_page_images=True (FEAT-017): the OCR fallback below needs each
-    # low-yield page's own rendered image to send to Gemini — this is the
-    # only way to get it without a second, separate Docling conversion.
-    #
-    # FEAT-020 (2026-07-27) — these three settings are PDF-specific and
-    # deliberately NOT ported to DOCX/PPTX/HTML: confirmed directly against
-    # the installed Docling source that DOCX/PPTX/HTML all use SimplePipeline
-    # with ConvertPipelineOptions, a completely different options class with
-    # no do_ocr/generate_picture_images/generate_page_images fields at all —
-    # there is nothing to set. Figure extraction (PictureItem.get_image())
-    # was confirmed live to work for DOCX/PPTX with zero configuration
-    # (these formats embed real image objects directly, unlike a PDF page
-    # which must be rendered/cropped) — see FEATURES.md's FEAT-020 entry for
-    # the full per-format investigation this decision is based on.
-    # allowed_formats is explicit (not left at Docling's "every format it
-    # knows how to read" default) so a format this project doesn't support
-    # yet fails clearly inside Docling rather than silently being accepted —
-    # routes/ingest.py's mime_type whitelist is the primary gate; this is
-    # defense-in-depth for any other caller of Parser() directly.
-    options = PdfPipelineOptions(do_ocr=False, generate_picture_images=True, generate_page_images=True)
-    return DocumentConverter(
-        allowed_formats=[InputFormat.PDF, InputFormat.DOCX, InputFormat.PPTX, InputFormat.HTML],
-        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)},
-    )
-
-
-# FEAT-020 (2026-07-27) — confirmed live, not assumed: DOCX and HTML
-# elements NEVER carry provenance (`item.prov` is an empty list for every
-# single element, always — including tables, figures, and headings). PDF
-# and PPTX always DO have real provenance (PPTX's page_no is genuinely the
-# slide index, confirmed against a real 3-slide fixture). This is a
-# structural difference in Docling's own backends, not a per-document
-# anomaly: DOCX/HTML simply have no page/coordinate concept for Docling to
-# report. Elements from these two formats get a fixed sentinel location
-# (page_number=1, a zero-sized bbox) instead of being dropped as "no
-# provenance" — see Parser.parse()'s extraction loop and FEATURES.md's
-# FEAT-020 entry for the full page_number design decision this resolves.
-_FORMATS_WITHOUT_PROVENANCE = {InputFormat.DOCX, InputFormat.HTML}
-
-
 # Audit finding (2026-07-26): with no explicit http_options.timeout, the
 # genai SDK passes timeout=None straight through to httpx — confirmed
 # directly against the installed SDK source (_api_client.py), not
@@ -91,11 +43,11 @@ OCR_TIMEOUT_MS = 60_000
 
 
 class GeminiOcrClient:
-    """Tier 1 of FEAT-017's OCR fallback chain — a page whose Docling
-    parse yielded suspiciously little gets sent here first, as a rendered
-    image, for a real vision-model transcription. Never raises: a failed
-    call returns None so the chain (in Parser.parse()) moves on to tier
-    2, matching this project's established fail-safe discipline elsewhere
+    """Tier 1 of FEAT-017's OCR fallback chain — a page whose real parse
+    yielded suspiciously little gets sent here first, as a rendered image,
+    for a real vision-model transcription. Never raises: a failed call
+    returns None so the chain (in Parser.parse()) moves on to tier 2,
+    matching this project's established fail-safe discipline elsewhere
     (Verifier's fail-to-unsupported pattern)."""
 
     def __init__(self, client: genai.Client | None = None):
@@ -235,282 +187,872 @@ def _default_ocr_tiers() -> list[tuple[str, object]]:
     ]
 
 
-class ElementType(str, Enum):
-    TEXT = "text"
-    HEADING = "heading"
-    TABLE = "table"
-    FIGURE = "figure"
-    CAPTION = "caption"
-    LIST = "list"
+# Data contract lives in services/document_model.py (FEAT-027) — that
+# module has no dependency on the heavy parsing libraries imported above,
+# so chunker.py (and everything that imports chunker.py) can depend on
+# ElementType/ParsedElement/ParsedDocument at runtime without paying for
+# pdfplumber/docx/pptx/pytesseract/selectolax/google.genai. Re-exported
+# here so `from services.parser import ElementType` etc. (existing call
+# sites, tests) keeps working unchanged.
+from services.document_model import (  # noqa: E402
+    _TEXTUAL_ELEMENT_TYPES,
+    BBox,
+    ElementType,
+    ParsedDocument,
+    ParsedElement,
+    ParseError,
+)
 
 
-# FEAT-017's trigger set: a page with zero elements of these types is
-# "low-yield" regardless of how many FIGURE/CAPTION elements it has. A lone
-# figure with no text around it is still consistent with an unread scanned
-# page — CAPTION is excluded too since a caption never appears without a
-# table/figure it belongs to, so it carries no independent signal either.
-_TEXTUAL_ELEMENT_TYPES = {ElementType.TEXT, ElementType.HEADING, ElementType.TABLE, ElementType.LIST}
+# ══════════════════════════════════════════════════════════════════════════
+# Shared heuristics (FEAT-027, .agent/reviews/2026-08-01-parser-research.md)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# PDF is the only format needing any of this — DOCX/PPTX/HTML all expose
+# real, native structural metadata (paragraph styles, placeholder types,
+# semantic tags) directly through their own libraries, confirmed live
+# against every real fixture in the research pass. Nothing below is used
+# for those three formats.
+
+# Caption prefix — matches Docling-labeled captions' own real text shape in
+# every fixture checked ("Table 1", "Table 2: example of...", "Figure 1: a
+# real embedded PNG chart image."). Anchored to line start (not
+# `re.search`) so it never matches a mid-sentence reference like "see
+# Table 4 for details" — AND requires a colon or end-of-string immediately
+# after the number, not just any following word. A real, live false
+# positive found during implementation: "Table 1 below shows quarterly
+# revenue figures..." (a body sentence that merely starts with "Table 1")
+# matched a looser version of this regex in both the DOCX and HTML
+# fixtures, which do carry that exact sentence alongside the real caption.
+# Every genuine caption in every fixture checked is either "Table N:
+# description" or a bare "Table N" — never "Table N <more prose>".
+_CAPTION_PREFIX_RE = re.compile(r"^(Table|Figure)\s+\d+\s*(:|$)", re.IGNORECASE)
+
+# Bullet/number list-item prefix. Catches numbered ("1. ", "2) "),
+# lettered ("a. "), and parenthesized-footnote ("(1) ") lists directly
+# from extracted text — the last of these a real gap found live against
+# table_heavy.pdf: its own 6 Docling-labeled list items are all
+# parenthesized footnote markers ("(1) Provisional total as of publication
+# date."), a distinct shape from clean_digital.pdf's plain "1. "/"2. "
+# numbering that an earlier version of this regex didn't cover.
+# Deliberately does NOT catch every unordered list on its own — research
+# found a real, confirmed gap: a PDF's unordered list can carry no bullet
+# glyph at all in its text layer (only visual indentation), which this
+# regex alone cannot see. The indent-based check below closes that gap.
+_BULLET_PREFIX_RE = re.compile(r"^\s*([•\-\*•●▪]|\(\d+\)|\d+[.)]|[a-z][.)])\s+")
+
+# A SHORT line indented further than the document's own body-text baseline
+# by at least this many points is treated as a list item even with no
+# bullet glyph — confirmed against clean_digital.pdf's real geometry: body
+# text sits at x0≈43.3, its glyph-less unordered list at x0≈71.5 (indent
+# +28.2). Deliberately set ABOVE the fixture's own indented-but-NOT-a-list
+# content (a block-quote paragraph at x0≈61.0, indent +17.7) rather than
+# just above zero — a real, live false positive found during
+# implementation: indent alone also fires on a quoted paragraph and on a
+# deeply-indented trailing credit line, neither of which is a list. The
+# word-count guard below is what actually separates a real list item
+# ("Item 1", 2 words) from indented prose (a full sentence) — indent alone
+# is necessary but not sufficient.
+_LIST_INDENT_THRESHOLD_PT = 20.0
+_LIST_INDENT_MAX_WORDS = 5
+
+# A whole-line-bold, short run is treated as a heading even at body-text
+# size or smaller — confirmed against clean_digital.pdf: "Lists" (bold,
+# same size as body), "Quote" and "Table" (bold, SMALLER than body — a
+# real small-caps-style section label) are all headings Docling itself
+# labeled, none of which the size-based rule alone catches. Guarded by
+# word count so a genuinely bold PARAGRAPH (not a short label) is never
+# misclassified — `_group_chars_into_lines`' `is_bold` is already
+# whole-line (every character bold), so a bold RUN inside an otherwise
+# plain sentence never trips this either.
+_HEADING_BOLD_MAX_WORDS = 6
+
+# An image covering more of the page than this is treated as "this page IS
+# a scan," not a meaningful embedded figure worth extracting on its own —
+# confirmed live against scanned.pdf: pdfplumber's page.images reports one
+# image per page covering ~100% of the page area on all 3 pages (the raw
+# scan itself), categorically different from a real embedded photo/logo/
+# chart. Extracting the whole-page scan as a "figure" would be redundant
+# with what the OCR fallback below already recovers as text for that same
+# page, not genuine additional content.
+_FIGURE_MAX_PAGE_COVERAGE = 0.85
+
+# A detected table with fewer than this many rows is treated as a false
+# positive, not a real table — confirmed live: pdfplumber's geometric table
+# detector misreads a single-row bordered/indented block (e.g. a styled
+# block-quote paragraph in clean_digital.pdf) as a 1-row "table." A real
+# table in every fixture checked has a header row plus at least one data
+# row.
+_MIN_TABLE_ROWS = 2
 
 
-# Matches .agent/SCHEMA.md's `element_type` enum exactly. Docling labels not
-# listed here (page_header, page_footer, footnote, formula, code, ...) are
-# deliberately dropped during parsing rather than mapped to a catch-all —
-# they have no column to live in downstream. This filtering is expected and
-# not logged; it's not the same thing as an element we DO model failing to
-# extract (see dropped_elements below).
-_LABEL_TO_ELEMENT_TYPE = {
-    DocItemLabel.TEXT: ElementType.TEXT,
-    DocItemLabel.PARAGRAPH: ElementType.TEXT,
-    DocItemLabel.TITLE: ElementType.HEADING,
-    DocItemLabel.SECTION_HEADER: ElementType.HEADING,
-    DocItemLabel.TABLE: ElementType.TABLE,
-    DocItemLabel.PICTURE: ElementType.FIGURE,
-    DocItemLabel.CHART: ElementType.FIGURE,
-    DocItemLabel.CAPTION: ElementType.CAPTION,
-    DocItemLabel.LIST_ITEM: ElementType.LIST,
-}
+def _rows_to_markdown(rows: list[list[str | None]]) -> str:
+    if not rows:
+        return ""
+    header = rows[0]
+    body = rows[1:]
+
+    def cell(value: str | None) -> str:
+        return (value or "").replace("\n", " ").replace("|", "\\|").strip()
+
+    lines = ["| " + " | ".join(cell(c) for c in header) + " |"]
+    lines.append("|" + "|".join(["---"] * len(header)) + "|")
+    for row in body:
+        lines.append("| " + " | ".join(cell(c) for c in row) + " |")
+    return "\n".join(lines)
 
 
-class ParseError(Exception):
-    def __init__(self, message: str, page_number: int | None = None):
-        super().__init__(message)
-        self.page_number = page_number
+def _bbox_overlaps(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> bool:
+    ax0, atop, ax1, abottom = a
+    bx0, btop, bx1, bbottom = b
+    return not (ax1 < bx0 or ax0 > bx1 or abottom < btop or atop > bbottom)
 
 
-@dataclass
-class BBox:
-    x0: float
-    y0: float
-    x1: float
-    y1: float
+def _bbox_center(bbox: tuple[float, float, float, float]) -> tuple[float, float]:
+    x0, top, x1, bottom = bbox
+    return ((x0 + x1) / 2, (top + bottom) / 2)
 
 
-@dataclass
-class ParsedElement:
-    element_type: ElementType
-    page_number: int
-    bbox: BBox
-    content: str | Image.Image
-    element_id: str
-    # Populated only for TABLE/FIGURE elements — the element_id of each
-    # caption Docling explicitly linked to this table/figure (via
-    # TableItem.captions / PictureItem.captions). Empty for every other
-    # element type, and empty (not an error) for a table/figure Docling
-    # simply didn't link a caption to.
-    associated_caption_ids: list[str] = field(default_factory=list)
-    # Populated only for CAPTION elements: "explicit" if some table/figure's
-    # `captions` list pointed at this caption (Tier 1 — Docling-provided),
-    # "none" if no table/figure claimed it. None (not "none") for every
-    # non-caption element type, since the field doesn't apply to them.
-    # Associating an unclaimed caption with a nearby table/figure by
-    # position/proximity is a Tier 2 heuristic — explicitly FEAT-005's job,
-    # not this parser's.
-    association_method: str | None = None
+def _bbox_distance(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    ax, ay = _bbox_center(a)
+    bx, by = _bbox_center(b)
+    return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
 
 
-@dataclass
-class ParsedDocument:
-    """Result of Parser.parse().
-
-    Figure ownership: each FIGURE element's `content` is a live PIL Image
-    backed by Docling's rendered page/crop data. The parser does not close
-    these. Callers must close every figure Image after persisting it (e.g.
-    after uploading to storage) to release the underlying buffer.
-    """
-
-    elements: list[ParsedElement]
-    dropped_elements: int = 0
+# ══════════════════════════════════════════════════════════════════════════
+# PDF extraction (pdfplumber)
+# ══════════════════════════════════════════════════════════════════════════
 
 
-class Parser:
-    def __init__(self, converter: DocumentConverter | None = None, ocr_tiers: list[tuple[str, object]] | None = None):
-        self._converter = converter or _default_converter()
-        # Real 3-tier chain by default, same reasoning as `converter` — OCR
-        # fallback is production behavior, not an opt-in extra a caller has
-        # to remember to wire up. routes/ingest.py constructs Parser() with
-        # no arguments and gets all three tiers automatically. Tests that
-        # don't want real calls inject their own (name, fake) tier list
-        # (see test_parser.py) — each tier is just anything with a
-        # transcribe_page(image) -> str | None method, same contract
-        # GeminiOcrClient/OcrSpaceClient/TesseractOcrClient all share.
-        self._ocr_tiers = ocr_tiers if ocr_tiers is not None else _default_ocr_tiers()
+def _document_body_font_size(pdf) -> float:
+    """The single most common (char-count-weighted) font size across the
+    whole document — the body-text baseline every heading heuristic below
+    is judged against. Computed once per document, not per page: real
+    fixtures checked (clean_digital.pdf, table_heavy.pdf) both have one
+    dominant body size used throughout, with headings a clear step above
+    it — confirmed live, not assumed."""
+    sizes: dict[float, int] = {}
+    for page in pdf.pages:
+        for ch in page.chars:
+            size = round(ch["size"], 1)
+            sizes[size] = sizes.get(size, 0) + 1
+    if not sizes:
+        return 11.0  # no text at all on any page — fallback, never divides by zero below
+    return max(sizes, key=lambda s: sizes[s])
 
-    def parse(self, file_bytes: bytes, filename: str = "document.pdf") -> ParsedDocument:
-        """filename drives Docling's own format detection (it inspects the
-        extension on DocumentStream.name, confirmed against the installed
-        SDK — there is no content-sniffing) — defaults to "document.pdf"
-        so every existing PDF-only call site (routes/ingest.py before
-        FEAT-020, and the large majority of this project's own tests)
-        keeps working unchanged. A caller ingesting DOCX/PPTX/HTML MUST
-        pass the real filename (or at least the real extension) or Docling
-        will silently try to parse it as the wrong format."""
-        stream = DocumentStream(name=filename, stream=BytesIO(file_bytes))
+
+def _group_chars_into_lines(page) -> list[dict]:
+    """Groups a page's characters into visual lines by vertical position —
+    pdfplumber's own primitive (page.chars) has no line concept built in.
+    Each line carries its text, bbox, average font size, and whether every
+    character in it is bold (by font name — pdfplumber doesn't expose a
+    separate bold flag)."""
+    lines: dict[float, list] = {}
+    for ch in page.chars:
+        key = round(ch["top"], 0)
+        lines.setdefault(key, []).append(ch)
+
+    result = []
+    for top in sorted(lines.keys()):
+        chars = sorted(lines[top], key=lambda c: c["x0"])
+        text = "".join(c["text"] for c in chars).strip()
+        if not text:
+            continue
+        x0 = chars[0]["x0"]
+        x1 = chars[-1]["x1"]
+        bottom = max(c["bottom"] for c in chars)
+        avg_size = sum(c["size"] for c in chars) / len(chars)
+        is_bold = all("bold" in c["fontname"].lower() for c in chars)
+        result.append(
+            {
+                "text": text,
+                "top": top,
+                "bottom": bottom,
+                "x0": x0,
+                "x1": x1,
+                "size": avg_size,
+                "bold": is_bold,
+            }
+        )
+    return result
+
+
+def _classify_line(line: dict, body_size: float, body_x0: float) -> ElementType:
+    if _CAPTION_PREFIX_RE.match(line["text"]):
+        return ElementType.CAPTION
+
+    word_count = len(line["text"].split())
+
+    # Heading: clearly larger than body text (any weight), OR whole-line
+    # bold and short (catches a same-/smaller-size bold section label —
+    # see _HEADING_BOLD_MAX_WORDS's docstring for the real fixture finding
+    # this covers).
+    if line["size"] > body_size * 1.08:
+        return ElementType.HEADING
+    if line["bold"] and word_count <= _HEADING_BOLD_MAX_WORDS:
+        return ElementType.HEADING
+
+    if _BULLET_PREFIX_RE.match(line["text"]):
+        return ElementType.LIST
+    if line["x0"] > body_x0 + _LIST_INDENT_THRESHOLD_PT and word_count <= _LIST_INDENT_MAX_WORDS:
+        return ElementType.LIST
+    return ElementType.TEXT
+
+
+def _document_body_x0(pdf) -> float:
+    """Left-margin baseline for the indent-based list heuristic — the most
+    common line-start x0 across the document, mirroring
+    _document_body_font_size's same weighting approach."""
+    positions: dict[float, int] = {}
+    for page in pdf.pages:
+        for line in _group_chars_into_lines(page):
+            key = round(line["x0"], 0)
+            positions[key] = positions.get(key, 0) + 1
+    if not positions:
+        return 0.0
+    return max(positions, key=lambda x: positions[x])
+
+
+def _extract_pdf_tables(page) -> list[dict]:
+    """Detected tables on one page, each with its real bbox and markdown
+    content — false positives (fewer than _MIN_TABLE_ROWS rows) filtered
+    out. Confirmed live: this filter removes exactly the one shared
+    false-positive both candidate libraries produced in the research pass
+    (a styled block-quote misread as a 1-row table) without affecting the
+    29/29 real detection rate on table_heavy.pdf."""
+    results = []
+    for table in page.find_tables():
+        rows = table.extract()
+        if len(rows) < _MIN_TABLE_ROWS:
+            continue
+        results.append({"bbox": table.bbox, "markdown": _rows_to_markdown(rows)})
+    return results
+
+
+def _extract_pdf_figures(page) -> list[dict]:
+    """Real embedded images only — page-covering "images" (a scanned
+    page's own raw content, not a meaningful embedded figure) are filtered
+    by _FIGURE_MAX_PAGE_COVERAGE. See that constant's docstring for the
+    live finding this is based on."""
+    page_area = float(page.width) * float(page.height)
+    results = []
+    for img in page.images:
+        bbox = (img["x0"], img["top"], img["x1"], img["bottom"])
+        area = max(0.0, img["x1"] - img["x0"]) * max(0.0, img["bottom"] - img["top"])
+        if page_area > 0 and area / page_area > _FIGURE_MAX_PAGE_COVERAGE:
+            continue
         try:
-            result = self._converter.convert(stream)
-        except Exception as exc:
-            raise ParseError(f"Docling conversion failed: {exc}") from exc
+            cropped = page.crop(bbox)
+            pil_image = cropped.to_image(resolution=150).original.convert("RGB")
+        except Exception:
+            logger.warning("parser: dropped a figure on page %s — image render failed", page.page_number, exc_info=True)
+            continue
+        results.append({"bbox": bbox, "image": pil_image})
+    return results
 
-        doc = result.document
-        # Real per-format finding (FEAT-020): DOCX/HTML never populate
-        # item.prov at all, for any element, ever — resolved once here
-        # rather than re-derived per element.
-        format_lacks_provenance = result.input.format in _FORMATS_WITHOUT_PROVENANCE
-        elements: list[ParsedElement] = []
-        dropped_elements = 0
-        last_page_number: int | None = None
-        explicitly_claimed_caption_ids: set[str] = set()
 
-        try:
-            for item, _level in doc.iterate_items():
-                element_type = _LABEL_TO_ELEMENT_TYPE.get(getattr(item, "label", None))
-                if element_type is None:
-                    continue  # not one of our six types — expected filtering, not a drop
+def _match_captions_to_targets(
+    captions: list[dict], targets: list[dict]
+) -> dict[int, int | None]:
+    """Tier 1 caption<->table/figure association (FEAT-027) — same
+    reading-order-then-bbox-distance greedy algorithm chunker.py's own
+    Tier 2 already uses (`_resolve_tier2_captions`), reused here at Tier 1
+    since this parser has no ML-provided explicit link to prefer over it.
+    Returns {caption_index: target_index_or_None}. A target already
+    claimed by an earlier (in reading-order) caption is no longer a
+    candidate for a later one — same documented greedy limitation
+    chunker.py's own version has (.agent/MEMORY.md §Anti-patterns),
+    carried forward deliberately for consistency, not independently
+    re-decided here."""
+    resolution: dict[int, int | None] = {}
+    claimed: set[int] = set()
+    for c_idx, caption in enumerate(captions):
+        candidates = [t_idx for t_idx in range(len(targets)) if t_idx not in claimed]
+        if not candidates:
+            resolution[c_idx] = None
+            continue
+        best = min(candidates, key=lambda t_idx: _bbox_distance(caption["bbox"], targets[t_idx]["bbox"]))
+        resolution[c_idx] = best
+        claimed.add(best)
+    return resolution
 
-                if item.prov:
-                    prov = item.prov[0]
-                    page_number = prov.page_no
-                    bbox = BBox(x0=prov.bbox.l, y0=prov.bbox.t, x1=prov.bbox.r, y1=prov.bbox.b)
-                elif format_lacks_provenance:
-                    # Not an anomaly for these two formats — this is every
-                    # element, always (confirmed live). Sentinel location:
-                    # page_number=1 (there is no real page/pagination
-                    # concept to report — inventing one would be worse
-                    # than an honest fixed value), zero-sized bbox (no
-                    # real coordinate space exists either).
-                    page_number = 1
-                    bbox = BBox(x0=0.0, y0=0.0, x1=0.0, y1=0.0)
-                else:
-                    # A genuine anomaly for a format that normally has
-                    # provenance (PDF, PPTX) — keep the original drop
-                    # behavior, unchanged.
-                    dropped_elements += 1
-                    logger.warning(
-                        "parser: dropped %s element — no provenance (page/bbox unavailable)",
-                        element_type.value,
+
+def _parse_pdf(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
+    last_page_number: int | None = None
+    try:
+        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+            if not pdf.pages:
+                raise ParseError("PDF has no pages")
+            body_size = _document_body_font_size(pdf)
+            body_x0 = _document_body_x0(pdf)
+
+            elements: list[ParsedElement] = []
+            dropped = 0
+            element_counter = 0
+
+            for page in pdf.pages:
+                page_number = page.page_number
+                last_page_number = page_number
+
+                tables = _extract_pdf_tables(page)
+                figures = _extract_pdf_figures(page)
+                target_bboxes = [t["bbox"] for t in tables] + [f["bbox"] for f in figures]
+
+                lines = _group_chars_into_lines(page)
+                non_table_lines = [
+                    line
+                    for line in lines
+                    if not any(
+                        _bbox_overlaps((line["x0"], line["top"], line["x1"], line["bottom"]), tb)
+                        for tb in target_bboxes
+                    )
+                ]
+
+                # Classify every remaining line; merge consecutive TEXT
+                # lines into one paragraph-level element (small vertical
+                # gap = still the same paragraph), matching the
+                # granularity real documents' own paragraph structure
+                # actually has — HEADING/LIST/CAPTION lines never merge,
+                # each stays its own element.
+                page_captions: list[dict] = []
+                page_elements: list[dict] = []
+                text_buffer: list[dict] = []
+
+                def flush_text_buffer():
+                    nonlocal element_counter
+                    if not text_buffer:
+                        return
+                    combined_text = "\n".join(l["text"] for l in text_buffer)
+                    bbox = (
+                        min(l["x0"] for l in text_buffer),
+                        text_buffer[0]["top"],
+                        max(l["x1"] for l in text_buffer),
+                        text_buffer[-1]["bottom"],
+                    )
+                    page_elements.append({"type": ElementType.TEXT, "bbox": bbox, "content": combined_text})
+                    text_buffer.clear()
+
+                prev_bottom = None
+                for line in non_table_lines:
+                    kind = _classify_line(line, body_size, body_x0)
+                    line_height = line["bottom"] - line["top"] or 12.0
+                    gap = (line["top"] - prev_bottom) if prev_bottom is not None else 0.0
+                    if kind == ElementType.TEXT:
+                        if text_buffer and gap > line_height * 1.5:
+                            flush_text_buffer()
+                        text_buffer.append(line)
+                    else:
+                        flush_text_buffer()
+                        bbox = (line["x0"], line["top"], line["x1"], line["bottom"])
+                        if kind == ElementType.CAPTION:
+                            page_captions.append({"bbox": bbox, "text": line["text"]})
+                        else:
+                            page_elements.append({"type": kind, "bbox": bbox, "content": line["text"]})
+                    prev_bottom = line["bottom"]
+                flush_text_buffer()
+
+                # Tier 1: match this page's captions to this page's
+                # tables/figures by reading-order + bbox proximity.
+                targets = [{"bbox": t["bbox"], "kind": "table"} for t in tables] + [
+                    {"bbox": f["bbox"], "kind": "figure"} for f in figures
+                ]
+                resolution = _match_captions_to_targets(page_captions, targets)
+
+                # Build final ParsedElements for this page in real reading
+                # order (sorted by vertical position) rather than grouped by
+                # type — tables/figures/captions/text are interleaved the
+                # way they actually appear on the page, matching Docling's
+                # reading-order output instead of dumping every table before
+                # any surrounding text.
+                caption_ids_by_target_index: dict[int, list[str]] = {}
+                caption_ids_by_c_idx: dict[int, str] = {}
+                for c_idx, caption in enumerate(page_captions):
+                    element_counter += 1
+                    cap_id = f"pdf-p{page_number}-cap{element_counter}"
+                    caption_ids_by_c_idx[c_idx] = cap_id
+                    target_idx = resolution.get(c_idx)
+                    if target_idx is not None:
+                        caption_ids_by_target_index.setdefault(target_idx, []).append(cap_id)
+
+                positioned: list[tuple[float, ParsedElement]] = []
+                for t_idx, table in enumerate(tables):
+                    element_counter += 1
+                    positioned.append(
+                        (
+                            table["bbox"][1],
+                            ParsedElement(
+                                element_type=ElementType.TABLE,
+                                page_number=page_number,
+                                bbox=BBox(*table["bbox"]),
+                                content=table["markdown"],
+                                element_id=f"pdf-p{page_number}-table{element_counter}",
+                                associated_caption_ids=caption_ids_by_target_index.get(t_idx, []),
+                            ),
+                        )
+                    )
+                for f_idx, figure in enumerate(figures):
+                    element_counter += 1
+                    positioned.append(
+                        (
+                            figure["bbox"][1],
+                            ParsedElement(
+                                element_type=ElementType.FIGURE,
+                                page_number=page_number,
+                                bbox=BBox(*figure["bbox"]),
+                                content=figure["image"],
+                                element_id=f"pdf-p{page_number}-fig{element_counter}",
+                                associated_caption_ids=caption_ids_by_target_index.get(len(tables) + f_idx, []),
+                            ),
+                        )
+                    )
+                for c_idx, caption in enumerate(page_captions):
+                    target_idx = resolution.get(c_idx)
+                    method = "explicit" if target_idx is not None else "none"
+                    positioned.append(
+                        (
+                            caption["bbox"][1],
+                            ParsedElement(
+                                element_type=ElementType.CAPTION,
+                                page_number=page_number,
+                                bbox=BBox(*caption["bbox"]),
+                                content=caption["text"],
+                                element_id=caption_ids_by_c_idx[c_idx],
+                                association_method=method,
+                            ),
+                        )
+                    )
+                for el in page_elements:
+                    element_counter += 1
+                    positioned.append(
+                        (
+                            el["bbox"][1],
+                            ParsedElement(
+                                element_type=el["type"],
+                                page_number=page_number,
+                                bbox=BBox(*el["bbox"]),
+                                content=el["content"],
+                                element_id=f"pdf-p{page_number}-el{element_counter}",
+                            ),
+                        )
+                    )
+
+                positioned.sort(key=lambda item: item[0])
+                elements.extend(el for _, el in positioned)
+
+            return elements, dropped
+    except ParseError:
+        raise
+    except Exception as exc:
+        raise ParseError(f"Failed to parse PDF: {exc}", page_number=last_page_number) from exc
+
+
+def _render_pdf_page_image(file_bytes: bytes, page_number: int) -> Image.Image | None:
+    """Renders one page as a full-resolution PIL Image for the OCR
+    fallback below — done lazily, only for pages that actually need it
+    (a fresh pdfplumber.open() per call is deliberate: cheap relative to
+    an OCR API call, and avoids holding the whole PDF's page objects open
+    for the entire parse just in case OCR is needed later)."""
+    try:
+        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+            if page_number < 1 or page_number > len(pdf.pages):
+                return None
+            page = pdf.pages[page_number - 1]
+            return page.to_image(resolution=150).original.convert("RGB")
+    except Exception:
+        logger.warning("parser: failed to render page %s for OCR fallback", page_number, exc_info=True)
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# DOCX extraction (python-docx)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Real native structure, no heuristics needed: paragraph.style.name
+# ("Heading 1"/"Heading 2"/... -> HEADING; "List Bullet"/"List Number" ->
+# LIST; "Caption" -> CAPTION, confirmed live to round-trip correctly,
+# .agent/reviews/2026-08-01-parser-research.md — table.docx's own fixture
+# doesn't happen to use Word's Caption style, so this path is exercised by
+# a synthetic construction in that research, and by whichever future real
+# document does use it; a caption-shaped paragraph using the text-prefix
+# convention below is caught regardless of style). Sentinel page_number=1
+# and zero bbox for every element, matching the prior Docling-based
+# contract exactly — DOCX has no real page/coordinate concept to report.
+
+_DOCX_HEADING_STYLE_RE = re.compile(r"^Heading\s+\d+$", re.IGNORECASE)
+_DOCX_LIST_STYLE_RE = re.compile(r"^List\b", re.IGNORECASE)
+_SENTINEL_BBOX = BBox(x0=0.0, y0=0.0, x1=0.0, y1=0.0)
+
+
+def _docx_image_bytes(document, inline_shape) -> bytes | None:
+    try:
+        rid = inline_shape._inline.graphic.graphicData.pic.blipFill.blip.embed
+        return document.part.related_parts[rid].blob
+    except Exception:
+        return None
+
+
+def _parse_docx(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
+    try:
+        document = docx.Document(BytesIO(file_bytes))
+    except Exception as exc:
+        raise ParseError(f"Failed to open DOCX: {exc}") from exc
+
+    elements: list[ParsedElement] = []
+    dropped = 0
+    counter = 0
+
+    try:
+        for paragraph in document.paragraphs:
+            text = paragraph.text.strip()
+            if not text:
+                continue
+            style_name = paragraph.style.name if paragraph.style else ""
+            if style_name.lower() == "caption" or _CAPTION_PREFIX_RE.match(text):
+                element_type = ElementType.CAPTION
+            elif _DOCX_HEADING_STYLE_RE.match(style_name):
+                element_type = ElementType.HEADING
+            elif _DOCX_LIST_STYLE_RE.match(style_name) or _BULLET_PREFIX_RE.match(text):
+                element_type = ElementType.LIST
+            else:
+                element_type = ElementType.TEXT
+
+            counter += 1
+            elements.append(
+                ParsedElement(
+                    element_type=element_type,
+                    page_number=1,
+                    bbox=_SENTINEL_BBOX,
+                    content=text,
+                    element_id=f"docx-p{counter}",
+                )
+            )
+
+        for table in document.tables:
+            rows = [[cell.text for cell in row.cells] for row in table.rows]
+            if len(rows) < _MIN_TABLE_ROWS:
+                continue
+            counter += 1
+            elements.append(
+                ParsedElement(
+                    element_type=ElementType.TABLE,
+                    page_number=1,
+                    bbox=_SENTINEL_BBOX,
+                    content=_rows_to_markdown(rows),
+                    element_id=f"docx-table{counter}",
+                )
+            )
+
+        for shape in document.inline_shapes:
+            image_bytes = _docx_image_bytes(document, shape)
+            if image_bytes is None:
+                dropped += 1
+                logger.warning("parser: dropped a DOCX figure — could not resolve its image bytes")
+                continue
+            try:
+                pil_image = Image.open(BytesIO(image_bytes)).convert("RGB")
+                pil_image.load()  # force decode now, while the source bytes are still in scope
+            except Exception:
+                dropped += 1
+                logger.warning("parser: dropped a DOCX figure — image bytes failed to decode", exc_info=True)
+                continue
+            counter += 1
+            elements.append(
+                ParsedElement(
+                    element_type=ElementType.FIGURE,
+                    page_number=1,
+                    bbox=_SENTINEL_BBOX,
+                    content=pil_image,
+                    element_id=f"docx-fig{counter}",
+                )
+            )
+    except ParseError:
+        raise
+    except Exception as exc:
+        raise ParseError(f"Failed while processing DOCX elements: {exc}") from exc
+
+    return elements, dropped
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PPTX extraction (python-pptx)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Real native structure: placeholder type (CENTER_TITLE/TITLE/SUBTITLE ->
+# HEADING) is a direct, zero-heuristic signal — cleaner than DOCX's style
+# names or PDF's font geometry. page_number is the REAL 1-indexed slide
+# index (confirmed live, FEAT-020) — PPTX is not a sentinel format, unlike
+# DOCX/HTML. bbox uses the shape's real EMU position/size, converted to
+# points (1 pt = 12700 EMU) to stay unit-consistent with the PDF path.
+
+_EMU_PER_POINT = 12700
+
+
+def _pptx_shape_bbox(shape) -> BBox:
+    try:
+        left, top, width, height = shape.left, shape.top, shape.width, shape.height
+        if None in (left, top, width, height):
+            return _SENTINEL_BBOX
+        x0 = left / _EMU_PER_POINT
+        y0 = top / _EMU_PER_POINT
+        return BBox(x0=x0, y0=y0, x1=x0 + width / _EMU_PER_POINT, y1=y0 + height / _EMU_PER_POINT)
+    except Exception:
+        return _SENTINEL_BBOX
+
+
+def _parse_pptx(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
+    try:
+        presentation = pptx.Presentation(BytesIO(file_bytes))
+    except Exception as exc:
+        raise ParseError(f"Failed to open PPTX: {exc}") from exc
+
+    elements: list[ParsedElement] = []
+    dropped = 0
+    counter = 0
+
+    try:
+        for slide_index, slide in enumerate(presentation.slides, start=1):
+            for shape in slide.shapes:
+                if shape.shape_type is not None and str(shape.shape_type) == "PICTURE (13)":
+                    try:
+                        image_bytes = shape.image.blob
+                        pil_image = Image.open(BytesIO(image_bytes)).convert("RGB")
+                        pil_image.load()
+                    except Exception:
+                        dropped += 1
+                        logger.warning(
+                            "parser: dropped a PPTX figure on slide %s — image extraction failed",
+                            slide_index,
+                            exc_info=True,
+                        )
+                        continue
+                    counter += 1
+                    elements.append(
+                        ParsedElement(
+                            element_type=ElementType.FIGURE,
+                            page_number=slide_index,
+                            bbox=_pptx_shape_bbox(shape),
+                            content=pil_image,
+                            element_id=f"pptx-s{slide_index}-fig{counter}",
+                        )
                     )
                     continue
 
-                last_page_number = page_number
-
-                if element_type == ElementType.TABLE:
-                    content = item.export_to_markdown(doc)
-                elif element_type == ElementType.FIGURE:
-                    image = item.get_image(doc)
-                    if image is None:
-                        dropped_elements += 1
-                        logger.warning(
-                            "parser: dropped figure element on page %s — get_image() returned None",
-                            page_number,
-                        )
+                if shape.has_table:
+                    tbl = shape.table
+                    rows = [[cell.text for cell in row.cells] for row in tbl.rows]
+                    if len(rows) < _MIN_TABLE_ROWS:
                         continue
-                    content = image
-                else:
-                    content = item.text
+                    counter += 1
+                    elements.append(
+                        ParsedElement(
+                            element_type=ElementType.TABLE,
+                            page_number=slide_index,
+                            bbox=_pptx_shape_bbox(shape),
+                            content=_rows_to_markdown(rows),
+                            element_id=f"pptx-s{slide_index}-table{counter}",
+                        )
+                    )
+                    continue
 
-                associated_caption_ids: list[str] = []
-                if element_type in (ElementType.TABLE, ElementType.FIGURE):
-                    for caption_ref in getattr(item, "captions", []):
-                        try:
-                            resolved = caption_ref.resolve(doc)
-                        except Exception:
-                            logger.warning(
-                                "parser: table/figure on page %s references a caption that failed to resolve (%s)",
-                                page_number,
-                                caption_ref,
-                            )
-                            continue
-                        if _LABEL_TO_ELEMENT_TYPE.get(getattr(resolved, "label", None)) != ElementType.CAPTION:
-                            logger.warning(
-                                "parser: table/figure on page %s's caption ref resolved to a non-caption item (%s)",
-                                page_number,
-                                getattr(resolved, "label", None),
-                            )
-                            continue
-                        associated_caption_ids.append(resolved.self_ref)
-                        explicitly_claimed_caption_ids.add(resolved.self_ref)
+                if not shape.has_text_frame:
+                    continue
 
+                is_title = shape.is_placeholder and shape.placeholder_format.type is not None and (
+                    "TITLE" in str(shape.placeholder_format.type)
+                )
+                for paragraph in shape.text_frame.paragraphs:
+                    text = paragraph.text.strip()
+                    if not text:
+                        continue
+                    if is_title:
+                        element_type = ElementType.HEADING
+                    elif paragraph.level and paragraph.level > 0:
+                        element_type = ElementType.LIST
+                    elif _BULLET_PREFIX_RE.match(text):
+                        element_type = ElementType.LIST
+                    elif _CAPTION_PREFIX_RE.match(text):
+                        element_type = ElementType.CAPTION
+                    else:
+                        element_type = ElementType.TEXT
+                    counter += 1
+                    elements.append(
+                        ParsedElement(
+                            element_type=element_type,
+                            page_number=slide_index,
+                            bbox=_pptx_shape_bbox(shape),
+                            content=text,
+                            element_id=f"pptx-s{slide_index}-el{counter}",
+                        )
+                    )
+    except ParseError:
+        raise
+    except Exception as exc:
+        raise ParseError(f"Failed while processing PPTX elements: {exc}") from exc
+
+    return elements, dropped
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# HTML extraction (selectolax)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Real native structure: semantic tags are ground truth, no heuristics
+# needed. Sentinel page_number=1 and zero bbox for every element, same
+# reasoning as DOCX — HTML has no page/coordinate concept either.
+
+_HTML_HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+
+
+def _parse_html(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
+    try:
+        tree = HTMLParser(file_bytes)
+    except Exception as exc:
+        raise ParseError(f"Failed to open HTML: {exc}") from exc
+
+    elements: list[ParsedElement] = []
+    dropped = 0
+    counter = 0
+
+    try:
+        for node in tree.css("h1, h2, h3, h4, h5, h6, p, li, table, figcaption, caption"):
+            tag = node.tag
+            if tag == "table":
+                rows = []
+                for tr in node.css("tr"):
+                    cells = [c.text(deep=True, separator=" ").strip() for c in tr.css("td, th")]
+                    if cells:
+                        rows.append(cells)
+                if len(rows) < _MIN_TABLE_ROWS:
+                    continue
+                counter += 1
                 elements.append(
                     ParsedElement(
-                        element_type=element_type,
-                        page_number=page_number,
-                        bbox=bbox,
-                        content=content,
-                        element_id=item.self_ref,
-                        associated_caption_ids=associated_caption_ids,
+                        element_type=ElementType.TABLE,
+                        page_number=1,
+                        bbox=_SENTINEL_BBOX,
+                        content=_rows_to_markdown(rows),
+                        element_id=f"html-table{counter}",
                     )
                 )
+                continue
 
-            # Second pass over already-extracted elements (no further Docling
-            # calls): a caption can be referenced by a table/figure that's
-            # iterated either before or after it, so association_method can
-            # only be finalized once every table/figure has been seen.
-            for element in elements:
-                if element.element_type == ElementType.CAPTION:
-                    element.association_method = (
-                        "explicit" if element.element_id in explicitly_claimed_caption_ids else "none"
-                    )
-        except Exception as exc:
-            raise ParseError(
-                f"Failed while processing document elements: {exc}", page_number=last_page_number
-            ) from exc
+            text = node.text(deep=True, separator=" ").strip()
+            if not text:
+                continue
 
-        # FEAT-017: OCR fallback for low-yield pages. Runs after Docling's
-        # own extraction is fully done (elements above are final) and
-        # outside the try/except above on purpose — a failed OCR call must
-        # never become a ParseError for the whole document (GeminiOcrClient
-        # itself never raises; this loop only needs to survive a page whose
-        # rendered image is unexpectedly missing).
-        #
-        # FEAT-020 (2026-07-27): confirmed this loop is already, correctly,
-        # a structural no-op for DOCX/PPTX/HTML — no special-casing added,
-        # none needed. doc.pages is completely empty for DOCX/HTML (their
-        # SimplePipeline never populates it, confirmed live), so this loop
-        # simply never executes for those two. PPTX's doc.pages DOES have
-        # one real entry per slide, but page.image is always None (PPTX
-        # also uses SimplePipeline, which never renders slide images the
-        # way PdfPipeline renders page images) — a textless PPTX slide
-        # would enter this loop, immediately hit the "no rendered page
-        # image" branch below, and move on. This is the right behavior:
-        # a DOCX/HTML/PPTX "page" with no extractable text is a
-        # structurally different failure mode than a scanned PDF page
-        # (there is no scan to re-read — the content is either genuinely
-        # absent or in a form Docling doesn't extract, e.g. HTML's broken
-        # figure extraction, see FEATURES.md's FEAT-020 entry), so OCR
-        # fallback correctly never fires for these formats rather than
-        # needing to be explicitly excluded.
+            if tag in _HTML_HEADING_TAGS:
+                element_type = ElementType.HEADING
+            elif tag == "li":
+                element_type = ElementType.LIST
+            elif tag in ("figcaption", "caption") or _CAPTION_PREFIX_RE.match(text):
+                element_type = ElementType.CAPTION
+            else:
+                element_type = ElementType.TEXT
+
+            counter += 1
+            elements.append(
+                ParsedElement(
+                    element_type=element_type,
+                    page_number=1,
+                    bbox=_SENTINEL_BBOX,
+                    content=text,
+                    element_id=f"html-el{counter}",
+                )
+            )
+
+        # HTML figure extraction (img tags): confirmed real gap during the
+        # original FEAT-020 investigation (Docling itself never resolved
+        # <img> content to a usable image either) — this rewrite doesn't
+        # fetch/decode <img> src content (would need a network fetch for a
+        # remote src, or a relative-path filesystem read for a local one,
+        # neither of which this parser has enough context to do safely).
+        # Text/table extraction for HTML is unaffected; this is a known,
+        # unchanged limitation, not a regression.
+    except ParseError:
+        raise
+    except Exception as exc:
+        raise ParseError(f"Failed while processing HTML elements: {exc}") from exc
+
+    return elements, dropped
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Parser — format dispatch + OCR fallback
+# ══════════════════════════════════════════════════════════════════════════
+
+_EXTENSION_TO_FORMAT = {
+    "pdf": "pdf",
+    "docx": "docx",
+    "pptx": "pptx",
+    "html": "html",
+    "htm": "html",
+}
+
+
+class Parser:
+    def __init__(self, ocr_tiers: list[tuple[str, object]] | None = None):
+        # Real 3-tier chain by default — OCR fallback is production
+        # behavior, not an opt-in extra a caller has to remember to wire
+        # up. routes/ingest.py constructs Parser() with no arguments and
+        # gets all three tiers automatically. Tests that don't want real
+        # calls inject their own (name, fake) tier list.
+        self._ocr_tiers = ocr_tiers if ocr_tiers is not None else _default_ocr_tiers()
+
+    def parse(self, file_bytes: bytes, filename: str = "document.pdf") -> ParsedDocument:
+        """filename drives format detection (extension-based — this parser
+        does not content-sniff). A caller ingesting DOCX/PPTX/HTML MUST
+        pass the real filename (or at least the real extension)."""
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        fmt = _EXTENSION_TO_FORMAT.get(ext)
+        if fmt is None:
+            raise ParseError(f"Unsupported file format: {filename!r}")
+
+        if fmt == "pdf":
+            elements, dropped = _parse_pdf(file_bytes)
+        elif fmt == "docx":
+            elements, dropped = _parse_docx(file_bytes)
+        elif fmt == "pptx":
+            elements, dropped = _parse_pptx(file_bytes)
+        else:
+            elements, dropped = _parse_html(file_bytes)
+
+        if fmt == "pdf":
+            elements = self._run_ocr_fallback(elements, file_bytes)
+
+        return ParsedDocument(elements=elements, dropped_elements=dropped)
+
+    def _run_ocr_fallback(self, elements: list[ParsedElement], file_bytes: bytes) -> list[ParsedElement]:
+        """FEAT-017: OCR fallback for low-yield PDF pages. Re-derived
+        against this parser's own real silent-failure behavior (research
+        item 8) — pdfplumber, unlike Docling, never raises and never
+        returns a page with zero pages total; a page pdfplumber found no
+        text on simply produces zero TEXT/HEADING/TABLE/LIST elements for
+        that page_number, the same trigger shape the original Docling-era
+        heuristic already used. PPTX/DOCX/HTML never reach this method at
+        all (called only from the fmt == "pdf" branch above) — mirrors the
+        prior contract exactly: OCR fallback is a PDF-specific concept,
+        confirmed structurally correct for the other three formats in the
+        original FEAT-020 investigation and unchanged here.
+        """
+        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+            total_pages = len(pdf.pages)
+
         pages_with_textual_content = {
             e.page_number for e in elements if e.element_type in _TEXTUAL_ELEMENT_TYPES
         }
-        for page_number, page in doc.pages.items():
+
+        for page_number in range(1, total_pages + 1):
             if page_number in pages_with_textual_content:
                 continue
-            page_image = page.image.pil_image if page.image else None
+
+            page_image = _render_pdf_page_image(file_bytes, page_number)
             if page_image is None:
                 logger.warning(
-                    "parser: page %s has no textual elements and no rendered page image "
-                    "(generate_page_images produced nothing) — cannot attempt OCR fallback",
+                    "parser: page %s has no textual elements and could not be rendered for OCR fallback",
                     page_number,
                 )
                 continue
 
-            # Walk the tier chain in order — each tier only attempted if
-            # every prior one failed (raised, returned nothing, or returned
-            # only whitespace — a "successful" call that recovered nothing
-            # useful is treated exactly like a failure, not a valid
-            # recovery), never in parallel and never speculatively. The
-            # try/except here is deliberate, on top of each tier client's
-            # own internal one: a tier is an injectable dependency (anything
-            # with transcribe_page), so this loop can't assume every
-            # possible implementation fails safe — or normalizes
-            # empty/whitespace results — on its own. `text and text.strip()`
-            # (not bare `text`) is deliberate defense-in-depth: every real
-            # client here already self-normalizes empty/whitespace text to
-            # None before returning, but a bare truthiness check would
-            # silently accept a raw whitespace-only string as "recovered"
-            # from any tier that didn't (a real gap, found live during
-            # audit — a plain `if text:` treats a non-empty whitespace
-            # string as truthy). One tier blowing up must never take down
-            # the rest of the chain, let alone the rest of the parse.
             recovered_text: str | None = None
             recovered_tier = "none"
             for tier_name, tier_client in self._ocr_tiers:
@@ -550,10 +1092,6 @@ class Parser:
                     element_id=f"ocr-page-{page_number}",
                 )
             )
-            # Which tier recovered this page — established as necessary
-            # for debugging retrieval quality (a page recovered by
-            # Tesseract, the weakest tier, may need a closer look if
-            # something downstream looks off).
             logger.info("parser: OCR fallback recovered text on page %s via tier=%s", page_number, recovered_tier)
 
-        return ParsedDocument(elements=elements, dropped_elements=dropped_elements)
+        return elements

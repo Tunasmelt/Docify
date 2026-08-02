@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 
 from PIL import Image
 
-from services.parser import ElementType, ParsedDocument, ParsedElement
+from services.document_model import ElementType, ParsedDocument, ParsedElement
 
 # ~500 tokens is the target chunk size (SCOPE.md, FEATURES.md FEAT-005). No
 # tokenizer dependency exists yet, so token count is approximated at ~4

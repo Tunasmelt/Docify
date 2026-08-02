@@ -147,6 +147,69 @@ Rule: a feature is not `complete` until acceptance criteria pass AND `/gap-check
 
 **Changelog:** See CHANGELOG.md 2026-07-22 "feature: Docling parser service (FEAT-004)", 2026-07-22 "fix: parser exception coverage + silent-drop visibility (FEAT-004 Codex follow-up)", and 2026-07-23 "feature: table/figure caption association, Tier 1 (FEAT-004 Codex follow-up #2)"
 
+**Superseded 2026-08-01 by [FEAT-027]** — Docling's real import cost (441MB) and real peak parse memory (1144.6MB on `table_heavy.pdf`) OOM-crash `/ingest` in production (Render's 512MB free tier). Replaced with a heuristic-based pdfplumber/python-docx/python-pptx/selectolax parser preserving this feature's exact contract. This entry stays as historical record of the original implementation and its real measured numbers; FEAT-027 is the current parser.
+
+---
+
+### [FEAT-027] Parser rewrite — Docling removal (pdfplumber/python-docx/python-pptx/selectolax)
+**Phase:** 1
+**Status:** complete
+**Owner:** claude-code
+**Depends on:** FEAT-004 (superseded, contract preserved), `.agent/reviews/2026-08-01-parser-research.md` (the investigation this implements against)
+**Files:**
+- `apps/api/services/document_model.py` (new — ElementType/BBox/ParsedElement/ParsedDocument/ParseError, split out of parser.py so chunker.py can depend on them at runtime without pulling in the heavy parsing libraries)
+- `apps/api/services/parser.py` (rewrite; re-exports document_model's types for backward compatibility)
+- `apps/api/services/chunker.py` (repointed at `services.document_model` instead of `services.parser` — it needs `ElementType` at runtime, not just as a type hint, so it couldn't use the TYPE_CHECKING pattern)
+- `apps/api/db/queries.py` (decouple `Chunk`/`ParsedElement` type imports from `services.chunker`/`services.parser`)
+- `apps/api/services/embedder.py` (same decoupling — `services.retriever` → `services.embedder` → `services.chunker` was a second, undocumented leak into `/query`)
+- `apps/api/routes/ingest.py` (`Parser` import moved from module level into `run_ingest_pipeline()` — main.py registers every router eagerly, so a module-level import here leaked `services.parser` into `import main` even after the two fixes above)
+- `apps/api/pyproject.toml` / `apps/api/uv.lock` (removed docling/torch/torchvision + CPU-index pins; added pdfplumber/python-docx/python-pptx/selectolax/psutil)
+- `apps/api/tests/test_parser.py` (rewritten against the new implementation)
+- `apps/api/tests/test_parser_rewrite.py` (new — acceptance criteria for this feature specifically)
+- `apps/api/tests/test_chunker.py` (5 tests updated — fixture-staleness only, chunker.py's own logic never changed)
+- `apps/api/tests/test_ingest.py` (1 test's patch target updated: `services.parser.Parser`, not `routes.ingest.Parser`, now that the import is local to the function)
+**Tests:**
+- `apps/api/tests/test_parser_rewrite.py` (13 tests)
+- `apps/api/tests/test_parser.py` (52 tests)
+**Acceptance criteria:**
+- [x] db/queries.py no longer imports services.chunker or services.parser transitively -- verified by importing db.queries in total isolation and asserting services.parser is not in sys.modules afterward
+- [x] Parser.parse() preserves the exact contract from the research report byte-for-byte -- ElementType six-value enum, BBox, ParsedElement fields (page_number, bbox, content, element_id, associated_caption_ids, association_method), ParsedDocument (elements, dropped_elements), ParseError(message, page_number)
+- [x] Figure elements return PIL Image objects the parser never closes -- caller-closes ownership contract preserved
+- [x] Per-format page_number provenance preserved -- real PDF page number, real PPTX slide index, DOCX/HTML sentinel value 1
+- [x] Caption Tier 1 heuristic (text-prefix plus bbox proximity) correctly associates at least 5 spot-checked captions that Docling's own model did not link, verified individually not just by count -- Table 4 (cast/role table, "Daniel Radcliffe"), Table 7 (balance-sheet table, "Non-current assets"/"Property"), Table 14 (survey table, "Question"/"Respondent"), Table 19 (country stats, "Afghanistan"), Table 23 (the "no structure" hard case, "Bob"/"Sue"/"Entered"/"Completed") -- none in Docling's real 13-table linked set, all verified correct by real content, not just presence of a link
+- [x] List detection combines bullet/number prefix with left-indent position and finds 9 of 9 list items on clean_digital.pdf, matching Docling's count exactly
+- [x] OCR trigger heuristic re-derived against pdfplumber's real silent-failure behavior on scanned.pdf, not assumed to transfer from Docling unchanged -- confirmed live: all 3 tiers (Gemini/OCR.space/Tesseract) recover real text from the same pdfplumber-rendered page image
+- [x] Per-fixture element counts, type breakdown, and page numbers reported against the Docling baseline for all six fixtures -- see below
+- [x] Table 23's extracted content matches Docling's correct reconstruction
+- [x] Real memory measurement shows import main.py no longer includes parser-related memory for routes that never touch it, reported against the old 441MB import / 1144.6MB peak numbers -- see below; caught and fixed a real leak (routes/ingest.py's module-level `Parser` import) that the original two fixes alone did not close
+- [x] docling, torch, torchvision removed from pyproject.toml including the CPU-only index pins, uv.lock re-locked
+- [x] Full backend test suite passes -- 207 passed, 127 skipped (env-gated integration tests), 82.9s
+
+**Per-fixture element counts (new parser vs Docling baseline):**
+| Fixture | Total | Type breakdown | Pages | vs Docling |
+|---|---|---|---|---|
+| clean_digital.pdf | 22 | heading:6 text:6 list:9 table:1 | [1] | heading/list/table match exactly (21→22: one extra text-merge boundary, benign) |
+| table_heavy.pdf | 74 | table:29 caption:29 heading:10 list:6 | [1,2] | table/list match exactly (29/29, 6/6); caption beats Docling 29 vs 19 |
+| scanned.pdf | 1 (+2 OCR-recovered) | text:1 | [1] | 0 figures (deliberate — `_FIGURE_MAX_PAGE_COVERAGE` filters page-covering "images"; Docling reported 1 small logo figure here, a real trade-off, documented in parser.py) |
+| table.docx | 12 | heading:4 text:4 caption:2 table:1 figure:1 | [1] (sentinel) | |
+| slides.pptx | 8 | heading:4 text:3 figure:1 | [1,2,3] | |
+| page.html | 8 | heading:3 text:3 caption:1 table:1 | [1] (sentinel) | |
+
+**Real memory measurement (psutil RSS, table_heavy.pdf):**
+| Checkpoint | Old (Docling) | New (pdfplumber) |
+|---|---|---|
+| bare interpreter | ~18MB | 17.6MB |
+| after `import main` | ~441MB (423MB delta) | 103.4MB (85.9MB delta) — `services.parser` confirmed NOT in `sys.modules` |
+| after `Parser()` construction | (included above) | 115.3MB (+11.9MB) |
+| after parsing table_heavy.pdf | 1144.6MB peak | 124.5MB (+9.1MB) |
+
+The decoupling proof required three fixes, not the two originally named: `db/queries.py` and `services/embedder.py`'s `Chunk`/`ParsedElement` type-hint-only imports were TYPE_CHECKING-guarded, but `services/chunker.py` needs `ElementType` at genuine runtime (enum comparisons), so it couldn't use that pattern — its dependency on the heavy parsing libraries was cut by extracting the data contract into `services/document_model.py`. Separately, `routes/ingest.py` had a legitimate module-level `from services.parser import Parser`; since `main.py` registers every router eagerly, this alone kept leaking `services.parser` into `import main` until the import was moved inside `run_ingest_pipeline()`. A permanent regression test (`test_import_main_py_does_not_pull_services_parser_into_sys_modules`, `tests/test_parser_rewrite.py`) now guards against this specific class of leak reappearing.
+
+**Run:**
+- `cd apps/api && uv run pytest tests/test_parser.py tests/test_parser_rewrite.py -v`
+
+**Changelog:** see CHANGELOG.md, 2026-08-01.
+
 ---
 
 ### [FEAT-005] Chunker
@@ -432,6 +495,7 @@ All 4/4 found their expected chunk in the top-5; 2/4 at rank 1, 2/4 at rank 2 (b
 - [x] `Retriever.retrieve()`'s `user_id` arg is passed `request.state.user_id` (JWT-verified, FEAT-003 middleware) — never a request-body/query-param value. `QueryRequest` (`models/query.py`) has no `user_id` field at all — structurally, not just conventionally, there is no other value that could reach it. Tested adversarially on its own (spying on the real call args), independent of the full end-to-end isolation test.
 - [x] Each of `Generator.generate()`'s `GenerateResult.cited_indices` (1-indexed positions into the `chunks` list, NOT chunk ids) is mapped back to a real `chunk_id` via `chunks[position - 1].chunk_id`. `services/figure_fetcher.py.fetch_generator_chunks()` adapts `RetrievedChunk` rows into `GeneratorChunk`s, fetching each figure chunk's image from Storage via `figure_path` first (confirmed by the 2026-07-24 full-flow audit that nothing did this before — built fresh, tested directly).
 - [x] This route is the first production caller of `Verifier`. It owns claim-span extraction (`_extract_claim_spans()` — sentence-boundary based, reuses `Generator`'s own `CITATION_BRACKET`/`CITATION_NUMBER` regex rather than a second, independently-maintained one) and marker-stripping (`_strip_dropped_markers()` — rebuilds grouped brackets like `[1, 2]` to keep only surviving positions, not a naive per-marker string replace, since Gemini has been observed live producing that grouped shape). Per `.agent/ARCHITECTURE.md`'s verify flow: `supported` → normal; `partial` → kept with a warning indicator, never dropped; `unsupported` (including a `Verdict.error` — a failed/unverifiable Gemini call, already forced to `UNSUPPORTED` by `Verifier` itself) → dropped from the response, marker stripped, but still persisted to `citations` for audit.
+- [x] **A citation with an unresolvable marker can never crash persistence or take the rest of the turn down with it (added 2026-07-31, real production incident — see CHANGELOG.md 2026-07-31).** Two independent layers: `routes/query.py`'s `_is_resolvable_marker()` guard (drops a citation whose position isn't a valid int in `1..len(generator_chunks)` the same fail-safe way a hallucinated out-of-range marker already is, applied identically in both the FIRST loop that indexes `generator_chunks[position-1]` and the persist loop — closes an unguarded `IndexError` risk in `post_query`, which has no surrounding try/except past generation, not just the originally-reported null-marker case) and `create_query_turn`'s SQL-level per-citation exception handling (`migrations/20260731_002_citation_persistence_defensive.sql` — one malformed citation is logged via `RAISE WARNING` and skipped, never rolls back the whole atomic function). Applies identically to `/query` and `/query/stream` — same guard function, same SQL function, called from both.
 
 **2026-07-24 full-flow audit findings, resolved:**
 - Item 3 (figure-fetch) and item 4 ([N]→chunk_id resolution) were both confirmed to not exist anywhere — built fresh in `services/figure_fetcher.py` and `routes/query.py`'s `_extract_claim_spans()`/`_strip_dropped_markers()`.

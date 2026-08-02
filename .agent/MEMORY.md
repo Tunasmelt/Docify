@@ -21,6 +21,7 @@ Things tried and failed, or explicitly rejected during design. Do not retry with
 ### 2026-07-22 [claude-code] — Vercel serverless for the Docling backend
 **Context:** User asked whether Python backend could run as Vercel serverless functions.
 **Why rejected:** (1) Vercel serverless function size cap of 250MB is smaller than PyTorch + Docling. (2) 10-30s cold starts on first invocation kill UX. (3) Default 15s timeout too short for multi-page parse. Do not attempt to move FastAPI to Vercel serverless. If Render becomes a problem, use Railway or Fly.io — not Vercel.
+**Update 2026-08-01 [claude-code]:** Reason (1) is now moot — FEAT-027 removed Docling/PyTorch entirely (pdfplumber's import cost is ~17MB, not 423MB). Reasons (2) and (3) are unrelated to the parsing library and still apply; the conclusion (don't move to Vercel serverless) still stands.
 
 ### 2026-07-22 [claude-code] — Application-level tenant filtering as primary defense
 **Context:** Considered relying on app-level `WHERE user_id = ?` alone for multi-tenancy.
@@ -41,10 +42,12 @@ Things tried and failed, or explicitly rejected during design. Do not retry with
 ### 2026-07-22 [claude-code] — Docling default pipeline options
 **Context:** FEAT-004 (Docling parser service). Docling's default pipeline downloads RapidOCR models on first use even when parsing fully-digital PDFs — must explicitly set `do_ocr=False` to stay in scope and avoid the unexpected download. Separately, `generate_picture_images` defaults to a setting that silently makes every figure element's image `None` with no error — must explicitly set `generate_picture_images=True` or figure extraction appears to work (elements exist) while actually producing no usable image data.
 **Why rejected:** Both are silent-failure-shaped defaults, not the kind of bug tests catch on their own — "elements exist" or "no error raised" looks like success. Always construct `DocumentConverter` with explicit `PdfPipelineOptions(do_ocr=False, generate_picture_images=True)` (see `apps/api/services/parser.py`) rather than relying on defaults, and re-check both flags if upgrading Docling in case defaults change.
+**MOOT as of 2026-08-01 [claude-code]:** FEAT-027 removed Docling entirely; `services/parser.py` no longer uses `DocumentConverter`/`PdfPipelineOptions`. Kept as historical record — the general lesson (silent-failure-shaped library defaults need explicit overrides, not trust) still applies to whatever library is in use.
 
 ### 2026-07-23 [claude-code] — Docling prints its own traceback to stderr on conversion failure
 **Context:** FEAT-004 Codex review. When `converter.convert()` fails (e.g. against a truncated/corrupt PDF), Docling/pypdfium2 print their own internal traceback to stderr *before* `Parser.parse()`'s `except Exception` catches it and re-raises as `ParseError`. Confirmed: the error is not swallowed — the caller still receives a clean `ParseError`, and `ParseError.page_number` is correctly `None` in this case since conversion failed before any page provenance existed. The stderr output is purely cosmetic noise from Docling's own internals, not a sign our error handling is leaking or failing.
 **Why rejected (verdict: not a bug, do not re-investigate):** This is expected third-party library behavior we don't control and don't need to suppress — `Parser.parse()`'s contract (raise `ParseError`, nothing else) already holds regardless of what gets printed to stderr. If this comes up again (e.g. noisy test output, a log-scraping alert triggering on stderr content), the fix is to filter/suppress at the logging or CI layer, not to treat it as a parser defect.
+**MOOT as of 2026-08-01 [claude-code]:** FEAT-027 removed Docling/pypdfium2 entirely. `_parse_pdf`'s pdfplumber-based implementation has not shown this stderr behavior in any test run.
 
 ### 2026-07-23 [claude-code] — Chunker's Tier-2 caption matching is greedy, not globally optimal
 **Context:** FEAT-005 (chunker service). `_resolve_tier2_captions()` processes captions in document order; a table/figure claimed via `claimed_targets` is unavailable to every caption processed after it. If two orphaned captions could both plausibly match the same single unclaimed table, whichever caption is encountered first in the document wins it — the second is left unmatched (a standalone `"unmatched"` chunk) even if, with full knowledge of both captions, it would have been the better fit for that table and the first caption would have been better left unmatched (or matched to a different table it also has a claim on).
@@ -115,6 +118,7 @@ Every fork, what was chosen, why. Append-only.
 **Alternatives considered:** Extract-to-text (simpler but lossy), unified multimodal embeddings (heavier compute, less deterministic chunks), page-as-image ColPali-style (highest fidelity but heaviest compute per page).
 **Chosen:** Layout-aware parsing via Docling.
 **Reasoning:** Widest applicability across document types, best portfolio depth, fully free at portfolio scale, preserves table structure and element relationships better than plain text extraction.
+**Superseded 2026-08-01 [claude-code] — see FEAT-027:** Docling's implementation (441MB import cost, 1144.6MB peak parse memory) OOM-crashed `/ingest` on Render's 512MB free tier in production. The *strategy* (layout-aware parsing) is unchanged and still correct; only the implementation swapped, to a heuristic-based pdfplumber/python-docx/python-pptx/selectolax parser preserving the exact same element/contract shape. See `.agent/reviews/2026-08-01-parser-research.md` for the investigation and `.agent/FEATURES.md`'s FEAT-027 entry for the real before/after numbers.
 
 ### 2026-07-22 [claude-code] — Embeddings: Voyage multimodal-3.5
 **Alternatives considered:** OpenAI text-embedding-3, Cohere embed-4, Jina v4, self-hosted nomic-embed.
@@ -151,6 +155,7 @@ Every fork, what was chosen, why. Append-only.
 **Alternatives considered:** All-Vercel (Python serverless), Railway, Fly.io, self-hosted VPS.
 **Chosen:** Vercel + Render.
 **Reasoning:** Vercel serverless can't fit Docling under size limits. Render free tier is sufficient (750 hrs/mo, Docker for Python). Railway is the fallback if Render's 15-min idle spin-down becomes a UX issue.
+**Update 2026-08-01 [claude-code]:** The Docling-size-limit reasoning is now moot (FEAT-027 removed Docling/PyTorch). Render remains the choice regardless — Tesseract (FEAT-017's OCR fallback) still needs a real Docker container, which Vercel serverless doesn't support either.
 
 ### 2026-07-22 [claude-code] — Four-agent development workflow (user override)
 **Alternatives considered:** Recommended reducing to two agents (claude-code + claude-design) for solo scope.

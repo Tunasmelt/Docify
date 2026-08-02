@@ -13,7 +13,6 @@ from models.ingest import IngestRequest, IngestResponse
 from rate_limit import limiter
 from services.chunker import Chunker
 from services.embedder import Embedder
-from services.parser import Parser
 
 logger = logging.getLogger(__name__)
 
@@ -312,7 +311,20 @@ def run_ingest_pipeline(
         validate_storage_path(storage_path, user_id)
 
         resolved_client = resolved_client or get_service_role_client()
-        parser = parser or Parser()
+        if parser is None:
+            # FEAT-027 (2026-08-01): imported here, not at module level —
+            # Parser pulls in pdfplumber/docx/pptx/pytesseract/selectolax/
+            # google.genai, real costs only an actual ingest run should
+            # pay. A module-level import made every route registered
+            # alongside this one (main.py wires up all routers eagerly)
+            # pay it just from `import main`, defeating the decoupling
+            # done in db/queries.py and services/embedder.py. Confirmed
+            # via real psutil measurement (memory_measurement.py) that
+            # `import main` no longer pulls services.parser into
+            # sys.modules once this import is deferred here too.
+            from services.parser import Parser
+
+            parser = Parser()
         chunker = chunker or Chunker()
         embedder = embedder or Embedder()
 
