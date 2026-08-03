@@ -36,6 +36,12 @@ export interface UserMessage {
   id: string;
   role: "user";
   text: string;
+  /** ISO timestamp — real `created_at` when loaded from history
+   * (GET /conversations/{id}/messages), or the moment the message was
+   * optimistically added client-side for a message not yet persisted.
+   * Chat UI modernization batch 1: message timestamps (relative + hover
+   * title). */
+  createdAt: string;
 }
 
 export interface AssistantMessage {
@@ -43,6 +49,12 @@ export interface AssistantMessage {
   role: "assistant";
   segments: MessageSegment[];
   citations: Citation[];
+  createdAt: string;
+  /** The literal answer text buildAssistantMessage() was given — pre-
+   * markdown-render, pre-citation-marker-splicing. Copy-message (batch 1,
+   * item 1) copies this, not the rendered DOM/markup, since the task
+   * explicitly calls for the raw answer text. */
+  rawText: string;
 }
 
 export type ChatMessage = UserMessage | AssistantMessage;

@@ -45,10 +45,15 @@ export async function askQuestion(
     }),
   });
 
+  // POST /query's response has no per-message created_at (API_CONTRACT.md)
+  // — "now" is the honest approximation for a request that just
+  // round-tripped synchronously, same as the streaming path's
+  // stream-started timestamp below.
+  const now = new Date().toISOString();
   return {
     conversationId: res.conversation_id,
-    userMessage: { id: `${res.message_id}-q`, role: "user", text: question },
-    assistantMessage: buildAssistantMessage(res.message_id, res.answer, res.citations),
+    userMessage: { id: `${res.message_id}-q`, role: "user", text: question, createdAt: now },
+    assistantMessage: buildAssistantMessage(res.message_id, res.answer, res.citations, now),
     metadata: res.metadata,
   };
 }

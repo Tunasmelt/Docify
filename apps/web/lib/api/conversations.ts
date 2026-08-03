@@ -57,8 +57,8 @@ export async function getConversationMessages(conversationId: string): Promise<C
 
   const messages: ChatMessage[] = res.messages.map((m) =>
     m.role === "user"
-      ? { id: m.id, role: "user" as const, text: m.content }
-      : buildAssistantMessage(m.id, m.content, m.citations ?? [])
+      ? { id: m.id, role: "user" as const, text: m.content, createdAt: m.created_at }
+      : buildAssistantMessage(m.id, m.content, m.citations ?? [], m.created_at)
   );
 
   return { conversation: res.conversation, messages };

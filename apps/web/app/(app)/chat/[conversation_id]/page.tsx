@@ -10,12 +10,22 @@ import { UserMessageBubble, AssistantMessageBubble } from "@/components/chat/mes
 import { LoadingStages, type StreamingStage } from "@/components/chat/loading-stages";
 import { QuestionInput } from "@/components/chat/question-input";
 import { SourcePanel } from "@/components/chat/source-panel";
+import { ScrollToBottomPill } from "@/components/chat/scroll-to-bottom-pill";
+import { DocumentScopeChips } from "@/components/chat/document-scope-chips";
+import { useChatShortcuts } from "@/hooks/use-chat-shortcuts";
 import type { ChatMessage, Citation } from "@/lib/types/chat";
 import { createClient } from "@/lib/supabase/browser";
 import { askQuestionStream } from "@/lib/api/query";
 import { buildAssistantMessage } from "@/lib/chat/parse-message";
 import { getConversationMessages, listConversations, type ApiConversation } from "@/lib/api/conversations";
+import { listDocuments } from "@/lib/api/documents";
 import { ApiError } from "@/lib/api/client";
+
+// A user is treated as "at the bottom" (auto-scroll keeps following new
+// content) once within this many px of the true bottom — a few px of
+// slack for how scroll containers actually report scrollTop/scrollHeight
+// across browsers, not a real reading-distance threshold.
+const NEAR_BOTTOM_THRESHOLD_PX = 96;
 
 const USER = { initials: "AK", name: "Ana Kovač", email: "ana@firm.com" };
 
@@ -56,12 +66,46 @@ export default function ChatPage({ params }: { params: { conversation_id: string
   const [activeCitation, setActiveCitation] = React.useState<Citation | null>(null);
   const [mobileMenuOpen, setMobileMenuOpen] = React.useState(false);
   const [recentConversations, setRecentConversations] = React.useState<ApiConversation[] | null>(null);
+  const [docNamesById, setDocNamesById] = React.useState<Map<string, string>>(new Map());
+  // Batch 1, item 4: force-auto-scroll fought a user who'd scrolled up
+  // to reread something (every new token/message yanked them back down).
+  // isNearBottomRef tracks live scroll position via onScroll — a ref,
+  // not state, so reading it inside the messages-changed effect below
+  // never races against a scroll event that hasn't triggered a
+  // re-render yet. showScrollPill is real state since it drives a
+  // render (the pill appearing/disappearing).
+  const isNearBottomRef = React.useRef(true);
+  const [showScrollPill, setShowScrollPill] = React.useState(false);
 
   const scrollRef = React.useRef<HTMLDivElement>(null);
 
+  function scrollToBottom() {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    isNearBottomRef.current = true;
+    setShowScrollPill(false);
+  }
+
+  function handleMessagesScroll() {
+    const el = scrollRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const nearBottom = distanceFromBottom <= NEAR_BOTTOM_THRESHOLD_PX;
+    isNearBottomRef.current = nearBottom;
+    if (nearBottom) setShowScrollPill(false);
+  }
+
   React.useEffect(() => {
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (!el) return;
+    if (isNearBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+    } else {
+      // New content arrived while the user was scrolled up — never yank
+      // their viewport; surface the pill instead so they can opt in.
+      setShowScrollPill(true);
+    }
   }, [messages, streamingStage]);
 
   // Real conversation history — omitted entirely for a fresh "new" chat,
@@ -113,6 +157,28 @@ export default function ChatPage({ params }: { params: { conversation_id: string
     };
   }, [conversationId]);
 
+  // Batch 1, item 6: document-scope chips need document_ids -> filename,
+  // and GET /conversations/{id}/messages doesn't return names itself —
+  // same composition ConversationCard/the conversation list page already
+  // use (FEAT-015 polish pass), reused here rather than a second
+  // name-resolution path or a new backend field. Independent of which
+  // conversation is open, same as the "Recent" list above.
+  React.useEffect(() => {
+    let cancelled = false;
+    listDocuments()
+      .then((result) => {
+        if (!cancelled) setDocNamesById(new Map(result.documents.map((d) => [d.id, d.filename])));
+      })
+      .catch(() => {
+        // Chips are purely informational — a failed lookup just means
+        // no chips render (documentNames resolves to []), never a
+        // blocking error for the whole page.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   async function ask(question: string) {
     if (documentIds.length === 0) {
       setAskError("Select at least one ready document from Documents before asking a question.");
@@ -121,10 +187,22 @@ export default function ChatPage({ params }: { params: { conversation_id: string
     setAskError(null);
     const userMessageId = `local-${Date.now()}`;
     const streamId = `stream-${userMessageId}`;
-    const optimisticUserMessage: ChatMessage = { id: userMessageId, role: "user", text: question };
+    // Captured once per turn, not re-read per token — the streaming
+    // placeholder bubble gets rebuilt on every token (below) and must
+    // keep showing the same "asked N seconds ago" origin, not a
+    // constantly-advancing "just now" from re-stamping itself on every
+    // token arrival.
+    const askedAt = new Date().toISOString();
+    const optimisticUserMessage: ChatMessage = { id: userMessageId, role: "user", text: question, createdAt: askedAt };
     setMessages((prev) => [...prev, optimisticUserMessage]);
     setStreamingId(streamId);
     setStreamingStage("retrieving");
+    // Sending a question is a deliberate "take me to the bottom" signal
+    // — even if the user had scrolled up to reread something earlier in
+    // the conversation, asking a new question means they want to watch
+    // it arrive.
+    isNearBottomRef.current = true;
+    setShowScrollPill(false);
 
     // Local accumulator, not state — read/written synchronously inside
     // the SSE callbacks below (all of which fire strictly in sequence
@@ -145,14 +223,14 @@ export default function ChatPage({ params }: { params: { conversation_id: string
             // LoadingStages' skeleton renders in its place, not
             // alongside an empty bubble) — insert it now.
             const exists = prev.some((m) => m.id === streamId);
-            const rebuilt = buildAssistantMessage(streamId, accumulated, []);
+            const rebuilt = buildAssistantMessage(streamId, accumulated, [], askedAt);
             return exists ? prev.map((m) => (m.id === streamId ? rebuilt : m)) : [...prev, rebuilt];
           });
         },
         onVerifying: () => setStreamingStage("verifying"),
         onCitationsResolved: (event) => {
           resolvedConversationId = event.conversation_id;
-          const finalMessage = buildAssistantMessage(streamId, event.answer, event.citations);
+          const finalMessage = buildAssistantMessage(streamId, event.answer, event.citations, askedAt);
           setMessages((prev) => prev.map((m) => (m.id === streamId ? finalMessage : m)));
         },
         onDone: () => {
@@ -195,6 +273,17 @@ export default function ChatPage({ params }: { params: { conversation_id: string
     }
   }
 
+  // Batch 1, item 5. onNewConversation goes to /documents — see
+  // use-chat-shortcuts.ts's own comment for why that's "wherever it
+  // currently lives" today. onEscape closes the source panel if one is
+  // open; setActiveCitation(null) is already a no-op when nothing is
+  // open, satisfying the "else no-op" requirement without a separate
+  // branch.
+  useChatShortcuts({
+    onNewConversation: () => router.push("/documents"),
+    onEscape: () => setActiveCitation(null),
+  });
+
   const librarySection = (
     <>
       <div className="px-[22px] pb-2 pt-6 text-[11px] font-semibold uppercase tracking-[0.08em] text-faint">
@@ -234,6 +323,7 @@ export default function ChatPage({ params }: { params: { conversation_id: string
 
   const isEmpty = messages.length === 0;
   const headerTitle = title ?? messages.find((m) => m.role === "user")?.text ?? "New conversation";
+  const documentNames = documentIds.map((id) => docNamesById.get(id)).filter((name): name is string => !!name);
 
   return (
     <div className="grid h-screen grid-cols-1 grid-rows-[minmax(0,1fr)] overflow-hidden bg-bg text-ink md:grid-cols-[248px_1fr]">
@@ -259,7 +349,13 @@ export default function ChatPage({ params }: { params: { conversation_id: string
           }
           right={<ThemeToggle />}
         />
-        <main ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
+        {documentNames.length > 0 ? (
+          <div className="flex items-center border-b border-line bg-bg px-4 py-2 md:px-6">
+            <DocumentScopeChips documentNames={documentNames} />
+          </div>
+        ) : null}
+        <div className="relative min-h-0 flex-1">
+          <main ref={scrollRef} onScroll={handleMessagesScroll} className="h-full overflow-y-auto">
           {notFound ? (
             <div className="flex h-full items-center justify-center px-6 text-center">
               <div>
@@ -311,6 +407,7 @@ export default function ChatPage({ params }: { params: { conversation_id: string
                       message={msg}
                       activeCitationId={activeCitation?.id ?? null}
                       onOpenCitation={setActiveCitation}
+                      isStreaming={msg.id === streamingId}
                     />
                     {msg.id === streamingId && streamingStage === "verifying" ? (
                       <LoadingStages stage="verifying" />
@@ -323,7 +420,9 @@ export default function ChatPage({ params }: { params: { conversation_id: string
               ) : null}
             </div>
           )}
-        </main>
+          </main>
+          {showScrollPill ? <ScrollToBottomPill onClick={scrollToBottom} /> : null}
+        </div>
         {askError ? (
           <p className="mx-6 mb-1 text-center text-sm text-destructive">{askError}</p>
         ) : null}

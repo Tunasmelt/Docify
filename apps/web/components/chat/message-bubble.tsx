@@ -1,22 +1,50 @@
 "use client";
 
 import * as React from "react";
+import { Check, Copy } from "lucide-react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { CitationMarker } from "@/components/chat/citation-marker";
+import { useRelativeTime } from "@/hooks/use-relative-time";
 import { citationPlaceholder, remarkCitationMarkers } from "@/lib/chat/remark-citation-markers";
 import type { AssistantMessage, Citation, UserMessage } from "@/lib/types/chat";
 
+const COPY_CONFIRM_MS = 1500;
+
+function formatAbsoluteTimestamp(iso: string): string {
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(new Date(iso));
+}
+
+/** Relative time label, real timestamp on hover (batch 1, item 2) — one
+ * shared component so user and assistant bubbles render it identically. */
+function MessageTimestamp({ createdAt, align }: { createdAt: string; align: "left" | "right" }) {
+  const relative = useRelativeTime(createdAt);
+  return (
+    <p
+      title={formatAbsoluteTimestamp(createdAt)}
+      className={`m-0 mt-1 font-mono text-[10px] tracking-[0.04em] text-faint ${align === "right" ? "text-right" : ""}`}
+    >
+      {relative}
+    </p>
+  );
+}
+
 export function UserMessageBubble({ message }: { message: UserMessage }) {
   return (
-    <div className="flex justify-end">
+    <div className="flex flex-col items-end">
       <div
         data-testid="user-message"
         className="max-w-[70%] rounded-[12px_12px_4px_12px] bg-panel-active px-4 py-3 text-[15px] leading-relaxed"
       >
         {message.text}
       </div>
+      <MessageTimestamp createdAt={message.createdAt} align="right" />
     </div>
   );
 }
@@ -25,6 +53,9 @@ export interface AssistantMessageBubbleProps {
   message: AssistantMessage;
   activeCitationId: string | null;
   onOpenCitation: (citation: Citation) => void;
+  /** True while this exact message is the one actively streaming
+   * (batch 1, item 3) — drives the trailing cursor. */
+  isStreaming?: boolean;
 }
 
 // buildAssistantMessage() (lib/chat/parse-message.ts) already does the
@@ -60,7 +91,32 @@ export function AssistantMessageBubble({
   message,
   activeCitationId,
   onOpenCitation,
+  isStreaming = false,
 }: AssistantMessageBubbleProps) {
+  const [copied, setCopied] = React.useState(false);
+  const copyResetRef = React.useRef<ReturnType<typeof setTimeout>>();
+
+  React.useEffect(() => () => clearTimeout(copyResetRef.current), []);
+
+  async function handleCopy() {
+    try {
+      // Raw answer text (task's own wording) — message.rawText is the
+      // literal string buildAssistantMessage() was given, before
+      // markdown rendering and before citation-marker splicing, not the
+      // rendered DOM's innerText (which would include footnote digits
+      // and citation-list rows that were never part of the answer).
+      await navigator.clipboard.writeText(message.rawText);
+      setCopied(true);
+      clearTimeout(copyResetRef.current);
+      copyResetRef.current = setTimeout(() => setCopied(false), COPY_CONFIRM_MS);
+    } catch {
+      // Clipboard permission denied/unavailable — no toast system
+      // exists anywhere else in this chat UI to surface a failure
+      // through, so this silently no-ops rather than inventing one for
+      // a single button.
+    }
+  }
+
   const citationsById = React.useMemo(
     () => Object.fromEntries(message.citations.map((c) => [c.id, c])),
     [message.citations]
@@ -134,12 +190,42 @@ export function AssistantMessageBubble({
   } as Components;
 
   return (
-    <div data-testid="assistant-message" className="max-w-[85%]">
+    <div data-testid="assistant-message" className="group relative max-w-[85%]">
+      <button
+        type="button"
+        data-testid="copy-message-button"
+        title={copied ? "Copied" : "Copy message"}
+        onClick={handleCopy}
+        // Hidden until hover/focus of the bubble (group-hover) or
+        // focus of the button itself (focus-visible, keyboard/a11y
+        // path) — matches the task's "on hover/focus" spec exactly,
+        // not just mouse hover.
+        className="absolute -top-1.5 right-0 flex h-7 w-7 items-center justify-center rounded-md text-faint opacity-0 transition-opacity hover:bg-panel hover:text-ink focus-visible:opacity-100 group-hover:opacity-100"
+      >
+        {copied ? <Check size={14} strokeWidth={2} /> : <Copy size={14} strokeWidth={2} />}
+      </button>
       <div className="markdown-body text-[15px] leading-[1.75]">
         <ReactMarkdown remarkPlugins={[remarkGfm, remarkCitationMarkers]} components={markdownComponents}>
           {content}
         </ReactMarkdown>
+        {isStreaming ? (
+          // Pulsing caret while tokens are actively arriving (batch 1,
+          // item 3) — reuses the existing pulse-dot animation (already
+          // used for the "retrieving/verifying" indicator dot) rather
+          // than inventing a new blink keyframe. Purely reactive to
+          // isStreaming (itself derived from real SSE state in the
+          // page, never a timer) so it disappears exactly on `done`,
+          // including for a message that completes in one fast burst —
+          // there's no separate timer here that could leave it
+          // dangling or flicker independently of the real stream state.
+          <span
+            aria-hidden="true"
+            data-testid="streaming-cursor"
+            className="ml-0.5 inline-block h-[1em] w-[2px] animate-pulse-dot align-text-bottom bg-accent"
+          />
+        ) : null}
       </div>
+      <MessageTimestamp createdAt={message.createdAt} align="left" />
       {message.citations.length > 0 ? (
         <div className="mt-3 flex flex-wrap gap-x-[18px] gap-y-1 border-t border-line pt-2">
           {message.citations.map((citation) => (

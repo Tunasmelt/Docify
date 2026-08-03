@@ -74,7 +74,8 @@ function apiCitationToClientCitation(id: string, c: ApiCitation): Citation {
 export function buildAssistantMessage(
   id: string,
   content: string,
-  citations: ApiCitation[]
+  citations: ApiCitation[],
+  createdAt: string
 ): AssistantMessage {
   const clientCitations = citations.map((c) => apiCitationToClientCitation(`${id}-c${c.marker}`, c));
   const clientByMarker = new Map(clientCitations.map((c) => [c.n, c]));
@@ -117,5 +118,7 @@ export function buildAssistantMessage(
     role: "assistant",
     segments,
     citations: clientCitations,
+    createdAt,
+    rawText: content,
   };
 }

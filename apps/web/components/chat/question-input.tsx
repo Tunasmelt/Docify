@@ -27,7 +27,11 @@ export function QuestionInput({ onSend, disabled }: QuestionInputProps) {
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
+              // Plain Enter sends; Shift+Enter inserts a newline.
+              // ⌘/Ctrl+Enter (batch 1, item 5) also sends — scoped here
+              // rather than as a global shortcut since it only makes
+              // sense while this field has focus.
+              if ((e.key === "Enter" && !e.shiftKey) || ((e.metaKey || e.ctrlKey) && e.key === "Enter")) {
                 e.preventDefault();
                 send();
               }
