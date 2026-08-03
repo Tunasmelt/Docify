@@ -15,9 +15,15 @@
 # test_query.py, so fake citations still reference real chunk rows from
 # a real ingested document.
 
+import contextlib
 import json
+import socket
+import threading
+import time
 
+import httpx
 import pytest
+import uvicorn
 
 from main import app
 from routes import query
@@ -114,6 +120,39 @@ def _retrieved_chunk(document_id: str, chunk_row: dict) -> RetrievedChunk:
         element_type="text",
         score=0.9,
     )
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@contextlib.contextmanager
+def _live_server():
+    """A genuinely real uvicorn server, in a background thread — needed
+    for Part 2's disconnect tests specifically. TestClient (in-process
+    ASGI transport, used everywhere else in this file) cannot produce a
+    real TCP disconnect at all; the investigation behind this feature
+    (routes/query.py's module comment above _watch_for_disconnect) found
+    that even `request.is_disconnected()` itself only became reliably
+    accurate against a REAL socket close on a REAL server — not something
+    a mocked/simulated disconnect signal could stand in for without
+    defeating the entire point of testing this."""
+    port = _free_port()
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    try:
+        deadline = time.time() + 5
+        while not server.started and time.time() < deadline:
+            time.sleep(0.02)
+        assert server.started, "real uvicorn server failed to start in time"
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
 
 
 # Acceptance: full event sequence retrieving -> token* -> verifying ->
@@ -387,3 +426,287 @@ def test_stream_unresolvable_citation_position_is_dropped_turn_still_persists(ap
     saved_citations = admin.table("citations").select("*").eq("message_id", message_id).execute().data
     assert len(saved_citations) == 1
     assert saved_citations[0]["marker"] == 1
+
+
+# --- Part 1 (2026-08-02): heartbeat keepalive frames during a slow gap -----
+
+
+class _SlowFakeRetriever:
+    """Real, blocking delay (time.sleep, not asyncio.sleep — retrieve()
+    is a plain sync method called via asyncio.to_thread in the real
+    code, exactly like the real Retriever) — long enough to span several
+    heartbeat intervals once query._HEARTBEAT_INTERVAL_S is patched down
+    for this test."""
+
+    def __init__(self, chunks, delay_s: float):
+        self._chunks = chunks
+        self._delay_s = delay_s
+        self.calls = []
+
+    def retrieve(self, question, document_ids, user_id, k=8):
+        self.calls.append({"question": question})
+        time.sleep(self._delay_s)
+        return self._chunks
+
+
+class _SlowStartFakeStreamingGenerator:
+    """Real delay BEFORE the first token — the exact gap task item 1
+    calls out ("most likely needed during retrieval and the pre-first-
+    token generation gap")."""
+
+    def __init__(self, delay_s: float, deltas, final):
+        self._delay_s = delay_s
+        self._deltas = deltas
+        self._final = final
+
+    async def generate_stream(self, question, chunks, history=None):
+        import asyncio as _asyncio
+
+        await _asyncio.sleep(self._delay_s)
+        for delta in self._deltas:
+            yield delta
+        yield self._final
+
+
+# Acceptance (Part 1, item 2): a real, patched-down heartbeat interval
+# fires real ": keepalive\n\n" SSE comment frames on the wire during a
+# real, artificially delayed retrieval step — and they never get parsed
+# as a real named event (event_names sequence is unaffected), matching
+# the frontend's real dispatchSseFrame behavior (verified directly
+# against apps/web/lib/api/query.ts, not assumed).
+def test_stream_heartbeat_frames_appear_during_a_slow_retrieval_gap(app_client, admin, user_a, monkeypatch):
+    user_id, token = user_a
+    document_id = _ingest_doc_with_content(app_client, admin, user_id, token, "doc.pdf", "Revenue grew 12%.")
+    chunk_row = _real_chunk_row(admin, document_id)
+
+    monkeypatch.setattr(query, "_HEARTBEAT_INTERVAL_S", 0.3)
+
+    final = GenerateStreamResult(
+        answer="Revenue grew 12% [1].", cited_indices=[1], hallucinated_markers=[],
+        model="gemini-3.6-flash", input_tokens=100, output_tokens=20, latency_ms=500.0,
+    )
+    _override(
+        retriever=_SlowFakeRetriever([_retrieved_chunk(document_id, chunk_row)], delay_s=1.2),
+        generator=FakeStreamingGenerator(["Revenue grew 12% [1]."], final),
+        verifier=type("V", (), {"verify_batch": staticmethod(lambda pairs: [_verdict(VerdictLabel.SUPPORTED, "Revenue grew 12%") for _ in pairs])})(),
+    )
+
+    with app_client.stream(
+        "POST", "/query/stream", json={"question": "q", "document_ids": [document_id]},
+        headers={"Authorization": f"Bearer {token}"},
+    ) as response:
+        raw = response.read().decode()
+
+    keepalive_count = raw.count(": keepalive\n\n")
+    assert keepalive_count >= 2, f"expected multiple real keepalive frames during a 1.2s gap with a 0.3s interval, got {keepalive_count} in: {raw!r}"
+
+    # The heartbeat frames must be genuinely transparent to real SSE-frame
+    # parsing — same event sequence as any other successful turn.
+    events = _parse_sse(type("R", (), {"iter_lines": lambda self: raw.split("\n")})())
+    event_names = [name for name, _ in events]
+    assert event_names == ["retrieving", "token", "verifying", "citations-resolved", "done"]
+
+
+# Acceptance (Part 1, item 2): same real keepalive-frame proof, but for
+# the gap BEFORE Gemini's first streamed token specifically — the other
+# gap task item 1 names explicitly.
+def test_stream_heartbeat_frames_appear_during_a_slow_pre_first_token_gap(app_client, admin, user_a, monkeypatch):
+    user_id, token = user_a
+    document_id = _ingest_doc_with_content(app_client, admin, user_id, token, "doc.pdf", "Revenue grew 12%.")
+    chunk_row = _real_chunk_row(admin, document_id)
+
+    monkeypatch.setattr(query, "_HEARTBEAT_INTERVAL_S", 0.3)
+
+    final = GenerateStreamResult(
+        answer="Revenue grew 12% [1].", cited_indices=[1], hallucinated_markers=[],
+        model="gemini-3.6-flash", input_tokens=100, output_tokens=20, latency_ms=500.0,
+    )
+    _override(
+        retriever=FakeRetriever([_retrieved_chunk(document_id, chunk_row)]),
+        generator=_SlowStartFakeStreamingGenerator(1.2, ["Revenue grew 12% [1]."], final),
+        verifier=type("V", (), {"verify_batch": staticmethod(lambda pairs: [_verdict(VerdictLabel.SUPPORTED, "Revenue grew 12%") for _ in pairs])})(),
+    )
+
+    with app_client.stream(
+        "POST", "/query/stream", json={"question": "q", "document_ids": [document_id]},
+        headers={"Authorization": f"Bearer {token}"},
+    ) as response:
+        raw = response.read().decode()
+
+    keepalive_count = raw.count(": keepalive\n\n")
+    assert keepalive_count >= 2, f"expected multiple real keepalive frames before the first token, got {keepalive_count} in: {raw!r}"
+
+    events = _parse_sse(type("R", (), {"iter_lines": lambda self: raw.split("\n")})())
+    event_names = [name for name, _ in events]
+    assert event_names == ["retrieving", "token", "verifying", "citations-resolved", "done"]
+
+
+# --- Part 2 (2026-08-02): a GENUINELY real client disconnect, against a --
+# --- real live uvicorn server, a real TCP connection forcibly closed  ---
+#
+# Not a mock, not request.is_disconnected() patched to return True, not
+# TestClient's in-process ASGI transport (confirmed, during this
+# feature's own investigation, NOT to produce a real disconnect signal at
+# all). A real server, a real httpx connection, a real socket close.
+#
+# The live-server investigation behind this feature (routes/query.py's
+# module comment above _watch_for_disconnect) found request.is_
+# disconnected() itself does not work reliably in this deployment either
+# — these tests exercise the real fix (_watch_for_disconnect's actively-
+# awaited request.receive() loop), not the documented-but-unreliable API.
+
+
+class _RecordingSlowRetriever:
+    def __init__(self, chunks, delay_s: float):
+        self._chunks = chunks
+        self._delay_s = delay_s
+        self.call_count = 0
+
+    def retrieve(self, question, document_ids, user_id, k=8):
+        self.call_count += 1
+        time.sleep(self._delay_s)
+        return self._chunks
+
+
+class _RecordingFastStreamingGenerator:
+    def __init__(self, deltas, final, delay_before_final_s: float = 0.0):
+        self._deltas = deltas
+        self._final = final
+        self._delay_before_final_s = delay_before_final_s
+        self.call_count = 0
+
+    async def generate_stream(self, question, chunks, history=None):
+        self.call_count += 1
+        for delta in self._deltas:
+            yield delta
+        if self._delay_before_final_s:
+            # Real delay between the last token and the final result --
+            # gives the disconnect test below a reliable real window to
+            # close its connection after seeing the token, before the
+            # server has any chance to race ahead to the verification
+            # disconnect-check (a real timing race otherwise: with zero
+            # delay, the server can reach that check before the client-
+            # side disconnect has even been scheduled to run, let alone
+            # delivered to the server's watch task).
+            import asyncio as _asyncio
+
+            await _asyncio.sleep(self._delay_before_final_s)
+        yield self._final
+
+
+class _RecordingSlowVerifier:
+    def __init__(self, delay_s: float):
+        self._delay_s = delay_s
+        self.call_count = 0
+
+    def verify_batch(self, pairs):
+        self.call_count += 1
+        time.sleep(self._delay_s)
+        return [_verdict(VerdictLabel.SUPPORTED, "q") for _ in pairs]
+
+
+# Acceptance (Part 2, item 3 — HIGH SCRUTINY): a real client that
+# genuinely disconnects WHILE retrieval is still running must never reach
+# generation. Waits past the retriever's own real delay, then asserts the
+# generator was NEVER called and NO conversation/message/citation rows
+# exist for this user — the DISCARD decision (Part 2, item 2) verified
+# directly against the real database, not inferred from the HTTP response
+# (there isn't a usable one — the connection was closed client-side).
+def test_stream_real_disconnect_during_retrieval_skips_generation_no_persistence(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id = _ingest_doc_with_content(app_client, admin, user_id, token, "doc.pdf", "Revenue grew 12%.")
+    chunk_row = _real_chunk_row(admin, document_id)
+
+    slow_retriever = _RecordingSlowRetriever([_retrieved_chunk(document_id, chunk_row)], delay_s=3.0)
+    fast_generator = _RecordingFastStreamingGenerator(
+        ["Revenue grew 12% [1]."],
+        GenerateStreamResult(
+            answer="Revenue grew 12% [1].", cited_indices=[1], hallucinated_markers=[],
+            model="gemini-3.6-flash", input_tokens=100, output_tokens=20, latency_ms=500.0,
+        ),
+    )
+    slow_verifier = _RecordingSlowVerifier(delay_s=0.1)
+    _override(retriever=slow_retriever, generator=fast_generator, verifier=slow_verifier)
+    app.state.limiter.enabled = False
+
+    try:
+        with _live_server() as base_url:
+            with httpx.Client(timeout=10, limits=httpx.Limits(max_keepalive_connections=0, max_connections=1)) as client:
+                with client.stream(
+                    "POST", f"{base_url}/query/stream",
+                    json={"question": "q", "document_ids": [document_id]},
+                    headers={"Authorization": f"Bearer {token}"},
+                ) as response:
+                    for i, _line in enumerate(response.iter_lines()):
+                        if i >= 1:  # got the "retrieving" event -- retrieval is now genuinely mid-sleep
+                            response.close()
+                            break
+
+            # Real wait past the retriever's own 3s delay -- long enough
+            # for retrieval to genuinely finish and for the disconnect
+            # check before generation to have run.
+            time.sleep(4)
+    finally:
+        _clear_overrides()
+
+    assert slow_retriever.call_count == 1, "retrieval itself cannot be cancelled once started -- it must still have run exactly once"
+    assert fast_generator.call_count == 0, "generation must NEVER have started once the disconnect was detected"
+    assert slow_verifier.call_count == 0
+
+    conversations = admin.table("conversations").select("id").eq("user_id", user_id).execute().data
+    assert conversations == [], "an aborted turn must be discarded entirely -- no conversation row for a request nobody could see the result of"
+
+
+# Acceptance (Part 2, item 3 — HIGH SCRUTINY): a real client that
+# disconnects AFTER generation completes (it saw its token(s)) but BEFORE
+# verification starts must never reach verify_batch() — the other real,
+# quota-costing checkpoint. This is the higher-value real-world case
+# (task brief's own framing): a user closing the tab right as the visible
+# answer looks complete, before the app has finished verifying it.
+def test_stream_real_disconnect_after_generation_skips_verification_no_persistence(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id = _ingest_doc_with_content(app_client, admin, user_id, token, "doc.pdf", "Revenue grew 12%.")
+    chunk_row = _real_chunk_row(admin, document_id)
+
+    fast_retriever = FakeRetriever([_retrieved_chunk(document_id, chunk_row)])
+    fast_generator = _RecordingFastStreamingGenerator(
+        ["Revenue grew 12% [1]."],
+        GenerateStreamResult(
+            answer="Revenue grew 12% [1].", cited_indices=[1], hallucinated_markers=[],
+            model="gemini-3.6-flash", input_tokens=100, output_tokens=20, latency_ms=500.0,
+        ),
+        delay_before_final_s=2.0,
+    )
+    slow_verifier = _RecordingSlowVerifier(delay_s=3.0)
+    _override(retriever=fast_retriever, generator=fast_generator, verifier=slow_verifier)
+    app.state.limiter.enabled = False
+
+    try:
+        with _live_server() as base_url:
+            with httpx.Client(timeout=10, limits=httpx.Limits(max_keepalive_connections=0, max_connections=1)) as client:
+                with client.stream(
+                    "POST", f"{base_url}/query/stream",
+                    json={"question": "q", "document_ids": [document_id]},
+                    headers={"Authorization": f"Bearer {token}"},
+                ) as response:
+                    seen_token = False
+                    for line in response.iter_lines():
+                        if line == "event: token":
+                            seen_token = True
+                        elif line == "" and seen_token:
+                            # Blank line closing the "token" frame just
+                            # arrived -- the client has now genuinely
+                            # received the full (only) token event.
+                            # Disconnect NOW, before "verifying"/verify_batch.
+                            response.close()
+                            break
+
+            time.sleep(4)  # real wait past the verifier's own 3s delay
+    finally:
+        _clear_overrides()
+
+    assert fast_generator.call_count == 1, "generation must have completed -- disconnect happened after it, not during"
+    assert slow_verifier.call_count == 0, "verification must NEVER have started once the disconnect was detected"
+
+    conversations = admin.table("conversations").select("id").eq("user_id", user_id).execute().data
+    assert conversations == [], "an aborted turn must be discarded entirely -- no conversation row for a request nobody could see the result of"

@@ -93,36 +93,160 @@ def get_verifier() -> Verifier:
     return Verifier()
 
 
+# 2026-08-02 — resolution cascade for _extract_claim_spans (Part 3,
+# citation-recovery follow-up). Paragraphs are blank-line-separated
+# blocks; a paragraph made ENTIRELY of markdown-style bullet/numbered
+# lines is treated as a list, where the "enclosing paragraph" fallback
+# below narrows to just the one list-item LINE the marker is actually in
+# — a citation attached to one bullet is a claim about THAT bullet, not
+# every other bullet in the same list.
+_PARAGRAPH_BOUNDARY = re.compile(r"\n\s*\n")
+_LIST_ITEM_PREFIX = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")
+
+
+def _clean_claim_text(text: str) -> str:
+    # A leading bullet/number marker is formatting, not claim content —
+    # stripped first so a list item that's genuinely nothing but a
+    # citation (e.g. "- [3].") cleans to truly empty ("") rather than a
+    # residual "-." that would technically count as "non-empty" and
+    # incorrectly short-circuit the cascade at this tier.
+    text = _LIST_ITEM_PREFIX.sub("", text, count=1)
+    clean = CITATION_BRACKET.sub("", text)
+    clean = re.sub(r"\s+([.,;:!?])", r"\1", clean)  # space left before punctuation by a removed bracket
+    clean = re.sub(r"\s+", " ", clean).strip()
+    # A result with no real word/number characters left (e.g. a lone "."
+    # or "-." after stripping a bullet marker and a bracket from a line
+    # that was genuinely nothing but a citation) is not real claim text —
+    # treated as empty so the cascade correctly moves on to the next
+    # tier instead of "recovering" punctuation-only noise.
+    if clean and not re.search(r"\w", clean):
+        clean = ""
+    return clean
+
+
+def _bracketed_positions(text: str) -> set[int]:
+    positions: set[int] = set()
+    for bracket in CITATION_BRACKET.finditer(text):
+        for match in CITATION_NUMBER.finditer(bracket.group(1)):
+            positions.add(int(match.group()))
+    return positions
+
+
+def _is_list_paragraph(paragraph: str) -> bool:
+    lines = [line for line in paragraph.split("\n") if line.strip()]
+    return bool(lines) and all(_LIST_ITEM_PREFIX.match(line) for line in lines)
+
+
 def _extract_claim_spans(answer: str, cited_positions: set[int]) -> dict[int, str]:
     """Maps each cited position (1-indexed, from GenerateResult.cited_indices)
-    to the claim text that supports it — the sentence it appears in, with
-    every `[...]` citation bracket stripped out. If a position is cited
-    from more than one sentence, the FIRST occurrence's sentence is used
-    (a repeated citation doesn't need independent re-verification).
+    to the claim text that supports it, trying progressively wider spans
+    of text until one actually has real content to hand the verifier:
+
+    (a) the SENTENCE the marker appears in (the original, still-primary
+        behavior — every `[...]` citation bracket stripped out).
+    (b) if that sentence turns out to be empty once brackets are
+        stripped (nothing left but the marker itself — a bare `[3].`
+        with no attached prose), the enclosing PARAGRAPH — or, if that
+        paragraph is a markdown-style list, just the one list-item LINE
+        the marker is in, not every bullet in the list.
+    (c) if the marker's own paragraph is ALSO empty of real text (a
+        genuinely standalone/sentence-initial citation, isolated in its
+        own paragraph with nothing else nearby), the PRECEDING sentence
+        in the whole answer's own reading order — a trailing citation
+        like "Also relevant: [3]" or a marker opening its own paragraph
+        most often refers back to what was just said immediately before it.
+    (d) only if all three come up empty is the position left unresolved
+        (the caller drops it, same fail-safe behavior as before this
+        cascade existed).
+
+    If a position is cited from more than one sentence, the FIRST
+    occurrence (in answer order) is used — a repeated citation doesn't
+    need independent re-verification, unchanged from the original
+    behavior.
+
+    IMPORTANT — this does NOT weaken FEAT-011's verification guarantee:
+    every claim text this returns, however it was resolved, still goes
+    through the identical verify_batch() check every other citation
+    does (routes/query.py's post_query/_stream_query_events, both
+    unchanged by this cascade) — a citation "recovered" via the
+    paragraph/preceding-sentence fallback is graded on the SAME
+    supported/partial/unsupported scale as one resolved via tier (a),
+    and is dropped exactly the same way if the verifier finds the wider
+    span doesn't actually support the claim. Widening WHERE the claim
+    text comes from never widens what counts as verified.
 
     2026-07-24 full-flow audit (item 4) confirmed nothing existed to
-    reuse for this — built fresh here. Deliberately lightweight: sentence
-    boundaries, not real claim/discourse understanding, are enough
-    structure to hand Verifier a focused span per citation rather than
-    the entire answer every time. Reuses generator.py's own
+    reuse for this — built fresh here. Deliberately lightweight: sentence/
+    paragraph boundaries, not real claim/discourse understanding, are
+    enough structure to hand Verifier a focused span per citation rather
+    than the entire answer every time. Reuses generator.py's own
     CITATION_BRACKET/CITATION_NUMBER (not a second, independently
     maintained regex) so this can never silently disagree with
     Generator's own citation parsing on what counts as a marker.
     """
+    # Tier (a) — BYTE-IDENTICAL to the pre-cascade algorithm: a flat
+    # sentence split over the WHOLE raw answer, with no paragraph
+    # awareness at all. Deliberately kept exactly as it was (not folded
+    # into the paragraph-aware structure tiers b/c use below) — an
+    # earlier version of this cascade pre-split by paragraph FIRST, which
+    # changed tier (a)'s own boundaries for some already-working inputs:
+    # a paragraph with no terminal punctuation before a blank line (e.g.
+    # a markdown header with no period) used to glue across that blank
+    # line under the original flat splitter, sometimes recovering MORE
+    # real content than a paragraph-first version would (verified live:
+    # "## Summary\n\n[1]\n\nReal content." originally resolved to the
+    # FULL glued text "## Summary Real content." under flat splitting;
+    # a paragraph-first rewrite would have only recovered "## Summary"
+    # for the same input via a later tier — strictly worse). Tiers (b)/(c)
+    # are pure ADDITIONS reached only for positions tier (a) still can't
+    # resolve, so no already-working case can regress.
+    flat_sentences = _SENTENCE_BOUNDARY.split(answer)
     spans: dict[int, str] = {}
-    for sentence in _SENTENCE_BOUNDARY.split(answer):
-        positions_in_sentence: set[int] = set()
-        for bracket in CITATION_BRACKET.finditer(sentence):
-            for match in CITATION_NUMBER.finditer(bracket.group(1)):
-                positions_in_sentence.add(int(match.group()))
-
-        clean_sentence = CITATION_BRACKET.sub("", sentence)
-        clean_sentence = re.sub(r"\s+([.,;:!?])", r"\1", clean_sentence)  # space left before punctuation by a removed bracket
-        clean_sentence = re.sub(r"\s+", " ", clean_sentence).strip()
-
+    first_sentence_index: dict[int, int] = {}
+    for index, sentence in enumerate(flat_sentences):
+        positions_in_sentence = _bracketed_positions(sentence) & cited_positions
+        if not positions_in_sentence:
+            continue
+        tier_a = _clean_claim_text(sentence)
         for position in positions_in_sentence:
-            if position in cited_positions and position not in spans and clean_sentence:
-                spans[position] = clean_sentence
+            first_sentence_index.setdefault(position, index)
+            if position not in spans and tier_a:
+                spans[position] = tier_a
+
+    unresolved = [p for p in cited_positions if p not in spans and p in first_sentence_index]
+    if not unresolved:
+        return spans
+
+    paragraphs = _PARAGRAPH_BOUNDARY.split(answer)
+    for position in unresolved:
+        owning_paragraph = next((p for p in paragraphs if position in _bracketed_positions(p)), None)
+
+        tier_b = ""
+        if owning_paragraph is not None:
+            if _is_list_paragraph(owning_paragraph):
+                item_line = next(
+                    (line for line in owning_paragraph.split("\n") if line.strip() and position in _bracketed_positions(line)),
+                    owning_paragraph,
+                )
+                tier_b = _clean_claim_text(item_line)
+            else:
+                tier_b = _clean_claim_text(owning_paragraph)
+
+        # Reachable only when (a) AND (b) both came up empty — the
+        # marker's own sentence AND its whole enclosing paragraph have
+        # no real text of their own, i.e. it's genuinely sentence-
+        # initial/standalone. Uses the SAME flat_sentences list tier (a)
+        # did — "preceding" means in the whole answer's own flat reading
+        # order, which can cross a paragraph boundary.
+        tier_c = ""
+        if not tier_b:
+            index = first_sentence_index[position]
+            if index > 0:
+                tier_c = _clean_claim_text(flat_sentences[index - 1])
+
+        claim = tier_b or tier_c
+        if claim:
+            spans[position] = claim
     return spans
 
 
@@ -473,11 +597,131 @@ async def post_query(
 
 
 def _sse(event: str, data: dict) -> str:
-    # Standard `event: <type>\ndata: <json>\n\n` SSE framing. `data` is
+    # Standard `event: <type>\ndata: {json}\n\n` SSE framing. `data` is
     # always a single JSON object per event — never multi-line/raw text —
     # so the frontend parser only has one shape to handle regardless of
     # event type.
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+# 2026-08-02 (FEAT-016 follow-up) — heartbeat + client-disconnect handling.
+#
+# HEARTBEAT: a real gap of several real seconds can open up between two
+# domain events — retrieval, the wait for Gemini's own first streamed
+# token, and a slow verify_batch() call are all real, unbounded-duration
+# waits with no `yield` of their own in between. A reverse proxy/load
+# balancer sitting in front of this app (nginx, a cloud LB) can have its
+# own idle-connection timeout well under what a slow real call can take,
+# and would silently kill the connection mid-wait with nothing to stop
+# it. ": keepalive\n\n" is the standard SSE COMMENT syntax (RFC-shaped:
+# any line starting with ":" is a comment, ignored by spec-compliant SSE
+# parsers) — sent periodically while a real stage is still pending, never
+# as its own named event.
+#
+# Verified directly against THIS project's actual client (2026-08-02) —
+# not assumed from generic EventSource behavior, since apps/web/lib/api/
+# query.ts (FEAT-016) deliberately does NOT use the browser's EventSource
+# (it can't send a POST body/Authorization header) and instead hand-rolls
+# SSE parsing via fetch()+ReadableStream, splitting on "\n\n" and looking
+# for "event:"/"data:" line prefixes (dispatchSseFrame). A ": keepalive"
+# frame has neither prefix, so `dataLines` stays empty and
+# dispatchSseFrame returns immediately without dispatching anything —
+# confirmed by reading that exact function, not by assuming spec
+# compliance transfers to a hand-rolled parser.
+_HEARTBEAT_INTERVAL_S = 12
+_KEEPALIVE_FRAME = ": keepalive\n\n"
+
+
+async def _yield_heartbeats_until_done(task: asyncio.Task):
+    """Yields `_KEEPALIVE_FRAME` every `_HEARTBEAT_INTERVAL_S` seconds
+    while `task` is still pending; yields nothing and returns the moment
+    it completes. The caller retrieves the real result/exception via
+    `task.result()` afterward (synchronous once `task.done()` — no
+    further await needed) — this generator's only job is the wire-level
+    keepalive framing during the wait, never the task's own outcome."""
+    while not task.done():
+        done, _ = await asyncio.wait({task}, timeout=_HEARTBEAT_INTERVAL_S)
+        if not done:
+            yield _KEEPALIVE_FRAME
+
+
+# CLIENT DISCONNECT: real, live-server investigation (2026-08-02, not
+# simulated) confirmed the pre-existing behavior: NOTHING in this
+# function ever checked for a disconnected client, at any point. A
+# genuine client disconnect (a real TCP close, driven by an actual
+# httpx connection closed mid-stream against a real uvicorn server) made
+# during retrieval still let retrieval run to completion, THEN started
+# generation, THEN started verification — the full pipeline, uninterrupted,
+# for a stream nobody was reading. Root cause: Starlette's modern
+# StreamingResponse (ASGI spec >= 2.4) only discovers a dead connection
+# REACTIVELY, when it next tries to physically write a chunk (`send()`
+# raising OSError) — there is no separate task racing a disconnect signal
+# against the body iterator the way older Starlette versions had. Between
+# two yields, while this generator is suspended awaiting a slow
+# `asyncio.to_thread(...)` call, nothing is polling for a disconnect at
+# all, so a stage that was ALREADY running when the client left always
+# runs to completion regardless (an in-flight Python thread cannot be
+# force-cancelled) — but nothing stops the NEXT stage from starting
+# needlessly.
+#
+# `request.is_disconnected()` (FastAPI/Starlette's own documented API for
+# exactly this) does NOT work here — confirmed live, not assumed: a real
+# uvicorn server + a real httpx connection genuinely closed mid-stream
+# (`response.close()`, no connection pooling) left `is_disconnected()`
+# returning `False` for the full 3+ real seconds a slow retrieval step
+# kept running, even though the client-side socket was confirmably
+# closed the entire time. Root cause: `is_disconnected()`'s own
+# implementation wraps its `receive()` call in an immediately-cancelled
+# `anyio.CancelScope` (a non-blocking "peek") — but uvicorn's ASGI
+# receive-channel only ever gets a real `http.disconnect` message
+# delivered to a `receive()` call that's GENUINELY, continuously pending
+# when the transport's own `connection_lost` fires; a call that cancels
+# itself before that can happen never receives it. Confirmed directly:
+# an ACTIVELY-awaited `request.receive()` loop (raced against real work
+# via `asyncio.wait`, `_watch_for_disconnect` below), NOT `is_disconnected()`,
+# detected the identical real disconnect in ~20ms. `is_disconnected()` is
+# not used anywhere in this file because of this — a real, generalizable
+# lesson logged in `.agent/MEMORY.md`.
+#
+# `_watch_for_disconnect` runs as one long-lived background task for the
+# whole stream, setting `disconnected` (an `asyncio.Event`) the moment a
+# real `http.disconnect` message arrives. `_abort_if_disconnected` below
+# is then a trivial, synchronous check of that Event — called before
+# generation and before verification (the two real, unbounded, quota-
+# costing stages) so neither ever starts for a request nobody can see the
+# result of. It does not stop whichever stage was ALREADY running at the
+# moment of disconnect (an in-flight Python thread cannot be force-
+# cancelled regardless of how fast the disconnect itself is detected).
+#
+# DECISION — an aborted turn is DISCARDED, never persisted as partial:
+# matches this project's existing all-or-nothing persistence model
+# (create_query_turn is one atomic call, made only once at the very end;
+# there was never a "partial turn" concept to begin with) and SCOPE.md's
+# established no-partial-data discipline for ingestion. A turn nobody
+# will ever see the confirmation of is not worth inventing a new partial-
+# persistence path for.
+async def _watch_for_disconnect(request: Request, disconnected: asyncio.Event) -> None:
+    """Runs for the lifetime of one /query/stream call (spawned once at
+    the top of _stream_query_events, cancelled in its `finally`). Sets
+    `disconnected` the moment a real ASGI `http.disconnect` message
+    arrives — see the module comment above for why this, and not
+    `request.is_disconnected()`, is the mechanism confirmed to work."""
+    while True:
+        message = await request.receive()
+        if message["type"] == "http.disconnect":
+            disconnected.set()
+            return
+
+
+def _abort_if_disconnected(disconnected: asyncio.Event, stage: str, user_id: str) -> bool:
+    if disconnected.is_set():
+        logger.info(
+            "post_query_stream: client disconnected before %s for user %s — aborting, nothing persisted",
+            stage,
+            user_id,
+        )
+        return True
+    return False
 
 
 async def _stream_query_events(
@@ -488,6 +732,7 @@ async def _stream_query_events(
     generator: Generator,
     verifier: Verifier,
     prior_messages: list[dict],
+    disconnected: asyncio.Event,
 ):
     """The actual SSE body for POST /query/stream (FEAT-016). Emits, in
     order: `retrieving` -> `token` (one per Gemini text delta, zero or
@@ -495,7 +740,9 @@ async def _stream_query_events(
     event can replace any step from that point on and always ends the
     stream — there is no path that closes the connection without either
     a `done` or an `error`, so the frontend never has to guess whether a
-    silent disconnect means success or failure.
+    silent disconnect means success or failure. `: keepalive\n\n` SSE
+    comment frames (never a named event) can appear between any two of
+    the above during a real, slow gap — see _yield_heartbeats_until_done.
 
     Deliberately mirrors post_query()'s logic step-for-step (same
     citation-verdict handling, same claim-span extraction, same
@@ -521,8 +768,16 @@ async def _stream_query_events(
         # same way from here down, not just this one, since an async
         # generator that blocks the loop for seconds at a time defeats
         # the entire purpose of streaming Gemini's tokens asynchronously
-        # in the first place.
-        retrieved = await asyncio.to_thread(retriever.retrieve, payload.question, payload.document_ids, user_id, k=payload.k)
+        # in the first place. Also wrapped with a heartbeat (2026-08-02)
+        # — real retrieval latency is unbounded (a real Postgres/Voyage
+        # call), and this is the very first potentially-long gap in the
+        # whole stream, right after only one small event has gone out.
+        retrieve_task = asyncio.ensure_future(
+            asyncio.to_thread(retriever.retrieve, payload.question, payload.document_ids, user_id, k=payload.k)
+        )
+        async for heartbeat in _yield_heartbeats_until_done(retrieve_task):
+            yield heartbeat
+        retrieved = retrieve_task.result()
     except Exception as exc:
         logger.error("post_query_stream: retrieval failed for user %s: %s", user_id, exc)
         yield _sse("error", {"code": "RETRIEVE_FAILED", "message": "retrieval failed"})
@@ -575,11 +830,33 @@ async def _stream_query_events(
         )
         return
 
+    # Real, live-server-confirmed gap (2026-08-02, see module comment
+    # above _abort_if_disconnected): generation is the first of the two
+    # genuinely expensive, quota-costing stages left to run. If the
+    # client is already known to be gone, skip it entirely rather than
+    # starting a real Gemini generation call nobody will ever see the
+    # output of.
+    if _abort_if_disconnected(disconnected, "generation", user_id):
+        return
+
     generator_chunks = await asyncio.to_thread(fetch_generator_chunks, client, retrieved)
 
+    # Heartbeat wraps EVERY step of the token stream (not just the first),
+    # via the underlying async generator's own __anext__() — covers both
+    # the real gap before Gemini's first token (retrieval+chunk-fetch
+    # already happened above, so this is purely "waiting on Gemini to
+    # start responding") and any real gap between individual token deltas.
     final_result = None
     try:
-        async for item in generator.generate_stream(payload.question, generator_chunks, history=prior_messages):
+        stream_iter = generator.generate_stream(payload.question, generator_chunks, history=prior_messages).__aiter__()
+        while True:
+            next_task = asyncio.ensure_future(stream_iter.__anext__())
+            async for heartbeat in _yield_heartbeats_until_done(next_task):
+                yield heartbeat
+            try:
+                item = next_task.result()
+            except StopAsyncIteration:
+                break
             if isinstance(item, str):
                 yield _sse("token", {"text": item})
             else:
@@ -595,6 +872,15 @@ async def _stream_query_events(
     if final_result is None:
         logger.error("post_query_stream: generate_stream ended with no final result for user %s", user_id)
         yield _sse("error", {"code": "GENERATE_FAILED", "message": "answer generation failed"})
+        return
+
+    # Second real checkpoint: verification is the other genuinely
+    # expensive stage (one real Gemini call per cited claim,
+    # services/verifier.py) — if the client left while the answer was
+    # still streaming (a very plausible real moment to close the tab,
+    # once the visible text looks complete), skip it and the persistence
+    # that would follow it.
+    if _abort_if_disconnected(disconnected, "verification", user_id):
         return
 
     yield _sse("verifying", {})
@@ -631,7 +917,10 @@ async def _stream_query_events(
             else:
                 dropped_positions.add(position)
 
-        verdicts: list[Verdict] = await asyncio.to_thread(verifier.verify_batch, verify_pairs)
+        verify_task = asyncio.ensure_future(asyncio.to_thread(verifier.verify_batch, verify_pairs))
+        async for heartbeat in _yield_heartbeats_until_done(verify_task):
+            yield heartbeat
+        verdicts: list[Verdict] = verify_task.result()
 
         citation_responses: list[CitationResponse] = []
         citations_to_persist: list[dict] = []
@@ -753,6 +1042,34 @@ async def _stream_query_events(
     )
 
 
+async def _stream_query_events_with_disconnect_watch(
+    payload: QueryRequest,
+    user_id: str,
+    client,
+    retriever: Retriever,
+    generator: Generator,
+    verifier: Verifier,
+    prior_messages: list[dict],
+    request: Request,
+):
+    """Thin wrapper — owns the real disconnect-watcher task's lifecycle
+    (spawned here, cancelled in `finally` on every exit path: success,
+    error, or an aborted-early return) so `_stream_query_events` itself
+    never has to be individually re-indented/wrapped at each of its many
+    existing return points. `_stream_query_events` only ever sees the
+    plain `asyncio.Event`, not `request` — it doesn't need to know HOW
+    disconnection is detected, only whether it happened."""
+    disconnected = asyncio.Event()
+    watch_task = asyncio.ensure_future(_watch_for_disconnect(request, disconnected))
+    try:
+        async for frame in _stream_query_events(
+            payload, user_id, client, retriever, generator, verifier, prior_messages, disconnected
+        ):
+            yield frame
+    finally:
+        watch_task.cancel()
+
+
 @router.post("/query/stream")
 @limiter.shared_limit(QUERY_MINUTE_LIMIT, scope=QUERY_RATE_LIMIT_SCOPE)
 @limiter.shared_limit(QUERY_DAY_LIMIT, scope=QUERY_RATE_LIMIT_SCOPE)
@@ -788,7 +1105,9 @@ async def post_query_stream(
         return error
 
     return StreamingResponse(
-        _stream_query_events(payload, user_id, client, retriever, generator, verifier, prior_messages),
+        _stream_query_events_with_disconnect_watch(
+            payload, user_id, client, retriever, generator, verifier, prior_messages, request
+        ),
         media_type="text/event-stream",
         headers={
             # Nginx/other reverse proxies buffer SSE responses by default,
