@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Check, Copy } from "lucide-react";
+import { Check, Copy, RotateCw } from "lucide-react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -56,6 +56,14 @@ export interface AssistantMessageBubbleProps {
   /** True while this exact message is the one actively streaming
    * (batch 1, item 3) — drives the trailing cursor. */
   isStreaming?: boolean;
+  /** Batch 2, part 2 — present only on the most recent assistant
+   * message, and only while nothing is currently streaming (the page
+   * decides both conditions; this component just renders the button
+   * when given a handler). Re-asks the original question as a new,
+   * appended turn — see page.tsx's own comment for why APPEND rather
+   * than an in-place replace (no backend endpoint exists to delete/
+   * update a message, confirmed during investigation). */
+  onRegenerate?: () => void;
 }
 
 // buildAssistantMessage() (lib/chat/parse-message.ts) already does the
@@ -92,6 +100,7 @@ export function AssistantMessageBubble({
   activeCitationId,
   onOpenCitation,
   isStreaming = false,
+  onRegenerate,
 }: AssistantMessageBubbleProps) {
   const [copied, setCopied] = React.useState(false);
   const copyResetRef = React.useRef<ReturnType<typeof setTimeout>>();
@@ -191,19 +200,33 @@ export function AssistantMessageBubble({
 
   return (
     <div data-testid="assistant-message" className="group relative max-w-[85%]">
-      <button
-        type="button"
-        data-testid="copy-message-button"
-        title={copied ? "Copied" : "Copy message"}
-        onClick={handleCopy}
-        // Hidden until hover/focus of the bubble (group-hover) or
-        // focus of the button itself (focus-visible, keyboard/a11y
-        // path) — matches the task's "on hover/focus" spec exactly,
-        // not just mouse hover.
-        className="absolute -top-1.5 right-0 flex h-7 w-7 items-center justify-center rounded-md text-faint opacity-0 transition-opacity hover:bg-panel hover:text-ink focus-visible:opacity-100 group-hover:opacity-100"
+      <div
+        // Same hover/focus-revealed treatment as the copy button below —
+        // one row so both actions share the exact same visibility rule
+        // rather than each reimplementing group-hover/focus-visible.
+        className="absolute -top-1.5 right-0 flex items-center gap-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100"
       >
-        {copied ? <Check size={14} strokeWidth={2} /> : <Copy size={14} strokeWidth={2} />}
-      </button>
+        {onRegenerate ? (
+          <button
+            type="button"
+            data-testid="regenerate-message-button"
+            title="Regenerate"
+            onClick={onRegenerate}
+            className="flex h-7 w-7 items-center justify-center rounded-md text-faint hover:bg-panel hover:text-ink"
+          >
+            <RotateCw size={14} strokeWidth={2} />
+          </button>
+        ) : null}
+        <button
+          type="button"
+          data-testid="copy-message-button"
+          title={copied ? "Copied" : "Copy message"}
+          onClick={handleCopy}
+          className="flex h-7 w-7 items-center justify-center rounded-md text-faint hover:bg-panel hover:text-ink"
+        >
+          {copied ? <Check size={14} strokeWidth={2} /> : <Copy size={14} strokeWidth={2} />}
+        </button>
+      </div>
       <div className="markdown-body text-[15px] leading-[1.75]">
         <ReactMarkdown remarkPlugins={[remarkGfm, remarkCitationMarkers]} components={markdownComponents}>
           {content}

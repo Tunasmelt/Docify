@@ -78,6 +78,14 @@ export default function ChatPage({ params }: { params: { conversation_id: string
   const [showScrollPill, setShowScrollPill] = React.useState(false);
 
   const scrollRef = React.useRef<HTMLDivElement>(null);
+  // Batch 2, part 1 (stop generation) — holds the AbortController for
+  // whichever askQuestionStream() call is currently in flight, so
+  // stopGeneration() (below) can abort it. Investigated and confirmed
+  // (see lib/api/query.ts's askQuestionStream docstring): aborting this
+  // fetch closes the same TCP connection a real disconnect would, which
+  // routes/query.py's already-proven _watch_for_disconnect mechanism
+  // reacts to identically — no new server-side path, no backend changes.
+  const abortControllerRef = React.useRef<AbortController | null>(null);
 
   function scrollToBottom() {
     const el = scrollRef.current;
@@ -211,6 +219,9 @@ export default function ChatPage({ params }: { params: { conversation_id: string
     let accumulated = "";
     let resolvedConversationId: string | null = null;
 
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     try {
       await askQuestionStream(question, documentIds, conversationId, {
         onRetrieving: () => setStreamingStage("retrieving"),
@@ -259,7 +270,7 @@ export default function ChatPage({ params }: { params: { conversation_id: string
           // an unindicated partial answer.
           setAskError(message);
         },
-      });
+      }, controller.signal);
     } catch (err) {
       // Failed before any streaming began at all (network error opening
       // the connection, or a non-2xx validation/ownership/auth response)
@@ -270,7 +281,57 @@ export default function ChatPage({ params }: { params: { conversation_id: string
       setAskError(
         err instanceof ApiError ? err.message : "Something went wrong asking that question. Try again."
       );
+    } finally {
+      abortControllerRef.current = null;
     }
+  }
+
+  // Batch 2, part 1 — stop generation. Decision (investigated, not
+  // assumed): a user-initiated stop DISCARDS the turn server-side,
+  // exactly like an accidental disconnect, rather than persisting the
+  // partial answer. Reasoning: this project's core guarantee is that
+  // every citation is verified before it's shown (FEAT-011 onward) — a
+  // partial answer stopped mid-generation has citation markers that
+  // never reached verify_batch() at all, not even an UNSUPPORTED/
+  // UNVERIFIED verdict, just raw unresolved [N] brackets. Persisting
+  // that as a real, reloadable message would be worse than the existing
+  // UNSUPPORTED/UNVERIFIED states this app already distinguishes
+  // carefully elsewhere — it would silently skip verification entirely.
+  // Discarding server-side (reusing the exact proven disconnect
+  // mechanism — see askQuestionStream's docstring) avoids inventing a
+  // new "partial, unverified, semi-persisted" state.
+  //
+  // The CLIENT side is a deliberate half-step short of that, though:
+  // the partial text already streamed and rendered stays visible in
+  // this session (not stripped from `messages`) — the user is still
+  // right here and may want to read/copy what arrived, per the task's
+  // own framing. It simply won't survive a reload, since nothing was
+  // saved. No error is shown; this was a deliberate action, not a
+  // failure. Resetting streamingId/streamingStage happens HERE, not in
+  // an onDone/onError callback — askQuestionStream() swallows the
+  // resulting AbortError silently (by design, see its docstring) and
+  // resolves normally, so nothing else will do this reset.
+  function stopGeneration() {
+    abortControllerRef.current?.abort();
+    setStreamingId(null);
+    setStreamingStage(null);
+  }
+
+  // Batch 2, part 2 — regenerate. Investigated: the backend has no
+  // endpoint to delete/replace a message (confirmed — GET and
+  // GET .../messages are the only conversation routes that exist), and
+  // create_query_turn always inserts one new user + one new assistant
+  // message pair per call. A true in-place "replace the last answer,
+  // no duplicate question" is therefore NOT achievable without a new
+  // backend endpoint — out of scope for this batch. APPEND is the only
+  // option available with zero backend changes: this simply re-asks the
+  // original question as a new turn via the exact same ask() path a
+  // normal question uses, so live rendering and a reload are
+  // byte-identical by construction (no special-casing to keep in sync —
+  // there's nothing invented here that reload wouldn't already do on
+  // its own).
+  function regenerate(originalQuestion: string) {
+    void ask(originalQuestion);
   }
 
   // Batch 1, item 5. onNewConversation goes to /documents — see
@@ -324,6 +385,18 @@ export default function ChatPage({ params }: { params: { conversation_id: string
   const isEmpty = messages.length === 0;
   const headerTitle = title ?? messages.find((m) => m.role === "user")?.text ?? "New conversation";
   const documentNames = documentIds.map((id) => docNamesById.get(id)).filter((name): name is string => !!name);
+
+  // Batch 2, part 2 — regenerate is offered only on the most recent
+  // assistant message, and only once nothing is currently streaming
+  // (can't regenerate mid-answer; there's already a stop button for
+  // that). Looks up the preceding user message for the original
+  // question text — see regenerate()'s own comment for why this
+  // re-asks rather than attempting an in-place replace.
+  const lastMessage = messages[messages.length - 1];
+  const canRegenerate = streamingId === null && lastMessage?.role === "assistant";
+  const lastUserMessage = canRegenerate
+    ? [...messages].reverse().find((m): m is Extract<ChatMessage, { role: "user" }> => m.role === "user")
+    : undefined;
 
   return (
     <div className="grid h-screen grid-cols-1 grid-rows-[minmax(0,1fr)] overflow-hidden bg-bg text-ink md:grid-cols-[248px_1fr]">
@@ -408,6 +481,11 @@ export default function ChatPage({ params }: { params: { conversation_id: string
                       activeCitationId={activeCitation?.id ?? null}
                       onOpenCitation={setActiveCitation}
                       isStreaming={msg.id === streamingId}
+                      onRegenerate={
+                        canRegenerate && msg.id === lastMessage?.id && lastUserMessage
+                          ? () => regenerate(lastUserMessage.text)
+                          : undefined
+                      }
                     />
                     {msg.id === streamingId && streamingStage === "verifying" ? (
                       <LoadingStages stage="verifying" />
@@ -426,7 +504,12 @@ export default function ChatPage({ params }: { params: { conversation_id: string
         {askError ? (
           <p className="mx-6 mb-1 text-center text-sm text-destructive">{askError}</p>
         ) : null}
-        <QuestionInput onSend={ask} disabled={streamingId !== null || loadingHistory || notFound} />
+        <QuestionInput
+          onSend={ask}
+          isStreaming={streamingId !== null}
+          onStop={stopGeneration}
+          disabled={loadingHistory || notFound}
+        />
         <SourcePanel
           citation={activeCitation}
           onClose={() => setActiveCitation(null)}

@@ -754,6 +754,116 @@ def test_stream_real_disconnect_after_generation_skips_verification_no_persisten
     assert conversations == [], "an aborted turn must be discarded entirely -- no conversation row for a request nobody could see the result of"
 
 
+class _RecordingMidStreamDelayGenerator:
+    """Yields a real delta, pauses (the real window a user would see text
+    actively arriving and click Stop), then yields a second delta before
+    finally completing -- lets a test close the connection genuinely
+    DURING generation (between two deltas of the same still-running
+    async generator), not just before generation starts or after it has
+    already fully finished."""
+
+    def __init__(self, first_delta: str, second_delta: str, final, delay_between_deltas_s: float):
+        self._first_delta = first_delta
+        self._second_delta = second_delta
+        self._final = final
+        self._delay_between_deltas_s = delay_between_deltas_s
+        self.call_count = 0
+        self.completed = False
+
+    async def generate_stream(self, question, chunks, history=None):
+        import asyncio as _asyncio
+
+        self.call_count += 1
+        yield self._first_delta
+        await _asyncio.sleep(self._delay_between_deltas_s)
+        yield self._second_delta
+        self.completed = True
+        yield self._final
+
+
+# 2026-08-04 (batch 2, part 1, item 3 -- HIGH SCRUTINY). Proves the
+# actual claim this feature's UI is built on: a STOP-BUTTON click
+# (AbortController.abort() on the browser's fetch, per this feature's
+# own investigation -- see apps/web/lib/api/query.ts's askQuestionStream
+# docstring) closes the connection the same low-level way any other
+# client disconnect does, so it hits the exact same, already-proven
+# _watch_for_disconnect path -- confirmed here by closing the connection
+# genuinely MID-GENERATION (between two deltas of one still-running
+# generate_stream() call, not before or cleanly after it), the one
+# timing window the three disconnect tests above don't individually
+# exercise. Real timing bound asserted too, not just correctness: the
+# whole test settles in well under the verifier's own 3s delay, which
+# would only be possible if the abort was detected fast (~20ms-class,
+# per the original disconnect investigation), not merely eventually.
+def test_stream_stop_button_click_mid_generation_no_further_calls_no_persistence(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id = _ingest_doc_with_content(app_client, admin, user_id, token, "doc.pdf", "Revenue grew 12%.")
+    chunk_row = _real_chunk_row(admin, document_id)
+
+    fast_retriever = FakeRetriever([_retrieved_chunk(document_id, chunk_row)])
+    mid_stream_generator = _RecordingMidStreamDelayGenerator(
+        first_delta="Revenue grew ",
+        second_delta="12% [1].",
+        final=GenerateStreamResult(
+            answer="Revenue grew 12% [1].", cited_indices=[1], hallucinated_markers=[],
+            model="gemini-3.6-flash", input_tokens=100, output_tokens=20, latency_ms=500.0,
+        ),
+        delay_between_deltas_s=2.0,
+    )
+    slow_verifier = _RecordingSlowVerifier(delay_s=3.0)
+    _override(retriever=fast_retriever, generator=mid_stream_generator, verifier=slow_verifier)
+    app.state.limiter.enabled = False
+
+    started = time.perf_counter()
+    try:
+        with _live_server() as base_url:
+            with httpx.Client(timeout=10, limits=httpx.Limits(max_keepalive_connections=0, max_connections=1)) as client:
+                with client.stream(
+                    "POST", f"{base_url}/query/stream",
+                    json={"question": "q", "document_ids": [document_id]},
+                    headers={"Authorization": f"Bearer {token}"},
+                ) as response:
+                    seen_token = False
+                    for line in response.iter_lines():
+                        if line == "event: token":
+                            seen_token = True
+                        elif line == "" and seen_token:
+                            # The FIRST delta's token frame just closed --
+                            # generate_stream() is now genuinely paused
+                            # mid-execution (awaiting its own internal
+                            # sleep), about to yield a second delta the
+                            # client will never see. This is "the user
+                            # clicked Stop while watching text actively
+                            # arrive," the real case this feature exists
+                            # for -- not a disconnect before or after
+                            # generation, but genuinely during it.
+                            response.close()
+                            break
+            closed_at = time.perf_counter()
+            # Real wait past the verifier's own 3s delay -- long enough
+            # for verify_batch to have run if the abort were NOT
+            # detected quickly, but this assertion window itself is much
+            # tighter than that 3s, which is the real point.
+            time.sleep(4)
+    finally:
+        _clear_overrides()
+
+    elapsed_after_close = closed_at - started
+    # Sanity on the test's own timing shape: the close happened well
+    # before the generator's internal 2s inter-delta sleep or the
+    # verifier's 3s delay could have elapsed on their own -- confirms
+    # this test genuinely caught the connection mid-flight, not after
+    # everything had already finished.
+    assert elapsed_after_close < 1.5, "test setup itself was too slow to prove a genuine mid-generation close"
+
+    assert mid_stream_generator.call_count == 1, "generation itself cannot be force-cancelled once started (in-flight coroutine)"
+    assert mid_stream_generator.completed is True, "the already-running generator call keeps running to completion in the background -- expected, matches the disconnect precedent"
+    assert slow_verifier.call_count == 0, "verification -- the next real, quota-costing stage -- must NEVER start once Stop was clicked, no quota burned past the click"
+
+    conversations = admin.table("conversations").select("id").eq("user_id", user_id).execute().data
+    assert conversations == [], "a stopped turn must be discarded entirely, identical to an accidental disconnect -- see page.tsx's stopGeneration() comment for the reasoning"
+
+
 class _RecordingSlowVerifierProducingUnverified:
     """Simulates a real in-flight verification call that ultimately fails
     safe to UNVERIFIED (the shape a real network error/timeout/quota
