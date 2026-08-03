@@ -77,9 +77,12 @@ class FakeVerifierRaising:
     feature's task brief (item 6). Deliberately a plain, undocumented
     exception (not one Verifier itself already fails safe on), since the
     real Verifier already converts Gemini-call failures into a safe
-    UNSUPPORTED Verdict — this exercises the case where verify_batch()
-    itself breaks, which /query/stream must still surface as a visible
-    error, not a hang."""
+    Verdict (UNVERIFIED for a genuine infrastructure failure — an
+    errored/timed-out/malformed call — 2026-08-03; UNSUPPORTED only for
+    a caught fabricated/ungrounded quote) — this exercises the case
+    where verify_batch() itself breaks (an uncaught exception escaping
+    the fail-safe wrapper entirely), which /query/stream must still
+    surface as a visible error, not a hang."""
 
     def verify_batch(self, pairs):
         raise RuntimeError("verifier exploded unexpectedly")
@@ -264,6 +267,45 @@ def test_stream_partial_verdict_citations_kept_not_dropped(app_client, admin, us
     assert len(resolved["citations"]) == 1
     assert resolved["citations"][0]["verdict"] == "partial"
     assert "[1]" in resolved["answer"], "partial citations must keep their marker — never dropped like unsupported"
+
+    done = next(data for name, data in events if name == "done")
+    assert done["metadata"]["cited_count"] == 1
+
+
+# 2026-08-03 — UNVERIFIED feature. Same rule as test_query.py's
+# test_unverified_citations_are_kept_not_dropped, mirrored against the
+# streaming path: a citation whose verification genuinely couldn't run
+# must be KEPT with its marker intact, never dropped like a real
+# UNSUPPORTED verdict.
+def test_stream_unverified_verdict_citations_kept_not_dropped(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id = _ingest_doc_with_content(app_client, admin, user_id, token, "doc.pdf", "Revenue grew 12% this quarter.")
+    chunk_row = _real_chunk_row(admin, document_id)
+
+    final = GenerateStreamResult(
+        answer="Revenue grew 12% this quarter [1].",
+        cited_indices=[1], hallucinated_markers=[],
+        model="gemini-3.6-flash", input_tokens=100, output_tokens=20, latency_ms=500.0,
+    )
+    _override(
+        retriever=FakeRetriever([_retrieved_chunk(document_id, chunk_row)]),
+        generator=FakeStreamingGenerator(["Revenue grew 12% this quarter [1]."], final),
+        verifier=type("V", (), {"verify_batch": staticmethod(lambda pairs: [_verdict(VerdictLabel.UNVERIFIED, None) for _ in pairs])})(),
+    )
+
+    with app_client.stream(
+        "POST", "/query/stream", json={"question": "q", "document_ids": [document_id]},
+        headers={"Authorization": f"Bearer {token}"},
+    ) as response:
+        events = _parse_sse(response)
+
+    resolved = next(data for name, data in events if name == "citations-resolved")
+    assert len(resolved["citations"]) == 1
+    assert resolved["citations"][0]["verdict"] == "unverified"
+    # response_model_exclude_none=True (API_CONTRACT.md) omits a None
+    # supporting_quote entirely rather than sending it as null.
+    assert resolved["citations"][0].get("supporting_quote") is None
+    assert "[1]" in resolved["answer"], "unverified citations must keep their marker — never dropped like unsupported"
 
     done = next(data for name, data in events if name == "done")
     assert done["metadata"]["cited_count"] == 1
@@ -710,3 +752,104 @@ def test_stream_real_disconnect_after_generation_skips_verification_no_persisten
 
     conversations = admin.table("conversations").select("id").eq("user_id", user_id).execute().data
     assert conversations == [], "an aborted turn must be discarded entirely -- no conversation row for a request nobody could see the result of"
+
+
+class _RecordingSlowVerifierProducingUnverified:
+    """Simulates a real in-flight verification call that ultimately fails
+    safe to UNVERIFIED (the shape a real network error/timeout/quota
+    exhaustion inside verify_batch would produce, per the 2026-08-03
+    UNVERIFIED feature) -- but takes real wall-clock time to get there,
+    giving a real disconnect a genuine window to arrive WHILE the call is
+    still in flight, not just before it starts."""
+
+    def __init__(self, delay_s: float):
+        self._delay_s = delay_s
+        self.call_count = 0
+
+    def verify_batch(self, pairs):
+        self.call_count += 1
+        time.sleep(self._delay_s)
+        return [_verdict(VerdictLabel.UNVERIFIED, None) for _ in pairs]
+
+
+# 2026-08-03 (item 7, UNVERIFIED feature) -- HIGH SCRUTINY: confirms the
+# UNVERIFIED feature interacts correctly with the just-shipped disconnect
+# handling for the one case the two disconnect tests above don't cover --
+# a disconnect arriving WHILE verify_batch() is already running (not
+# before it starts). The pre-verification _abort_if_disconnected
+# checkpoint (routes/query.py) only runs BEFORE verify_batch() is
+# scheduled; there is deliberately no checkpoint after it completes and
+# before persistence, matching the established "an in-flight call can't
+# be cancelled" precedent from the retrieval/generation disconnect tests
+# above. So the only two valid outcomes are: (a) the disconnect is caught
+# by the pre-check and the turn is discarded entirely (proven by the test
+# above), or (b) the disconnect arrives too late for that check, the
+# verify call (and the UNVERIFIED verdict it fails safe to) runs to
+# completion, and the turn persists normally as one atomic, fully-formed
+# unit -- never a half-applied state (e.g. a conversation row with no
+# matching citations, or citations persisted but the turn otherwise
+# aborted).
+def test_stream_real_disconnect_during_verification_still_persists_consistently(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id = _ingest_doc_with_content(app_client, admin, user_id, token, "doc.pdf", "Revenue grew 12%.")
+    chunk_row = _real_chunk_row(admin, document_id)
+
+    fast_retriever = FakeRetriever([_retrieved_chunk(document_id, chunk_row)])
+    fast_generator = _RecordingFastStreamingGenerator(
+        ["Revenue grew 12% [1]."],
+        GenerateStreamResult(
+            answer="Revenue grew 12% [1].", cited_indices=[1], hallucinated_markers=[],
+            model="gemini-3.6-flash", input_tokens=100, output_tokens=20, latency_ms=500.0,
+        ),
+    )
+    slow_verifier = _RecordingSlowVerifierProducingUnverified(delay_s=3.0)
+    _override(retriever=fast_retriever, generator=fast_generator, verifier=slow_verifier)
+    app.state.limiter.enabled = False
+
+    try:
+        with _live_server() as base_url:
+            with httpx.Client(timeout=10, limits=httpx.Limits(max_keepalive_connections=0, max_connections=1)) as client:
+                with client.stream(
+                    "POST", f"{base_url}/query/stream",
+                    json={"question": "q", "document_ids": [document_id]},
+                    headers={"Authorization": f"Bearer {token}"},
+                ) as response:
+                    seen_verifying = False
+                    for line in response.iter_lines():
+                        if line == "event: verifying":
+                            seen_verifying = True
+                        elif line == "" and seen_verifying:
+                            # Blank line closing the "verifying" frame --
+                            # verify_batch() is now genuinely mid-sleep
+                            # (its own real 3s delay). Disconnect NOW,
+                            # while the call is actually in flight, not
+                            # before it started.
+                            response.close()
+                            break
+
+            # Real wait past the verifier's own 3s delay, long enough for
+            # verify_batch() to genuinely finish and for persistence to
+            # have run (or not) — no ambiguity about which happened.
+            time.sleep(4)
+    finally:
+        _clear_overrides()
+
+    assert slow_verifier.call_count == 1, "an in-flight verify_batch() call cannot be cancelled -- it must still run to completion"
+
+    conversations = admin.table("conversations").select("id").eq("user_id", user_id).execute().data
+    messages = admin.table("messages").select("id,conversation_id").eq("user_id", user_id).execute().data
+    citations = admin.table("citations").select("id,message_id,verdict").eq("user_id", user_id).execute().data
+
+    # The one thing this test exists to prove: never an inconsistent
+    # half-state. Either nothing persisted (if some other guard caught
+    # it) or everything did, as one atomic turn -- never a conversation
+    # with no messages, or messages with no matching citation audit row.
+    if not conversations:
+        assert messages == [] and citations == [], "no conversation means no orphaned messages/citations either"
+    else:
+        assert len(conversations) == 1
+        assert len(messages) == 2, "a full turn is exactly one user message + one assistant message"
+        assert all(m["conversation_id"] == conversations[0]["id"] for m in messages)
+        assert len(citations) == 1
+        assert citations[0]["verdict"] == "unverified", "the in-flight call's real fail-safe verdict must persist unmodified"
+        assert citations[0]["message_id"] in {m["id"] for m in messages}

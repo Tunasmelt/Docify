@@ -12,19 +12,24 @@ export interface CitationMarkerProps {
 /** The inline `[N]` superscript button — the through-line motif from
  * the onboarding footnote treatment into real cited claims. Verdict
  * drives color: solid green for supported, amber with a dotted
- * underline for partial (never renders unsupported — those are
- * dropped server-side before reaching the client, per
- * API_CONTRACT.md). */
+ * underline for partial, muted with a dashed underline for unverified
+ * (2026-08-03 — distinct from partial's dotted-amber: this isn't a
+ * warning about the content being wrong, it's "we couldn't check this
+ * one" — see CITATION_VERDICT_STYLES). Never renders unsupported —
+ * those are dropped server-side before reaching the client, per
+ * API_CONTRACT.md. */
 export function CitationMarker({ citation, active, onOpen }: CitationMarkerProps) {
   const style = CITATION_VERDICT_STYLES[citation.verdict];
   const isPartial = citation.verdict === "partial";
+  const isUnverified = citation.verdict === "unverified";
   // location is null for DOCX/HTML sources (no real page concept —
   // FEAT-020) — omit the location clause entirely rather than show a
   // false "p. 1" for every citation in the document.
   const locationSuffix = citation.location
     ? `, ${citation.location.kind === "page" ? "Page" : "Slide"} ${citation.location.number}`
     : "";
-  const tip = (isPartial ? "Partially supported — " : "") + `${citation.documentName}${locationSuffix}`;
+  const tipPrefix = isPartial ? "Partially supported — " : isUnverified ? "Could not be verified — " : "";
+  const tip = tipPrefix + `${citation.documentName}${locationSuffix}`;
 
   return (
     <sup>
@@ -47,7 +52,11 @@ export function CitationMarker({ citation, active, onOpen }: CitationMarkerProps
         style={{
           color: style.fg,
           background: active ? style.bg : "transparent",
-          borderBottom: isPartial ? `1px dotted ${style.fg}` : "none",
+          borderBottom: isPartial
+            ? `1px dotted ${style.fg}`
+            : isUnverified
+              ? `1px dashed ${style.fg}`
+              : "none",
         }}
       >
         {citation.n}

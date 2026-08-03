@@ -1,4 +1,4 @@
-export type CitationVerdict = "supported" | "partial";
+export type CitationVerdict = "supported" | "partial" | "unverified";
 
 export interface Citation {
   id: string;

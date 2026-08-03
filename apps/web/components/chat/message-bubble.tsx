@@ -152,7 +152,11 @@ export function AssistantMessageBubble({
               <span
                 style={{
                   color:
-                    citation.verdict === "partial" ? "var(--amber)" : "var(--accent)",
+                    citation.verdict === "partial"
+                      ? "var(--amber)"
+                      : citation.verdict === "unverified"
+                        ? "var(--muted)"
+                        : "var(--accent)",
                 }}
               >
                 {citation.n}
@@ -165,6 +169,7 @@ export function AssistantMessageBubble({
                 ? ` · ${citation.location.kind === "page" ? "P" : "S"}.${citation.location.number}`
                 : ""}
               {citation.verdict === "partial" ? " · partial" : ""}
+              {citation.verdict === "unverified" ? " · unverified" : ""}
             </button>
           ))}
         </div>

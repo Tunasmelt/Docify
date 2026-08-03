@@ -45,15 +45,17 @@ function apiCitationToClientCitation(id: string, c: ApiCitation): Citation {
     n: c.marker,
     documentName: c.document_name,
     location: citationLocation(c.document_mime_type, c.page_number),
-    // Backend only ever sends 'supported' | 'partial' citations to the
-    // client (POST /query drops 'unsupported' from its response array,
-    // GET /conversations/{id}/messages' list_citations_for_messages()
-    // filters the same way) — narrowed here rather than widening
-    // Citation.verdict to include 'unsupported', since nothing renders
-    // that case and a stray 'unsupported' row reaching this point would
-    // mean a real contract violation worth a loud runtime error, not a
-    // silently-accepted type.
-    verdict: c.verdict as "supported" | "partial",
+    // Backend only ever sends 'supported' | 'partial' | 'unverified'
+    // citations to the client (POST /query drops 'unsupported' from its
+    // response array, GET /conversations/{id}/messages'
+    // list_citations_for_messages() filters the same way) — narrowed
+    // here rather than widening Citation.verdict to include
+    // 'unsupported', since nothing renders that case and a stray
+    // 'unsupported' row reaching this point would mean a real contract
+    // violation worth a loud runtime error, not a silently-accepted
+    // type. 'unverified' (2026-08-03) IS a legitimate, kept-not-dropped
+    // state now — see API_CONTRACT.md and CITATION_VERDICT_STYLES.
+    verdict: c.verdict as "supported" | "partial" | "unverified",
     // supporting_quote is null whenever the verifier couldn't ground a
     // verbatim quote (always true for figure citations — figure chunks
     // have no text content to quote from) — snippet (the raw chunk

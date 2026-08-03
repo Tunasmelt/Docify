@@ -109,12 +109,13 @@ def test_verifier_verify_claim_chunk_verdict_verdict_quote_uses_gemin():
     assert client.models.calls[0]["model"] == MODEL == "gemini-3.5-flash-lite"
 
 
-# Acceptance criterion: Verdict enum: supported | partial | unsupported
-def test_verdict_enum_supported_partial_unsupported():
+# Acceptance criterion: Verdict enum: supported | partial | unsupported | unverified
+def test_verdict_enum_supported_partial_unsupported_unverified():
     assert VerdictLabel.SUPPORTED.value == "supported"
     assert VerdictLabel.PARTIAL.value == "partial"
     assert VerdictLabel.UNSUPPORTED.value == "unsupported"
-    assert {v.value for v in VerdictLabel} == {"supported", "partial", "unsupported"}
+    assert VerdictLabel.UNVERIFIED.value == "unverified"
+    assert {v.value for v in VerdictLabel} == {"supported", "partial", "unsupported", "unverified"}
 
 
 # Acceptance criterion: Returns the supporting quote from the source (or null if unsupported)
@@ -247,19 +248,23 @@ def test_verify_raises_verification_error_for_empty_claim_text():
 # be silently treated as verified, tested concretely rather than assumed.
 
 
-def test_verify_fails_safe_to_unsupported_when_gemini_api_call_raises():
+def test_verify_fails_safe_to_unverified_when_gemini_api_call_raises():
+    # A quota-exhaustion-shaped failure (429) — the call never actually
+    # ran to completion, so this is UNVERIFIED (2026-08-03), not
+    # UNSUPPORTED: "never checked" is distinct from "checked and found
+    # false."
     client = FakeClient(raises=_fake_client_error(429, "rate limited"))
     verifier = Verifier(client=client)
 
     result = verifier.verify("some claim", _chunk())
 
-    assert result.verdict == VerdictLabel.UNSUPPORTED
+    assert result.verdict == VerdictLabel.UNVERIFIED
     assert result.quote is None
     assert result.error is not None
     assert "rate limited" in result.error or "429" in result.error or "ClientError" in result.error
 
 
-def test_verify_fails_safe_to_unsupported_when_response_parsed_is_none():
+def test_verify_fails_safe_to_unverified_when_response_parsed_is_none():
     # Simulates the SDK's own documented behavior (google/genai/types.py):
     # a malformed/non-schema-conforming response leaves response.parsed
     # as None WITHOUT raising — verified against installed SDK source,
@@ -270,7 +275,7 @@ def test_verify_fails_safe_to_unsupported_when_response_parsed_is_none():
 
     result = verifier.verify("some claim", _chunk())
 
-    assert result.verdict == VerdictLabel.UNSUPPORTED
+    assert result.verdict == VerdictLabel.UNVERIFIED
     assert result.quote is None
     assert result.error is not None
 
@@ -278,15 +283,19 @@ def test_verify_fails_safe_to_unsupported_when_response_parsed_is_none():
 def test_verify_never_raises_or_crashes_on_a_broken_gemini_call():
     # The explicit, structural guarantee: verify() itself never lets a
     # broken underlying call propagate as an exception OR as anything
-    # other than UNSUPPORTED — a caller that only reads `.verdict` and
-    # never checks `.error` still gets the safe outcome by construction,
-    # not by convention it has to remember to uphold.
+    # other than a safe fail state — a caller that only reads `.verdict`
+    # and never checks `.error` still gets the safe outcome by
+    # construction, not by convention it has to remember to uphold. Both
+    # cases here are genuine "could not run" shapes, so both are
+    # UNVERIFIED (2026-08-03) — see test_verify_fails_safe_when_the_
+    # returned_quote_is_not_actually_in_the_source below for the one
+    # fail-safe shape that stays UNSUPPORTED instead.
     for client in (
         FakeClient(raises=_fake_client_error(500, "server error")),
         FakeClient(response=FakeResponse(parsed=None)),
     ):
         result = Verifier(client=client).verify("claim", _chunk())
-        assert result.verdict == VerdictLabel.UNSUPPORTED
+        assert result.verdict == VerdictLabel.UNVERIFIED
         assert result.quote is None
 
 
@@ -317,7 +326,7 @@ def test_verify_batch_one_failing_pair_does_not_contaminate_others():
 
     assert results[0].verdict == VerdictLabel.SUPPORTED
     assert results[0].error is None
-    assert results[1].verdict == VerdictLabel.UNSUPPORTED
+    assert results[1].verdict == VerdictLabel.UNVERIFIED
     assert results[1].error is not None
     assert results[2].verdict == VerdictLabel.SUPPORTED
     assert results[2].error is None
@@ -357,7 +366,7 @@ def test_verify_fails_safe_when_the_call_times_out_at_the_transport_layer():
 
     result = Verifier(client=TimeoutClient()).verify("some claim", _chunk())
 
-    assert result.verdict == VerdictLabel.UNSUPPORTED
+    assert result.verdict == VerdictLabel.UNVERIFIED
     assert result.quote is None
     assert result.error is not None
 
@@ -376,7 +385,7 @@ def test_verify_fails_safe_when_connection_is_refused():
 
     result = Verifier(client=UnreachableClient()).verify("some claim", _chunk())
 
-    assert result.verdict == VerdictLabel.UNSUPPORTED
+    assert result.verdict == VerdictLabel.UNVERIFIED
     assert result.error is not None
 
 
@@ -391,6 +400,11 @@ def test_verify_fails_safe_when_the_returned_quote_is_not_actually_in_the_source
 
     result = Verifier(client=client).verify("Angola achieved a top-improving HDI of 4.42.", chunk)
 
+    # Deliberately UNSUPPORTED, not UNVERIFIED (2026-08-03): the call DID
+    # run and DID return a real, schema-conforming response — this is a
+    # caught active rejection of untrustworthy evidence, not an
+    # infrastructure failure, so it stays on the stronger "checked and
+    # found false" side of the line. See _fail_safe_verdict's docstring.
     assert result.verdict == VerdictLabel.UNSUPPORTED, "a fabricated quote must never let a SUPPORTED verdict through"
     assert result.quote is None
     assert result.error is not None
@@ -449,7 +463,7 @@ def test_verify_fails_safe_when_the_sdk_would_receive_an_out_of_enum_verdict():
 
     result = Verifier(client=client).verify("claim", _chunk())
 
-    assert result.verdict == VerdictLabel.UNSUPPORTED
+    assert result.verdict == VerdictLabel.UNVERIFIED
     assert result.error is not None
 
 
@@ -491,7 +505,7 @@ def test_verify_batch_survives_two_poisoned_pairs_at_any_position(poisoned_posit
     assert len(call_log) == 5
     for i, result in enumerate(results):
         if i in poisoned_positions:
-            assert result.verdict == VerdictLabel.UNSUPPORTED, f"position {i} (poisoned) should fail safe"
+            assert result.verdict == VerdictLabel.UNVERIFIED, f"position {i} (poisoned) should fail safe"
             assert result.error is not None
         else:
             assert result.verdict == VerdictLabel.SUPPORTED, f"position {i} (clean) should verify normally"
@@ -532,9 +546,14 @@ def test_real_gemini_flash_lite_verifies_a_clearly_supported_claim():
     reason="set RUN_REAL_VERIFIER_TEST=1 to run a real (deliberately-failing) Gemini API call",
 )
 def test_real_gemini_call_with_invalid_api_key_still_fails_safe():
-    # Item 6, proven against a REAL network failure, not a mocked one —
-    # a genuinely invalid API key forces a real auth error from Google's
-    # actual endpoint. Costs no quota (fails before any generation).
+    # Item 6 (2026-08-03 UNVERIFIED feature), proven against a REAL
+    # network/auth failure, not a mocked one — a genuinely invalid API
+    # key forces a real auth error from Google's actual endpoint. Costs
+    # no quota (fails before any generation). This is the "network
+    # error" half of item 6's dual real-failure requirement; the 429
+    # quota-exhaustion half is covered by test_verify_fails_safe_to_
+    # unverified_when_gemini_api_call_raises above (mocked, since
+    # deliberately exhausting a real quota isn't practical to run here).
     from google import genai
 
     verifier = Verifier(client=genai.Client(api_key="invalid-key-for-testing-fail-safe-behavior"))
@@ -547,7 +566,7 @@ def test_real_gemini_call_with_invalid_api_key_still_fails_safe():
     print(f"verdict={result.verdict} quote={result.quote!r} error={result.error!r}")
     print("=" * 90)
 
-    assert result.verdict == VerdictLabel.UNSUPPORTED
+    assert result.verdict == VerdictLabel.UNVERIFIED
     assert result.quote is None
     assert result.error is not None
 

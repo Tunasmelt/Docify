@@ -20,7 +20,7 @@ export interface ApiCitation {
   page_number: number;
   element_type: string;
   snippet: string;
-  verdict: "supported" | "partial" | "unsupported";
+  verdict: "supported" | "partial" | "unsupported" | "unverified";
   supporting_quote: string | null;
   /** Present only on a figure citation (API_CONTRACT.md, FEAT-026) —
    * absent entirely (not `null`) on text/table citations, per

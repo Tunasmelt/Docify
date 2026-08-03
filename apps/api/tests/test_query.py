@@ -87,10 +87,13 @@ class FakeVerifier:
         return [self._verdicts_by_chunk_id[chunk.chunk_id] for _, chunk in pairs]
 
 
+_NO_QUOTE_LABELS = (VerdictLabel.UNSUPPORTED, VerdictLabel.UNVERIFIED)
+
+
 def _verdict(label: VerdictLabel, quote: str | None = "a quote") -> Verdict:
     return Verdict(
         verdict=label,
-        quote=quote if label != VerdictLabel.UNSUPPORTED else None,
+        quote=quote if label not in _NO_QUOTE_LABELS else None,
         model="gemini-3.5-flash-lite",
         input_tokens=10,
         output_tokens=5,
@@ -263,6 +266,52 @@ def test_partial_verdict_citations_are_kept_not_dropped(app_client, admin, user_
     assert len(body["citations"]) == 1
     assert body["citations"][0]["verdict"] == "partial"
     assert "[1]" in body["answer"], "partial citations must keep their marker — never dropped like unsupported"
+    assert body["metadata"]["cited_count"] == 1
+
+
+# 2026-08-03 — UNVERIFIED feature. A citation whose verification call
+# genuinely couldn't run (network error, quota exhaustion, malformed
+# response) must be KEPT and surfaced as "unverified", never silently
+# dropped the same way a real UNSUPPORTED verdict is. Proven distinct
+# from both test_partial_verdict_citations_are_kept_not_dropped above
+# (kept, different verdict string) and
+# test_unsupported_citations_are_dropped_from_response_markers_stri
+# above (still dropped — verified in the same file to prove the two
+# fail-safe shapes are never conflated downstream).
+def test_unverified_citations_are_kept_not_dropped(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id = _ingest_doc_with_content(app_client, admin, user_id, token, "doc.pdf", "Revenue grew 12% this quarter.")
+    chunk_row = _real_chunk_row(admin, document_id)
+
+    retrieved = [
+        RetrievedChunk(
+            chunk_id=chunk_row["id"], content=chunk_row["content"], page=1, document_id=document_id,
+            document_name="doc.pdf", document_mime_type="application/pdf", element_type="text", score=0.9,
+        )
+    ]
+    gen_result = GenerateResult(
+        answer="Revenue grew 12% this quarter [1].",
+        cited_indices=[1], hallucinated_markers=[],
+        model="gemini-3.6-flash", input_tokens=100, output_tokens=20, latency_ms=500.0,
+    )
+    _override(
+        retriever=FakeRetriever(retrieved),
+        generator=FakeGenerator(gen_result),
+        verifier=FakeVerifier({chunk_row["id"]: _verdict(VerdictLabel.UNVERIFIED, None)}),
+    )
+
+    response = app_client.post(
+        "/query", json={"question": "q", "document_ids": [document_id]}, headers={"Authorization": f"Bearer {token}"}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["citations"]) == 1
+    assert body["citations"][0]["verdict"] == "unverified"
+    # response_model_exclude_none=True (API_CONTRACT.md) omits a None
+    # supporting_quote entirely rather than sending it as null.
+    assert body["citations"][0].get("supporting_quote") is None
+    assert "[1]" in body["answer"], "unverified citations must keep their marker — never dropped like unsupported"
     assert body["metadata"]["cited_count"] == 1
 
 

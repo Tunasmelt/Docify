@@ -447,12 +447,16 @@ CITATION_JOIN_COLUMNS = (
 
 def list_citations_for_messages(client, *, message_ids: list[str], user_id: str) -> dict[str, list[dict]]:
     """Citations for a batch of message ids in one query, grouped by
-    message_id — avoids an N+1 query per message. Filters out
-    'unsupported' verdicts to match exactly what /query's own response
-    (and therefore each message's stored `content` text — see
-    routes/query.py's _strip_dropped_markers) actually contains;
-    'unsupported' citations ARE persisted (create_query_turn's own
-    full-audit-trail comment) but were never meant to be user-facing.
+    message_id — avoids an N+1 query per message. Filters out only
+    'unsupported' verdicts (not an allowlist of the other three) to
+    match exactly what /query's own response (and therefore each
+    message's stored `content` text — see routes/query.py's
+    _strip_dropped_markers) actually contains; 'unsupported' citations
+    ARE persisted (create_query_turn's own full-audit-trail comment) but
+    were never meant to be user-facing. 'unverified' rows (2026-08-03 —
+    verification genuinely could not run) are NOT filtered here, same as
+    live /query responses — they're real, kept-not-dropped citations,
+    just ones the client renders with their own distinct indicator.
     Ordered by marker so a message's citations come back in the same
     order they appear inline in its content text."""
     if not message_ids:

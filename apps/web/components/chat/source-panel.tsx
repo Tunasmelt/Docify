@@ -25,7 +25,9 @@ export function SourcePanel({ citation, onClose, onOpenInDocument }: SourcePanel
   const verdictText =
     citation.verdict === "partial"
       ? `Partially supported — this${location ? " " + location.kind : " source"} backs part of the claim. Worth a direct look.`
-      : `Verified — this passage supports the claim${locationClause}.`;
+      : citation.verdict === "unverified"
+        ? `Could not be verified — we couldn't confirm this${location ? " " + location.kind : " source"} against the claim. Use your own judgment.`
+        : `Verified — this passage supports the claim${locationClause}.`;
 
   return (
     <aside

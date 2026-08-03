@@ -25,4 +25,10 @@ export const DOCUMENT_STATUS_STYLES: Record<DocumentStatus, StatusStyle> = {
 export const CITATION_VERDICT_STYLES = {
   supported: { fg: "var(--accent)", bg: "var(--green-bg)" },
   partial: { fg: "var(--amber)", bg: "var(--amber-bg)" },
+  // Reuses the same neutral, non-alarming token pair as
+  // DOCUMENT_STATUS_STYLES.uploaded — "we couldn't check this one, use
+  // your own judgment" is not a warning about the content itself being
+  // wrong (that's what partial's amber is for), so it gets the muted
+  // treatment instead of a new color (2026-08-03).
+  unverified: { fg: "var(--muted)", bg: "var(--muted-bg)" },
 } as const;

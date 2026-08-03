@@ -22,7 +22,13 @@ create extension if not exists pgcrypto;    -- gen_random_uuid()
 create type document_status     as enum ('uploaded', 'parsing', 'embedded', 'ready', 'failed');
 create type element_type       as enum ('text', 'heading', 'table', 'figure', 'caption', 'list');
 create type message_role       as enum ('user', 'assistant');
-create type verdict            as enum ('supported', 'partial', 'unsupported');
+create type verdict            as enum ('supported', 'partial', 'unsupported', 'unverified');
+-- 'unverified' added 2026-08-03 (migrations/20260803_001_citation_verdict_unverified.sql,
+-- `alter type verdict add value`) -- distinct from 'unsupported': used only when
+-- verification genuinely could not run (Gemini call errored, timed out, or returned a
+-- malformed/non-schema response), never as a substitute for a real 'unsupported' verdict
+-- or for a citation the recovery cascade correctly dropped before verification. See
+-- services/verifier.py's VerdictLabel docstring and API_CONTRACT.md's POST /query entry.
 create type embedding_provider as enum ('voyage', 'gemini');  -- 2026-07-31, see chunks.embedding_provider below
 ```
 

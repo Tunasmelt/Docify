@@ -483,14 +483,20 @@ async def post_query(
 
     verdicts: list[Verdict] = verifier.verify_batch(verify_pairs)
 
-    # verdict == UNSUPPORTED (including a Verifier-internal failure,
-    # which Verifier itself already forces to UNSUPPORTED — never
-    # retried, never silently upgraded) is dropped: not returned to the
-    # client, its marker stripped from the answer text. SUPPORTED and
-    # PARTIAL are both kept — PARTIAL renders with a warning indicator
-    # client-side (ARCHITECTURE.md's verify flow; API_CONTRACT.md now
-    # documents this explicitly after the 2026-07-24 full-flow audit
-    # found it was previously undocumented there).
+    # verdict == UNSUPPORTED — a real model judgment that the claim is
+    # false, or a caught fabricated/ungrounded quote (Verifier still
+    # forces these to UNSUPPORTED — never retried, never silently
+    # upgraded) — is dropped: not returned to the client, its marker
+    # stripped from the answer text. SUPPORTED, PARTIAL, and UNVERIFIED
+    # (2026-08-03 — verification genuinely could not run: a Verifier-
+    # internal infrastructure failure, distinct from a real UNSUPPORTED
+    # verdict) are all kept. This check is deliberately an equality
+    # check against UNSUPPORTED specifically, not an allowlist of
+    # "keep" states — a new verdict label that isn't literally
+    # UNSUPPORTED falls through to kept/shown automatically. PARTIAL and
+    # UNVERIFIED each render with their own distinct client-side
+    # indicator (ARCHITECTURE.md's verify flow; API_CONTRACT.md documents
+    # all four states explicitly).
     citation_responses: list[CitationResponse] = []
     citations_to_persist: list[dict] = []
 

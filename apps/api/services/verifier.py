@@ -37,6 +37,21 @@ class VerdictLabel(str, Enum):
     SUPPORTED = "supported"
     PARTIAL = "partial"
     UNSUPPORTED = "unsupported"
+    # 2026-08-02 — distinct from UNSUPPORTED, added after finding this
+    # project's own fail-safe path was conflating two different things:
+    # "checked and found false" (a real model verdict, or a caught
+    # attempt to pass off a fabricated/ungrounded quote) vs. "never
+    # actually checked" (the verify call itself errored, timed out, or
+    # returned a malformed/non-schema response — an infrastructure
+    # failure, not a judgment about the claim). The citation recovery
+    # cascade (2026-08-02, same day) made this matter for a larger share
+    # of real answers than before: more citations now reach verify_batch()
+    # at all, so more of them can hit a real infrastructure failure here
+    # too. UNVERIFIED is used ONLY for that narrow "could not run"
+    # category — see _fail_safe_verdict's own docstring for exactly which
+    # branches use it and, just as importantly, which ones deliberately
+    # still use UNSUPPORTED.
+    UNVERIFIED = "unverified"
 
 
 class _VerdictResponse(pydantic.BaseModel):
@@ -59,21 +74,28 @@ class Verdict:
     input_tokens: int
     output_tokens: int
     latency_ms: float
-    # Non-None ONLY when the Gemini call itself failed or returned a
-    # response that didn't conform to the schema — verdict is ALWAYS
-    # forced to UNSUPPORTED and quote to None in that case, regardless of
-    # what a caller does with this field. This is what makes fail-safe
-    # behavior structural rather than a convention the caller must
-    # remember to uphold: even a caller that only ever reads `.verdict`
-    # and ignores `.error` entirely still gets the safe outcome.
+    # Non-None whenever something went wrong (an infrastructure failure
+    # OR a caught fabricated/ungrounded quote) — quote is always forced
+    # to None alongside it, regardless of what a caller does with this
+    # field. This is what makes fail-safe behavior structural rather than
+    # a convention the caller must remember to uphold: even a caller that
+    # only ever reads `.verdict` and ignores `.error` entirely still gets
+    # a safe outcome. `.verdict` itself is what actually distinguishes
+    # the two failure shapes (2026-08-02): UNVERIFIED when the call
+    # genuinely could not run or produce a trustworthy response at all
+    # (error/timeout/malformed response); UNSUPPORTED when the call DID
+    # run and DID return something, but a caught fabricated/ungrounded
+    # quote means the response itself can't be trusted — see
+    # _fail_safe_verdict's docstring for the exact line between them.
     error: str | None = None
 
 
 class VerificationError(Exception):
     """Raised only for a caller-side misuse (e.g. an empty claim_text) —
     never for a failed or malformed Gemini response, which verify()
-    converts into a fail-safe UNSUPPORTED Verdict instead of an
-    exception a caller could forget to catch and mishandle."""
+    converts into a fail-safe Verdict (UNVERIFIED or UNSUPPORTED,
+    depending on the failure — never a plain exception a caller could
+    forget to catch and mishandle)."""
 
 
 def _default_client() -> genai.Client:
@@ -111,9 +133,31 @@ def _quote_is_grounded(quote: str, content: str) -> bool:
     return _normalize_whitespace(quote) in _normalize_whitespace(content)
 
 
-def _fail_safe_verdict(model: str, error: str, latency_ms: float) -> Verdict:
+def _fail_safe_verdict(verdict_label: VerdictLabel, model: str, error: str, latency_ms: float) -> Verdict:
+    """The one place every failure path in verify() below funnels
+    through — `verdict_label` is the ONE thing callers must get right,
+    since it's the real, structural line between the two failure shapes
+    (2026-08-02):
+
+    - `VerdictLabel.UNVERIFIED` — the call genuinely could not run or
+      produce a trustworthy response: a raised APIError/httpx.HTTPError
+      (infrastructure — quota, network, auth), or `response.parsed is
+      None` (the call completed but the response was malformed/didn't
+      conform to the schema at all — a protocol-level failure, not a
+      judgment about the claim).
+    - `VerdictLabel.UNSUPPORTED` — the call DID run and DID return a
+      real, schema-conforming response, but it's being rejected because
+      the quote it offered as evidence doesn't actually appear in the
+      source (`_quote_is_grounded` below). This is deliberately NOT
+      UNVERIFIED: catching a model trying to pass off a fabricated quote
+      is closer to "we checked, and what it offered as proof doesn't
+      hold up" than "we never checked" — the stronger, dropped-not-shown
+      treatment stays warranted.
+
+    Both cases force `quote=None` — an error, by definition, means
+    nothing survived to be shown as a supporting quote either way."""
     return Verdict(
-        verdict=VerdictLabel.UNSUPPORTED,
+        verdict=verdict_label,
         quote=None,
         model=model,
         input_tokens=0,
@@ -144,8 +188,8 @@ class Verifier:
             response = self._client.models.generate_content(model=MODEL, contents=contents, config=config)
         except APIError as exc:
             latency_ms = (time.perf_counter() - started) * 1000
-            logger.warning("verifier: Gemini call failed — failing safe to UNSUPPORTED: %s", exc)
-            return _fail_safe_verdict(MODEL, f"Gemini API error: {exc}", latency_ms)
+            logger.warning("verifier: Gemini call failed — failing safe to UNVERIFIED: %s", exc)
+            return _fail_safe_verdict(VerdictLabel.UNVERIFIED, MODEL, f"Gemini API error: {exc}", latency_ms)
         except httpx.HTTPError as exc:
             # A self-audit found this branch missing: the SDK's own HTTP
             # layer (_api_client.py) calls httpx directly with no
@@ -158,8 +202,8 @@ class Verifier:
             # HTTP status errors, so this closes that gap the same
             # fail-safe way as an APIError.
             latency_ms = (time.perf_counter() - started) * 1000
-            logger.warning("verifier: Gemini call failed at the transport layer — failing safe to UNSUPPORTED: %s", exc)
-            return _fail_safe_verdict(MODEL, f"transport error: {exc}", latency_ms)
+            logger.warning("verifier: Gemini call failed at the transport layer — failing safe to UNVERIFIED: %s", exc)
+            return _fail_safe_verdict(VerdictLabel.UNVERIFIED, MODEL, f"transport error: {exc}", latency_ms)
         latency_ms = (time.perf_counter() - started) * 1000
 
         # response.parsed is None both when the SDK never attempted to
@@ -172,10 +216,12 @@ class Verifier:
         if response.parsed is None:
             logger.warning(
                 "verifier: response did not conform to the verdict schema — failing safe to "
-                "UNSUPPORTED. raw text=%r",
+                "UNVERIFIED. raw text=%r",
                 response.text,
             )
-            return _fail_safe_verdict(response.model_version or MODEL, "unparseable or non-schema-conforming response", latency_ms)
+            return _fail_safe_verdict(
+                VerdictLabel.UNVERIFIED, response.model_version or MODEL, "unparseable or non-schema-conforming response", latency_ms
+            )
 
         parsed: _VerdictResponse = response.parsed
         usage = response.usage_metadata
@@ -202,7 +248,7 @@ class Verifier:
                 quote,
             )
             return _fail_safe_verdict(
-                response.model_version or MODEL, f"returned quote not found in source content: {quote!r}", latency_ms
+                VerdictLabel.UNSUPPORTED, response.model_version or MODEL, f"returned quote not found in source content: {quote!r}", latency_ms
             )
 
         return Verdict(

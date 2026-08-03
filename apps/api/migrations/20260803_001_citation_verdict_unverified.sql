@@ -1,0 +1,40 @@
+-- 20260803_001_citation_verdict_unverified.sql
+--
+-- Adds a fourth citations.verdict value, 'unverified', distinct from
+-- 'unsupported': services/verifier.py's own fail-safe path was
+-- conflating "checked and found false" (a real model verdict, or a
+-- caught fabricated/ungrounded quote) with "never actually checked"
+-- (the Gemini verify call itself errored, timed out, or returned a
+-- malformed/non-schema response -- an infrastructure failure, not a
+-- judgment about the claim). Hiding the second case the same way as
+-- the first produces an answer that looks fully verified when part of
+-- it silently wasn't. See verifier.py's VerdictLabel/_fail_safe_verdict
+-- docstrings for the exact line between the two.
+--
+-- ALTER TYPE ... ADD VALUE is a real, additive, non-breaking migration
+-- on Postgres 12+ (this project runs 15+) -- no same-transaction
+-- restriction for this straightforward case, and it follows this
+-- project's own established pattern of real Postgres enums for every
+-- other piece of categorical state (document_status, embedding_provider,
+-- element_type) rather than introducing a nullable-verdict+separate-flag
+-- design for just this one column.
+--
+-- routes/query.py's citation-keep/drop check (`if verdict ==
+-- UNSUPPORTED: drop`) and db/queries.py's list_citations_for_messages
+-- filter (`.neq("verdict", "unsupported")`) are both exclusion-based,
+-- not allowlists -- 'unverified' rows are automatically kept and
+-- surfaced with zero application-code changes beyond this schema value.
+
+alter type verdict add value if not exists 'unverified';
+
+-- ══════════════════════════════════════════════════════════════════════════
+-- ROLLBACK
+-- ══════════════════════════════════════════════════════════════════════════
+-- Postgres does not support removing a single value from an enum type.
+-- To roll back: first update any 'unverified' rows to a value that still
+-- exists (e.g. `update citations set verdict = 'unsupported' where
+-- verdict = 'unverified';`), then recreate the type without it:
+--   alter type verdict rename to verdict_old;
+--   create type verdict as enum ('supported', 'partial', 'unsupported');
+--   alter table citations alter column verdict type verdict using verdict::text::verdict;
+--   drop type verdict_old;
