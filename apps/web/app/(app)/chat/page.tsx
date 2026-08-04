@@ -8,9 +8,11 @@ import { Topbar, WorkspaceBadge, MobileMenuButton } from "@/components/layout/to
 import { ThemeToggle } from "@/components/theme-toggle";
 import { Button } from "@/components/ui/button";
 import { ConversationCard, type ConversationCardData } from "@/components/conversations/conversation-card";
+import { RenameConversationDialog, type RenameConversationTarget } from "@/components/conversations/rename-conversation-dialog";
+import { DeleteConversationDialog, type DeleteConversationTarget } from "@/components/conversations/delete-conversation-dialog";
 import { createClient } from "@/lib/supabase/browser";
 import { ApiError } from "@/lib/api/client";
-import { listConversations, type ApiConversation } from "@/lib/api/conversations";
+import { listConversations, renameConversation, deleteConversation, type ApiConversation } from "@/lib/api/conversations";
 import { listDocuments } from "@/lib/api/documents";
 
 const USER = { initials: "AK", name: "Ana Kovač", email: "ana@firm.com" };
@@ -47,6 +49,17 @@ export default function ConversationListPage() {
   const [loadError, setLoadError] = React.useState<string | null>(null);
   const [mobileMenuOpen, setMobileMenuOpen] = React.useState(false);
 
+  // Batch 3 — rename/delete. Targets carry just enough for the dialog to
+  // render itself (id + current title) rather than the whole
+  // ApiConversation, so the dialog components stay decoupled from this
+  // page's own data shape.
+  const [renameTarget, setRenameTarget] = React.useState<RenameConversationTarget | null>(null);
+  const [renameError, setRenameError] = React.useState<string | null>(null);
+  const [renaming, setRenaming] = React.useState(false);
+  const [deleteTarget, setDeleteTarget] = React.useState<DeleteConversationTarget | null>(null);
+  const [deleteError, setDeleteError] = React.useState<string | null>(null);
+  const [deleting, setDeleting] = React.useState(false);
+
   React.useEffect(() => {
     let cancelled = false;
     Promise.all([listConversations(), listDocuments()])
@@ -79,6 +92,53 @@ export default function ConversationListPage() {
       setLoadError(err instanceof ApiError ? err.message : "Couldn't load your conversations.");
     } finally {
       setLoading(false);
+    }
+  }
+
+  function openRenameDialog(id: string) {
+    const conv = conversations.find((c) => c.id === id);
+    if (!conv) return;
+    setRenameError(null);
+    setRenameTarget({ id, currentTitle: conv.title ?? "" });
+  }
+
+  async function handleRenameConfirm(title: string) {
+    if (!renameTarget) return;
+    setRenaming(true);
+    setRenameError(null);
+    try {
+      const updated = await renameConversation(renameTarget.id, title);
+      // Real, persisted title from the response (server trims/validates,
+      // API_CONTRACT.md) — not just echoing what was typed, so the list
+      // shows exactly what was actually saved.
+      setConversations((prev) => prev.map((c) => (c.id === renameTarget.id ? { ...c, title: updated.title } : c)));
+      setRenameTarget(null);
+    } catch (err) {
+      setRenameError(err instanceof ApiError ? err.message : "Couldn't rename this conversation.");
+    } finally {
+      setRenaming(false);
+    }
+  }
+
+  function openDeleteDialog(id: string) {
+    const conv = conversations.find((c) => c.id === id);
+    if (!conv) return;
+    setDeleteError(null);
+    setDeleteTarget({ id, title: conv.title ?? "Untitled conversation" });
+  }
+
+  async function handleDeleteConfirm() {
+    if (!deleteTarget) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await deleteConversation(deleteTarget.id);
+      setConversations((prev) => prev.filter((c) => c.id !== deleteTarget.id));
+      setDeleteTarget(null);
+    } catch (err) {
+      setDeleteError(err instanceof ApiError ? err.message : "Couldn't delete this conversation.");
+    } finally {
+      setDeleting(false);
     }
   }
 
@@ -148,13 +208,27 @@ export default function ConversationListPage() {
             ) : (
               <div className="overflow-hidden rounded-lg border border-line bg-drop-bg">
                 {cardConversations.map((conv) => (
-                  <ConversationCard key={conv.id} conversation={conv} />
+                  <ConversationCard key={conv.id} conversation={conv} onRename={openRenameDialog} onDelete={openDeleteDialog} />
                 ))}
               </div>
             )}
           </div>
         </main>
       </div>
+      <RenameConversationDialog
+        target={renameTarget}
+        error={renameError}
+        saving={renaming}
+        onConfirm={handleRenameConfirm}
+        onCancel={() => setRenameTarget(null)}
+      />
+      <DeleteConversationDialog
+        target={deleteTarget}
+        error={deleteError}
+        deleting={deleting}
+        onConfirm={handleDeleteConfirm}
+        onCancel={() => setDeleteTarget(null)}
+      />
     </div>
   );
 }

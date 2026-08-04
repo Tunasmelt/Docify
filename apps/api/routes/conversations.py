@@ -1,7 +1,7 @@
 import logging
 
 from fastapi import APIRouter, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from db import queries
 from db.client import get_service_role_client
@@ -12,6 +12,7 @@ from models.conversations import (
     ConversationMessagesResponse,
     ConversationResponse,
     MessageResponse,
+    RenameConversationRequest,
 )
 from models.query import CitationResponse
 from routes._pagination import decode_cursor, encode_cursor
@@ -20,6 +21,12 @@ from services.figure_fetcher import signed_figure_url
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Matches create_query_turn's own auto-generated-title truncation
+# (`left(p_question, 200)`, migrations/20260724_002) — a user-supplied
+# rename is held to the same real bound an auto-generated title already
+# is, not a new, inconsistent limit invented just for this endpoint.
+TITLE_MAX_LENGTH = 200
 
 
 @router.get("/conversations", response_model=ConversationListResponse)
@@ -134,3 +141,47 @@ async def get_conversation_messages(conversation_id: str, request: Request):
         conversation=ConversationDetail(**conversation_row),
         messages=messages,
     )
+
+
+# API_CONTRACT.md's own documented shape (this route existed there as a
+# "not-yet-defined" stub before batch 3 implemented it) — POST, not PATCH:
+# a rename is a real, singular action on a resource, matching this
+# project's existing action-route precedent (POST /reindex/{document_id})
+# rather than introducing this API's first PATCH verb for one endpoint.
+@router.post("/conversations/{conversation_id}/rename", response_model=ConversationDetail)
+async def rename_conversation(conversation_id: str, payload: RenameConversationRequest, request: Request):
+    title = payload.title.strip()
+    if not title:
+        return JSONResponse(status_code=422, content=error_envelope("VALIDATION_ERROR", "title must not be empty"))
+    if len(title) > TITLE_MAX_LENGTH:
+        return JSONResponse(
+            status_code=422,
+            content=error_envelope("VALIDATION_ERROR", f"title must be at most {TITLE_MAX_LENGTH} characters"),
+        )
+
+    user_id = request.state.user_id
+    client = get_service_role_client()
+
+    row = queries.rename_conversation(client, conversation_id=conversation_id, user_id=user_id, title=title)
+    if row is None:
+        # Same response whether conversation_id doesn't exist at all or
+        # belongs to another user — rename_conversation() scopes user_id
+        # in the query itself, identical discipline as every other
+        # owned-resource lookup in this API (API_CONTRACT.md).
+        return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "conversation not found"))
+
+    return ConversationDetail(**row)
+
+
+@router.delete("/conversations/{conversation_id}", status_code=204)
+async def delete_conversation(conversation_id: str, request: Request):
+    user_id = request.state.user_id
+    client = get_service_role_client()
+
+    deleted = queries.delete_conversation(client, conversation_id=conversation_id, user_id=user_id)
+    if not deleted:
+        return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "conversation not found"))
+
+    # 204 No Content, matching DELETE /documents/{id}'s own convention and
+    # API_CONTRACT.md's already-documented response for this route.
+    return Response(status_code=204)

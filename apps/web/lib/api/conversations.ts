@@ -20,12 +20,34 @@ export async function listConversations(): Promise<ConversationListResponse> {
   return apiFetch<ConversationListResponse>("/conversations");
 }
 
-interface ApiConversationDetail {
+export interface ApiConversationDetail {
   id: string;
   title: string | null;
   document_ids: string[];
   created_at: string;
   updated_at: string;
+}
+
+/** POST /conversations/{id}/rename (batch 3) — POST, not PATCH, matching
+ * this API's existing action-route precedent (API_CONTRACT.md). Backend
+ * trims and validates non-empty/<=200 chars; the trimmed, persisted
+ * title comes back in the response rather than echoing what was sent,
+ * so the caller never has to duplicate that trimming logic itself. */
+export async function renameConversation(conversationId: string, title: string): Promise<ApiConversationDetail> {
+  return apiFetch<ApiConversationDetail>(`/conversations/${conversationId}/rename`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title }),
+  });
+}
+
+/** DELETE /conversations/{id} (batch 3) — 204 on success, apiFetch()
+ * already resolves a 204 to undefined (lib/api/client.ts). Messages and
+ * citations cascade server-side (SCHEMA.md's on-delete-cascade FKs); no
+ * client-side cleanup of anything beyond removing this id from local
+ * list state is needed. */
+export async function deleteConversation(conversationId: string): Promise<void> {
+  await apiFetch<void>(`/conversations/${conversationId}`, { method: "DELETE" });
 }
 
 interface ApiMessage {

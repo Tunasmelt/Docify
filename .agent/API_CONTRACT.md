@@ -363,16 +363,65 @@ Full message history for a conversation, including citations.
 
 ---
 
+### `POST /conversations/{conversation_id}/rename` (batch 3, 2026-08-04)
+Renames a conversation. POST, not PATCH — a rename is a real, singular
+action on a resource, matching this API's existing action-route
+precedent (`POST /reindex/{document_id}`) rather than introducing this
+API's first PATCH verb for one endpoint.
+
+**Request:**
+```json
+{ "title": "New conversation title" }
+```
+
+**Response 200:** the updated conversation (same shape as
+`GET /conversations/{id}/messages`'s `conversation` object):
+```json
+{
+  "id": "6c1a...",
+  "title": "New conversation title",
+  "document_ids": ["3f9e..."],
+  "created_at": "2026-07-22T14:00:00Z",
+  "updated_at": "2026-07-22T14:00:00Z"
+}
+```
+
+**Behaviour:**
+- `title` is trimmed; empty (after trim) or over 200 chars (matching
+  `create_query_turn`'s own auto-generated-title truncation) is a `422
+  VALIDATION_ERROR`.
+- Deliberately does **not** bump `updated_at` — a rename is a metadata
+  edit, not new conversation activity. `GET /conversations` sorts by
+  `updated_at desc`; bumping it here would jump a renamed-but-otherwise-
+  untouched conversation to the top of "Recent," which nothing about a
+  rename implies the caller wants.
+
+**Errors:**
+- `404 NOT_FOUND` if the conversation doesn't exist or belongs to another
+  user (identical response either way — no ownership oracle)
+- `422 VALIDATION_ERROR` — see above
+
+---
+
 ### `DELETE /conversations/{conversation_id}`
-Deletes the conversation and its messages + citations.
+Deletes the conversation and its messages + citations. `messages.conversation_id`
+and `citations.message_id` both cascade at the DB level (`on delete
+cascade` FKs, SCHEMA.md) — unlike `DELETE /documents/{id}`, there is no
+Storage cleanup and no array-reference cleanup needed, since a
+conversation owns no Storage objects and nothing else references a
+conversation's id the way `conversations.document_ids` references a
+document's id.
 
 **Response 204**
+
+**Errors:**
+- `404 NOT_FOUND` if the conversation doesn't exist or belongs to another
+  user (identical response either way)
 
 ---
 
 ## Not-yet-defined endpoints (Phase 4+)
 
-- `POST /conversations/{id}/rename`
 - `GET /conversations/{id}/export` — markdown export
 - `PATCH /documents/{id}` — rename
 

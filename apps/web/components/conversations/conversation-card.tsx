@@ -4,7 +4,11 @@
 // square, serif title, mono/faint meta line, hover-panel row) — kept
 // as its own component for the same reason DocumentCard is: this
 // project's convention is one card component per list-row shape, not
-// inline JSX repeated across pages.
+// inline JSX repeated across pages. Rename/delete (batch 3) reuse
+// DocumentCard's own always-visible (not hover-only) action-button
+// treatment, the closer sibling precedent for a list row.
+
+import { Pencil, Trash2 } from "lucide-react";
 
 const MAX_INLINE_DOCUMENT_NAMES = 2;
 
@@ -24,6 +28,8 @@ export interface ConversationCardData {
 
 export interface ConversationCardProps {
   conversation: ConversationCardData;
+  onRename: (id: string) => void;
+  onDelete: (id: string) => void;
 }
 
 function formatDocumentNames(names: string[]): string {
@@ -33,23 +39,56 @@ function formatDocumentNames(names: string[]): string {
   return `${shown} +${names.length - MAX_INLINE_DOCUMENT_NAMES} more`;
 }
 
-export function ConversationCard({ conversation }: ConversationCardProps) {
+export function ConversationCard({ conversation, onRename, onDelete }: ConversationCardProps) {
   const meta = `${formatDocumentNames(conversation.documentNames)} · ${conversation.messageCount} ${
     conversation.messageCount === 1 ? "MESSAGE" : "MESSAGES"
   } · ${conversation.updatedAtLabel}`;
 
   return (
-    <a
-      href={`/chat/${conversation.id}`}
-      className="flex items-center gap-4 border-b border-line px-[18px] py-3.5 no-underline last:border-b-0 hover:bg-panel-hover"
-    >
-      <div className="flex h-9 w-7 flex-shrink-0 items-center justify-center rounded-[3px] border border-border bg-surface font-serif text-sm text-faint">
-        ¶
+    // relative wrapper, not the <a> itself — the action buttons below
+    // are siblings of the <a>, absolutely positioned on top of it,
+    // rather than nested inside it (an interactive <button> nested
+    // inside an <a> is invalid HTML and makes click targeting
+    // unreliable across browsers).
+    <div className="group relative border-b border-line last:border-b-0">
+      <a
+        href={`/chat/${conversation.id}`}
+        className="flex items-center gap-4 px-[18px] py-3.5 pr-[92px] no-underline hover:bg-panel-hover"
+      >
+        <div className="flex h-9 w-7 flex-shrink-0 items-center justify-center rounded-[3px] border border-border bg-surface font-serif text-sm text-faint">
+          ¶
+        </div>
+        <div className="min-w-0 flex-1">
+          <p className="m-0 truncate font-serif text-[15px] font-medium text-ink">{conversation.title}</p>
+          <p className="m-0 mt-0.5 truncate font-mono text-[11px] tracking-[0.04em] text-faint">{meta}</p>
+        </div>
+      </a>
+      <div className="absolute right-[18px] top-1/2 flex -translate-y-1/2 items-center gap-1">
+        <button
+          type="button"
+          title="Rename"
+          data-testid={`rename-conversation-${conversation.id}`}
+          onClick={(e) => {
+            e.preventDefault();
+            onRename(conversation.id);
+          }}
+          className="flex h-[30px] w-[30px] flex-shrink-0 items-center justify-center rounded-md text-faint transition-colors hover:bg-panel-active hover:text-ink"
+        >
+          <Pencil size={15} strokeWidth={1.8} />
+        </button>
+        <button
+          type="button"
+          title="Delete"
+          data-testid={`delete-conversation-${conversation.id}`}
+          onClick={(e) => {
+            e.preventDefault();
+            onDelete(conversation.id);
+          }}
+          className="flex h-[30px] w-[30px] flex-shrink-0 items-center justify-center rounded-md text-faint transition-colors hover:bg-panel-active hover:text-destructive"
+        >
+          <Trash2 size={15} strokeWidth={1.8} />
+        </button>
       </div>
-      <div className="min-w-0 flex-1">
-        <p className="m-0 truncate font-serif text-[15px] font-medium text-ink">{conversation.title}</p>
-        <p className="m-0 mt-0.5 truncate font-mono text-[11px] tracking-[0.04em] text-faint">{meta}</p>
-      </div>
-    </a>
+    </div>
   );
 }

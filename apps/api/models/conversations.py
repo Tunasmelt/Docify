@@ -3,6 +3,10 @@ from pydantic import BaseModel
 from models.query import CitationResponse
 
 
+class RenameConversationRequest(BaseModel):
+    title: str
+
+
 class ConversationResponse(BaseModel):
     id: str
     title: str | None

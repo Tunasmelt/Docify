@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import { Pencil, Trash2 } from "lucide-react";
 
 import { Sidebar } from "@/components/layout/sidebar";
 import { Topbar, WorkspaceBadge, MobileMenuButton } from "@/components/layout/topbar";
@@ -12,12 +13,20 @@ import { QuestionInput } from "@/components/chat/question-input";
 import { SourcePanel } from "@/components/chat/source-panel";
 import { ScrollToBottomPill } from "@/components/chat/scroll-to-bottom-pill";
 import { DocumentScopeChips } from "@/components/chat/document-scope-chips";
+import { RenameConversationDialog } from "@/components/conversations/rename-conversation-dialog";
+import { DeleteConversationDialog } from "@/components/conversations/delete-conversation-dialog";
 import { useChatShortcuts } from "@/hooks/use-chat-shortcuts";
 import type { ChatMessage, Citation } from "@/lib/types/chat";
 import { createClient } from "@/lib/supabase/browser";
 import { askQuestionStream } from "@/lib/api/query";
 import { buildAssistantMessage } from "@/lib/chat/parse-message";
-import { getConversationMessages, listConversations, type ApiConversation } from "@/lib/api/conversations";
+import {
+  getConversationMessages,
+  listConversations,
+  renameConversation,
+  deleteConversation,
+  type ApiConversation,
+} from "@/lib/api/conversations";
 import { listDocuments } from "@/lib/api/documents";
 import { ApiError } from "@/lib/api/client";
 
@@ -67,6 +76,14 @@ export default function ChatPage({ params }: { params: { conversation_id: string
   const [mobileMenuOpen, setMobileMenuOpen] = React.useState(false);
   const [recentConversations, setRecentConversations] = React.useState<ApiConversation[] | null>(null);
   const [docNamesById, setDocNamesById] = React.useState<Map<string, string>>(new Map());
+  // Batch 3 — rename/delete the currently-open conversation, same
+  // dialog components the conversation list page uses.
+  const [renameOpen, setRenameOpen] = React.useState(false);
+  const [renameError, setRenameError] = React.useState<string | null>(null);
+  const [renaming, setRenaming] = React.useState(false);
+  const [deleteOpen, setDeleteOpen] = React.useState(false);
+  const [deleteError, setDeleteError] = React.useState<string | null>(null);
+  const [deleting, setDeleting] = React.useState(false);
   // Batch 1, item 4: force-auto-scroll fought a user who'd scrolled up
   // to reread something (every new token/message yanked them back down).
   // isNearBottomRef tracks live scroll position via onScroll — a ref,
@@ -334,6 +351,46 @@ export default function ChatPage({ params }: { params: { conversation_id: string
     void ask(originalQuestion);
   }
 
+  // Batch 3 — rename/delete the currently-open conversation. Both are
+  // no-ops (dialogs simply aren't opened) while conversationId is still
+  // null — a "new" chat with no persisted turn yet has nothing to
+  // rename or delete server-side.
+  async function handleRenameConfirm(newTitle: string) {
+    if (!conversationId) return;
+    setRenaming(true);
+    setRenameError(null);
+    try {
+      const updated = await renameConversation(conversationId, newTitle);
+      setTitle(updated.title);
+      // Keeps the sidebar's "Recent" list in sync — it's fetched once
+      // per conversationId change (below), which a rename doesn't
+      // trigger, so without this it would keep showing the pre-rename
+      // title until the next navigation.
+      setRecentConversations((prev) => prev?.map((c) => (c.id === conversationId ? { ...c, title: updated.title } : c)) ?? prev);
+      setRenameOpen(false);
+    } catch (err) {
+      setRenameError(err instanceof ApiError ? err.message : "Couldn't rename this conversation.");
+    } finally {
+      setRenaming(false);
+    }
+  }
+
+  async function handleDeleteConfirm() {
+    if (!conversationId) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await deleteConversation(conversationId);
+      // The conversation this page was showing no longer exists —
+      // same destination as the "conversation not found" state's own
+      // "Back to conversations" link below.
+      router.push("/chat");
+    } catch (err) {
+      setDeleteError(err instanceof ApiError ? err.message : "Couldn't delete this conversation.");
+      setDeleting(false);
+    }
+  }
+
   // Batch 1, item 5. onNewConversation goes to /documents — see
   // use-chat-shortcuts.ts's own comment for why that's "wherever it
   // currently lives" today. onEscape closes the source panel if one is
@@ -420,7 +477,42 @@ export default function ChatPage({ params }: { params: { conversation_id: string
               ) : null}
             </>
           }
-          right={<ThemeToggle />}
+          right={
+            <>
+              {/* Only once a real, persisted conversation exists —
+                  nothing to rename/delete server-side for a "new" chat
+                  that hasn't sent its first question yet. */}
+              {conversationId ? (
+                <>
+                  <button
+                    type="button"
+                    title="Rename conversation"
+                    data-testid="rename-conversation-header-button"
+                    onClick={() => {
+                      setRenameError(null);
+                      setRenameOpen(true);
+                    }}
+                    className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-md text-faint transition-colors hover:bg-panel hover:text-ink"
+                  >
+                    <Pencil size={16} strokeWidth={1.8} />
+                  </button>
+                  <button
+                    type="button"
+                    title="Delete conversation"
+                    data-testid="delete-conversation-header-button"
+                    onClick={() => {
+                      setDeleteError(null);
+                      setDeleteOpen(true);
+                    }}
+                    className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-md text-faint transition-colors hover:bg-panel hover:text-destructive"
+                  >
+                    <Trash2 size={16} strokeWidth={1.8} />
+                  </button>
+                </>
+              ) : null}
+              <ThemeToggle />
+            </>
+          }
         />
         {documentNames.length > 0 ? (
           <div className="flex items-center border-b border-line bg-bg px-4 py-2 md:px-6">
@@ -521,6 +613,20 @@ export default function ChatPage({ params }: { params: { conversation_id: string
           }
         />
       </div>
+      <RenameConversationDialog
+        target={renameOpen && conversationId ? { id: conversationId, currentTitle: title ?? "" } : null}
+        error={renameError}
+        saving={renaming}
+        onConfirm={handleRenameConfirm}
+        onCancel={() => setRenameOpen(false)}
+      />
+      <DeleteConversationDialog
+        target={deleteOpen && conversationId ? { id: conversationId, title: headerTitle } : null}
+        error={deleteError}
+        deleting={deleting}
+        onConfirm={handleDeleteConfirm}
+        onCancel={() => setDeleteOpen(false)}
+      />
     </div>
   );
 }

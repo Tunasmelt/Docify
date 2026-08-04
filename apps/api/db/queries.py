@@ -395,6 +395,53 @@ def get_conversation_detail(client, *, conversation_id: str, user_id: str) -> di
     return rows[0] if rows else None
 
 
+def rename_conversation(client, *, conversation_id: str, user_id: str, title: str) -> dict | None:
+    """Scoped to user_id in the .eq() filter itself (not checked after the
+    fact) — same "doesn't exist and belongs to someone else look
+    identical" discipline as get_document()/get_conversation(). Returns
+    None for either case so POST /conversations/{id}/rename can return an
+    identical 404 without a separate ownership check.
+
+    Deliberately does NOT bump updated_at — a rename is a metadata edit,
+    not new conversation activity, and conversations are sorted by
+    updated_at desc (SCHEMA.md's conversations_user_idx) for GET
+    /conversations. Bumping it here would jump a renamed-but-otherwise-
+    untouched conversation to the top of "Recent," which nothing about
+    a rename action implies the user wants."""
+    rows = (
+        client.table("conversations")
+        .update({"title": title})
+        .eq("id", conversation_id)
+        .eq("user_id", user_id)
+        .execute()
+        .data
+    )
+    return rows[0] if rows else None
+
+
+def delete_conversation(client, *, conversation_id: str, user_id: str) -> bool:
+    """Scoped to user_id in the .eq() filter itself, same discipline as
+    every other owned-row lookup in this file. messages and citations
+    cascade at the DB level (`on delete cascade` FKs, SCHEMA.md) — unlike
+    delete_document(), there is no Storage cleanup or array-reference
+    cleanup needed here, since a conversation owns no Storage objects and
+    nothing else references a conversation_id the way documents.id is
+    referenced by conversations.document_ids.
+
+    Returns whether a row was actually deleted, so the caller can return
+    a real 404 for a conversation that doesn't exist or belongs to
+    someone else, rather than a silent no-op 204."""
+    rows = (
+        client.table("conversations")
+        .delete()
+        .eq("id", conversation_id)
+        .eq("user_id", user_id)
+        .execute()
+        .data
+    )
+    return bool(rows)
+
+
 def list_messages_for_conversation(
     client, *, conversation_id: str, user_id: str, limit: int | None = None
 ) -> list[dict]:

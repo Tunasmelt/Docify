@@ -324,3 +324,172 @@ def test_multi_tenant_isolation_across_conversations_and_messages(app_client, ad
 
     get_as_b = app_client.get(f"/conversations/{conv_id}/messages", headers={"Authorization": f"Bearer {token_b}"})
     assert get_as_b.status_code == 404
+
+
+# --- Batch 3 (2026-08-04): POST /conversations/{id}/rename, DELETE /conversations/{id} ---
+
+
+def test_rename_conversation_updates_title_and_returns_the_updated_conversation(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id = ingest_real_document(app_client, user_id, token, filename="doc.pdf")
+    chunk_row = admin.table("chunks").select("id,document_id,element_type,page_number,content").eq("document_id", document_id).execute().data[0]
+    result = _ask_real_question(app_client, admin, user_id, token, document_id, chunk_row, "Answer [1].")
+    conv_id = result["conversation_id"]
+
+    response = app_client.post(
+        f"/conversations/{conv_id}/rename", json={"title": "  My renamed conversation  "}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # Trimmed, not stored with the surrounding whitespace verbatim.
+    assert body["title"] == "My renamed conversation"
+    assert body["id"] == conv_id
+
+    # Real persistence, not just an echoed request body -- confirmed via
+    # a completely separate real GET.
+    listed = app_client.get("/conversations", headers={"Authorization": f"Bearer {token}"}).json()
+    renamed = next(c for c in listed["conversations"] if c["id"] == conv_id)
+    assert renamed["title"] == "My renamed conversation"
+
+
+def test_rename_conversation_does_not_bump_updated_at(app_client, admin, user_a):
+    # Real product decision (API_CONTRACT.md): a rename is a metadata
+    # edit, not new conversation activity -- must never reorder "Recent"
+    # on its own.
+    user_id, token = user_a
+    document_id = ingest_real_document(app_client, user_id, token, filename="doc.pdf")
+    chunk_row = admin.table("chunks").select("id,document_id,element_type,page_number,content").eq("document_id", document_id).execute().data[0]
+    result = _ask_real_question(app_client, admin, user_id, token, document_id, chunk_row, "Answer [1].")
+    conv_id = result["conversation_id"]
+
+    before = admin.table("conversations").select("updated_at").eq("id", conv_id).execute().data[0]["updated_at"]
+
+    response = app_client.post(
+        f"/conversations/{conv_id}/rename", json={"title": "New title"}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == 200
+
+    after = admin.table("conversations").select("updated_at").eq("id", conv_id).execute().data[0]["updated_at"]
+    assert after == before, "rename must not change updated_at"
+
+
+def test_rename_conversation_rejects_empty_title(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id = ingest_real_document(app_client, user_id, token, filename="doc.pdf")
+    chunk_row = admin.table("chunks").select("id,document_id,element_type,page_number,content").eq("document_id", document_id).execute().data[0]
+    result = _ask_real_question(app_client, admin, user_id, token, document_id, chunk_row, "Answer [1].")
+    conv_id = result["conversation_id"]
+
+    for bad_title in ["", "   ", "\t\n"]:
+        response = app_client.post(
+            f"/conversations/{conv_id}/rename", json={"title": bad_title}, headers={"Authorization": f"Bearer {token}"}
+        )
+        assert response.status_code == 422, response.text
+        assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_rename_conversation_rejects_title_over_200_chars(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id = ingest_real_document(app_client, user_id, token, filename="doc.pdf")
+    chunk_row = admin.table("chunks").select("id,document_id,element_type,page_number,content").eq("document_id", document_id).execute().data[0]
+    result = _ask_real_question(app_client, admin, user_id, token, document_id, chunk_row, "Answer [1].")
+    conv_id = result["conversation_id"]
+
+    response = app_client.post(
+        f"/conversations/{conv_id}/rename", json={"title": "x" * 201}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+    # Exactly 200 is allowed -- the boundary itself, not just "too long"
+    # is rejected.
+    ok_response = app_client.post(
+        f"/conversations/{conv_id}/rename", json={"title": "x" * 200}, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert ok_response.status_code == 200
+
+
+def test_rename_conversation_returns_404_for_nonexistent_or_another_user_s_conversation(app_client, admin, user_a, user_b):
+    user_id_a, token_a = user_a
+    user_id_b, token_b = user_b
+    document_id = ingest_real_document(app_client, user_id_a, token_a, filename="private.pdf")
+    chunk_row = admin.table("chunks").select("id,document_id,element_type,page_number,content").eq("document_id", document_id).execute().data[0]
+    result = _ask_real_question(app_client, admin, user_id_a, token_a, document_id, chunk_row, "Private answer [1].")
+    conv_id = result["conversation_id"]
+
+    # A real, syntactically-valid but nonexistent conversation id.
+    nonexistent = app_client.post(
+        "/conversations/00000000-0000-0000-0000-000000000000/rename",
+        json={"title": "x"},
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+    assert nonexistent.status_code == 404
+
+    # User B attempting to rename user A's real conversation -- identical
+    # 404, no ownership oracle, matching every other owned-resource
+    # lookup in this API.
+    as_b = app_client.post(
+        f"/conversations/{conv_id}/rename", json={"title": "hijacked"}, headers={"Authorization": f"Bearer {token_b}"}
+    )
+    assert as_b.status_code == 404
+
+    # Confirm the title was genuinely untouched by the failed attempt.
+    still_owned = admin.table("conversations").select("title").eq("id", conv_id).execute().data[0]
+    assert still_owned["title"] != "hijacked"
+
+
+def test_delete_conversation_removes_it_and_cascades_messages_and_citations(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id = ingest_real_document(app_client, user_id, token, filename="doc.pdf")
+    chunk_row = admin.table("chunks").select("id,document_id,element_type,page_number,content").eq("document_id", document_id).execute().data[0]
+    result = _ask_real_question(app_client, admin, user_id, token, document_id, chunk_row, "Answer [1].")
+    conv_id = result["conversation_id"]
+    message_id = result["message_id"]
+
+    # Real rows exist before delete -- not asserting against an empty
+    # baseline.
+    assert admin.table("messages").select("id").eq("conversation_id", conv_id).execute().data
+    assert admin.table("citations").select("id").eq("message_id", message_id).execute().data
+
+    response = app_client.delete(f"/conversations/{conv_id}", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 204
+    assert response.content == b""
+
+    # The conversation row itself is gone.
+    assert admin.table("conversations").select("id").eq("id", conv_id).execute().data == []
+    # messages.conversation_id -> conversations(id) on delete cascade
+    # (SCHEMA.md) -- confirmed live, not assumed from reading the FK.
+    assert admin.table("messages").select("id").eq("conversation_id", conv_id).execute().data == []
+    # citations.message_id -> messages(id) on delete cascade -- the
+    # second hop of the same real cascade, confirmed independently.
+    assert admin.table("citations").select("id").eq("message_id", message_id).execute().data == []
+
+    # GET /conversations/{id}/messages on the now-deleted conversation is
+    # a clean 404, same as one that never existed.
+    after_delete = app_client.get(f"/conversations/{conv_id}/messages", headers={"Authorization": f"Bearer {token}"})
+    assert after_delete.status_code == 404
+
+
+def test_delete_conversation_returns_404_for_nonexistent_or_another_user_s_conversation(app_client, admin, user_a, user_b):
+    user_id_a, token_a = user_a
+    _, token_b = user_b
+    document_id = ingest_real_document(app_client, user_id_a, token_a, filename="private.pdf")
+    chunk_row = admin.table("chunks").select("id,document_id,element_type,page_number,content").eq("document_id", document_id).execute().data[0]
+    result = _ask_real_question(app_client, admin, user_id_a, token_a, document_id, chunk_row, "Private answer [1].")
+    conv_id = result["conversation_id"]
+
+    nonexistent = app_client.delete(
+        "/conversations/00000000-0000-0000-0000-000000000000", headers={"Authorization": f"Bearer {token_a}"}
+    )
+    assert nonexistent.status_code == 404
+
+    # User B attempting to delete user A's real conversation -- identical
+    # 404, and the conversation must genuinely survive the attempt (not
+    # just "the response said 404" while the row was silently removed
+    # anyway).
+    as_b = app_client.delete(f"/conversations/{conv_id}", headers={"Authorization": f"Bearer {token_b}"})
+    assert as_b.status_code == 404
+    assert admin.table("conversations").select("id").eq("id", conv_id).execute().data != []
+
+    still_works_for_owner = app_client.get(f"/conversations/{conv_id}/messages", headers={"Authorization": f"Bearer {token_a}"})
+    assert still_works_for_owner.status_code == 200
