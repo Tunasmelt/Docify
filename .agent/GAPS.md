@@ -221,3 +221,46 @@ answer text sent to the client with no matching citation object — should be ad
 `dropped_positions`/`_strip_dropped_markers` the same way an UNSUPPORTED verdict already is, so
 the visible answer never shows a dangling, unclickable marker. Not the data-loss bug reported
 here; logged for whoever picks it up next.
+
+## ACCEPTED, OPEN — email-change confirmation completes on a bare, unauthenticated link click; no full fix available at the platform layer
+
+**Found:** 2026-08-05, independent audit (`.agent/reviews/2026-08-05-settings-audit.md`, item 2),
+corrected and finalized same day (see `.agent/MEMORY.md`'s "Email-change confirmation" entry —
+an earlier version of this finding overstated it as a session-hijack vulnerability, based on a
+test client that didn't match the app's real PKCE configuration; that escalation is superseded).
+
+**The real, remaining gap:** anyone with read access to *either* the account's old or new email
+inbox — not both, despite `double_confirm_changes = true`'s name implying otherwise — can force
+a permanent email-address change on the account with a single anonymous HTTP request, no
+password, no session, no PKCE code-verifier needed for the swap itself (PKCE, which this app's
+real client already correctly uses, only protects session-TOKEN issuance at a separate exchange
+step — confirmed empirically, not assumed). This is real GoTrue server behavior for the
+`email_change` verification type, deliberately supporting cross-device confirmation (the same
+model signup/recovery/magic-link all share) — not a bug this project introduced.
+
+**Why it isn't fully fixed:** investigated three angles for a native lever before accepting
+this — (1) no `secure_email_change`-equivalent Supabase config flag exists (only
+`secure_password_change`, for a different flow); (2) this Supabase CLI version exposes exactly
+two Auth Hook points (`before_user_created`, `custom_access_token`), neither of which fires at
+email-change-confirmation time; (3) `verifyOtp()` (the alternate, code-based confirmation path)
+hits the same unauthenticated `/verify` endpoint with no session requirement built into the SDK
+call — architecturally the same trust model as the link, just POST instead of GET. A complete
+fix requires NOT using GoTrue's native email-change flow at all — a fully custom in-app OTP
+(generate our own code, require the user to be signed in AND manually enter it, only then call
+the admin API to perform the swap) — which was presented as an option and explicitly deferred in
+favor of the lighter mitigation below, given real new-surface cost (code storage/expiry, rate
+limiting, a new email template, UI, tests).
+
+**Mitigation shipped instead (2026-08-05):** `lib/supabase/profile.ts`'s `requestEmailChange`
+now requires the account's current password, verified via a real `signInWithPassword` call,
+before a change can even be INITIATED (`email-section.tsx` gates the submit button on it,
+`e2e/settings.e2e.ts` has a real test proving a wrong password blocks it and the account stays
+untouched). **This raises the bar on who can START a change — it does not and cannot close the
+gap in how a change gets CONFIRMED**, since the confirmation step happens independent of
+whatever gated the initiation.
+
+**Not addressed, deliberately deferred:** the full custom in-app OTP flow described above.
+Revisit if this app's threat model changes (e.g. handling genuinely sensitive data where an
+attacker gaining transient mailbox access to force an email swap — setting up a follow-on
+password-reset takeover — is judged unacceptable even as a two-step chain rather than a one-click
+exploit).
