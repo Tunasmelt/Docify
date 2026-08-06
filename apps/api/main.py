@@ -11,7 +11,7 @@ from slowapi.middleware import SlowAPIMiddleware
 
 from middleware.auth import JWTAuthMiddleware
 from rate_limit import limiter, rate_limit_exceeded_handler
-from routes import conversations, documents, health, ingest, query
+from routes import account, conversations, documents, export, health, ingest, query
 
 app = FastAPI(title="docify-api")
 
@@ -54,6 +54,19 @@ app.add_middleware(
     ).split(","),
     allow_methods=["*"],
     allow_headers=["*"],
+    # Settings batch 3 (export) — Content-Disposition is NOT one of the
+    # handful of "safe" response headers a browser exposes to JS on a
+    # cross-origin request by default (Cache-Control, Content-Language,
+    # Content-Length, Content-Type, Expires, Last-Modified, Pragma only —
+    # a real, standard fetch/CORS restriction, not specific to this app).
+    # lib/api/export.ts reads this header client-side to name the
+    # downloaded file after the real filename routes/export.py generated
+    # — without exposing it explicitly, `res.headers.get("content-
+    # disposition")` silently returns null and the download falls back
+    # to a generic name, confirmed live (the exact symptom that caught
+    # this: e2e/export.e2e.ts's real browser downloads came back named
+    # "docify-export.json" instead of the real timestamped filename).
+    expose_headers=["Content-Disposition"],
 )
 
 app.include_router(health.router)
@@ -61,3 +74,5 @@ app.include_router(ingest.router)
 app.include_router(documents.router)
 app.include_router(query.router)
 app.include_router(conversations.router)
+app.include_router(export.router)
+app.include_router(account.router)

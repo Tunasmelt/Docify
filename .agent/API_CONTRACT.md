@@ -201,9 +201,12 @@ Ask a question over one or more documents.
   "question": "What was Q3 revenue?",
   "document_ids": ["3f9e...", "8a2c..."],
   "conversation_id": "optional-existing-conv-id",
-  "k": 8
+  "k": 8,
+  "rerank": false
 }
 ```
+
+- **`rerank`** (added Settings batch 2, 2026-08-04) — optional, default `false`. Wires the retrieval layer's already-existing opt-in Voyage `rerank-2.5` reranking (`services/retriever.py`'s `Retriever.retrieve(rerank=...)`, shipped FEAT-009 follow-up but never reachable from a route until now) through to the request. **Real cost, not just a flag flip:** adds a measured ~380ms to retrieval latency (`.agent/MEMORY.md`'s 2026-07-27 decision — pushes `/query`'s worst-case total from ~8.3s to ~8.68s) via one additional real Voyage API call per request. Any client surfacing this as a user-facing toggle should default it off and disclose the latency cost, not present it as a free quality knob.
 
 **Response 200:**
 ```json
@@ -420,9 +423,195 @@ document's id.
 
 ---
 
+### `GET /export/conversations` (batch 3, 2026-08-06)
+Exports every conversation, message, and citation belonging to the
+authenticated user, in one file. **Scope is deliberate and stated
+explicitly: this covers conversational data only — source documents
+themselves are NOT included.** Documents are large binary files with
+their own existing lifecycle (upload, re-index, delete); a user who
+wants their originals back already has them, and what genuinely can't
+be reconstructed by the user is the conversation history and citation
+verification audit trail this endpoint exports. This replaces the
+`GET /conversations/{id}/export` stub previously listed under
+"Not-yet-defined endpoints" — that stub anticipated a narrower,
+single-conversation, Markdown-only shape; this implements a broader,
+whole-account, both-formats export instead, matching this feature's
+real purpose (giving a user confidence in their data before batch 3's
+account-deletion half makes losing it permanent).
+
+**Query params:**
+- `format` — `json` (default) or `markdown`. Any other value is a `422`
+  (FastAPI's own default validation-error shape, same as every other
+  `Query(...)`-validated param in this API, e.g. `GET /conversations`'s
+  `limit`).
+
+**Response 200:** the raw file body (not JSON-enveloped, even for
+`format=json` — the whole response body IS the export), with:
+- `Content-Type`: `application/json` or `text/markdown; charset=utf-8`
+- `Content-Disposition: attachment; filename="docify-export-<timestamp>.<ext>"`
+
+JSON shape:
+```json
+{
+  "exported_at": "2026-08-06T12:00:00.000000Z",
+  "conversation_count": 1,
+  "message_count": 2,
+  "citation_count": 1,
+  "conversations": [
+    {
+      "id": "6c1a...",
+      "title": "What are the termination clauses?",
+      "document_names": ["lease.pdf"],
+      "created_at": "2026-08-01T10:00:00Z",
+      "updated_at": "2026-08-01T10:00:05Z",
+      "messages": [
+        { "id": "...", "role": "user", "content": "What are the termination clauses?", "raw_content": null, "created_at": "...", "citations": [] },
+        {
+          "id": "...", "role": "assistant",
+          "content": "The lease can be terminated with 30 days notice [1].",
+          "raw_content": "The lease can be terminated with 30 days notice [1].",
+          "created_at": "...",
+          "citations": [
+            {
+              "marker": 1, "chunk_id": "...", "document_name": "lease.pdf",
+              "page_number": 4, "element_type": "text",
+              "claim_span": "terminated with 30 days notice",
+              "claim_start": null, "claim_end": null,
+              "verdict": "supported",
+              "supporting_quote": "either party may terminate with 30 days written notice",
+              "verifier_model": "gemini-3.5-flash-lite",
+              "verified_at": "2026-08-01T10:00:05Z"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+**Completeness — the load-bearing property of this endpoint:**
+`citations` is **unfiltered**, unlike every other citation-returning
+route in this API — `POST /query`, `POST /query/stream`, and
+`GET /conversations/{id}/messages` all drop `unsupported`-verdict
+citations before responding (they were never meant to be user-facing
+live). This endpoint deliberately includes them: an `unsupported`
+citation is still part of the user's real, persisted audit trail
+(`create_query_turn`'s own full-audit-trail behavior), and an export
+whose whole purpose is completeness before a possible account deletion
+must not silently reproduce that same filtering.
+
+Markdown shape: one file, one `##` section per conversation, in the
+app's own citation footnote motif (`components/chat/citation-marker.tsx`) —
+a message's text (using `raw_content`, not the UI-facing `content`, so
+every citation marker — including `unsupported` ones stripped from
+`content`, see `POST /query`'s `_strip_dropped_markers` — is still
+visible in context) followed by a `> **Sources**` block listing every
+citation with its real verdict, quote, and source location.
+
+**Behaviour:**
+- No pagination — every conversation, oldest first, in one response.
+  Deliberately unbounded (unlike `GET /conversations`'s keyset
+  pagination): an export exists to be complete, and this project's real
+  scale (portfolio/demo, not thousands of conversations per user —
+  `.agent/SCOPE.md`) doesn't justify the complexity of a paginated or
+  streamed export.
+- Synchronous — not an async job + download-when-ready pattern. Same
+  real-scale reasoning: a single user's full conversation history is a
+  handful of indexed queries, not a bulk/warehouse-scale operation.
+  Revisit only with real evidence this stops being fast enough.
+- **Not rate-limited** — read-only, makes zero calls to Voyage/Gemini or
+  any other paid vendor API, the same real-cost profile `GET /documents`
+  and `GET /conversations` (both already unrated-limited) already rest
+  on. Only `/ingest` and `/query`+`/query/stream` carry rate limits in
+  this API, specifically because those draw on real, metered vendor
+  quota.
+
+**Errors:**
+- `422 VALIDATION_ERROR` — invalid `format` value
+
+---
+
+### `DELETE /account` (batch 3, part 2, 2026-08-06)
+**Permanently and irreversibly deletes the authenticated user's entire
+account** — every document, chunk, conversation, message, and citation,
+every Storage object in `uploads`/`figures`/`avatars` for this user, and
+the `auth.users` row itself. HIGH-scrutiny feature, same standard as
+FEAT-007/008's original delete audits — see `routes/account.py`'s
+module docstring for the full enumeration (every `user_id`-scoped table
+and Storage bucket, confirmed by grepping every migration, not assumed)
+and ordering justification.
+
+**Request:** no body. Reauthentication (current password) is enforced
+**client-side**, before this is ever called — the exact same real
+`signInWithPassword()` check already required for email-change
+(`lib/supabase/profile.ts`'s `requestEmailChange`), reused here for
+consistency. This route has no more server-side way to verify "was this
+session recently reauthenticated" than email-change's own flow already
+does; it trusts the same JWT-scoped `user_id` every other route in this
+API already rests on.
+
+**Response 204** — no body.
+
+**Ordering (irreversible only at the very last step):**
+1. Remove every Storage object under `{user_id}/` in `uploads`,
+   `figures`, and `avatars`, in that fixed order — listed directly via
+   Storage's own `list()`, not reconstructed from DB rows, so a stray
+   object with no matching row still gets caught.
+2. **Only once all three buckets are confirmed clean:** delete the
+   `auth.users` row via the admin API. This cascades all 6 user-scoped
+   tables automatically (`documents`, `chunks`, `conversations`,
+   `messages`, `citations`, `usage_counters` — every one already has an
+   `on delete cascade` FK to `auth.users`, confirmed by grepping every
+   migration; no explicit per-table DELETE is needed or issued).
+
+Deleting the auth user first would be actively dangerous, not just out
+of order: every Storage RLS policy in this project checks
+`auth.uid()` against a *live* session — once the user is gone, no
+future request (a retry included) could ever re-authenticate as that
+user to finish an interrupted cleanup, permanently orphaning whatever
+Storage objects were left.
+
+**Partial-failure end state:** Storage cleanup fails fast on the first
+bucket that errors; later buckets in the fixed order are never
+attempted. Nothing about this is "half deleted" in the DB sense — the
+`auth.users` row (and therefore all 6 cascading tables) is only ever
+touched after every bucket succeeds, so a failure anywhere in Storage
+leaves the account fully intact and safe to retry. An already-empty
+bucket prefix on retry is a harmless no-op (Storage's `remove()` on a
+nonexistent object doesn't itself error — the same fact
+`DELETE /documents/{id}` already established).
+
+**Stale sessions after deletion:** `middleware/auth.py` does pure
+cryptographic JWT verification with no live session/DB lookup, so an
+already-issued, not-yet-expired access token remains valid until its
+own natural expiry — every request through it still runs its normal
+`user_id`-scoped query, which now simply matches nothing (a clean,
+empty response, e.g. `GET /conversations` returns `{"conversations":
+[], "next_cursor": null}`, never a crash or a leak). The refresh path is
+closed immediately: `auth.admin.delete_user()` invalidates the user's
+sessions/refresh tokens as part of removing the row, confirmed live —
+so nothing can ever renew past the already-issued token's own expiry.
+This is a pre-existing, general property of this app's stateless-JWT
+auth design (true for every route), not a gap account deletion
+introduces or could itself close.
+
+**Not rate-limited** — same reasoning as `GET /export/conversations`:
+read/delete-only against this user's own already-stored rows and
+Storage objects, zero Voyage/Gemini calls.
+
+**Errors:**
+- `401 UNAUTHORIZED` — missing/invalid JWT (standard middleware behavior)
+- `500 STORAGE_ERROR` — a bucket's Storage removal failed; nothing was
+  deleted, retrying is safe
+- `500 DELETE_FAILED` — the final `auth.admin.delete_user()` call
+  failed after Storage was already cleaned; DB rows are NOT yet
+  deleted (the cascade never ran), retrying is safe
+
+---
+
 ## Not-yet-defined endpoints (Phase 4+)
 
-- `GET /conversations/{id}/export` — markdown export
 - `PATCH /documents/{id}` — rename
 
 ---

@@ -26,6 +26,17 @@ export interface AskResult {
   metadata: QueryMetadata;
 }
 
+/** Settings batch 2 — QueryRequest.k/rerank (apps/api/models/query.py)
+ * are already real, independently-optional request parameters; this is
+ * just the client-side shape for passing a caller's chosen values
+ * through. Omitting either lets the backend's own defaults apply
+ * (k=8, rerank=false) — a caller passing nothing gets byte-identical
+ * behavior to before this option existed. */
+export interface QueryOptions {
+  k?: number;
+  rerank?: boolean;
+}
+
 /** POST /query — real retrieve -> generate -> verify round trip
  * (API_CONTRACT.md). `conversationId` omitted starts a new conversation;
  * the real one the backend created comes back on `AskResult.conversationId`
@@ -33,7 +44,8 @@ export interface AskResult {
 export async function askQuestion(
   question: string,
   documentIds: string[],
-  conversationId: string | null
+  conversationId: string | null,
+  options?: QueryOptions
 ): Promise<AskResult> {
   const res = await apiFetch<QueryApiResponse>("/query", {
     method: "POST",
@@ -42,6 +54,8 @@ export async function askQuestion(
       question,
       document_ids: documentIds,
       conversation_id: conversationId ?? undefined,
+      k: options?.k,
+      rerank: options?.rerank,
     }),
   });
 
@@ -117,7 +131,8 @@ export async function askQuestionStream(
   documentIds: string[],
   conversationId: string | null,
   handlers: QueryStreamHandlers,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  options?: QueryOptions
 ): Promise<void> {
   const token = await getAccessToken();
   let res: Response;
@@ -129,6 +144,8 @@ export async function askQuestionStream(
         question,
         document_ids: documentIds,
         conversation_id: conversationId ?? undefined,
+        k: options?.k,
+        rerank: options?.rerank,
       }),
       signal,
     });

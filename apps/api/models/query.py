@@ -6,6 +6,16 @@ class QueryRequest(BaseModel):
     document_ids: list[str]
     conversation_id: str | None = None
     k: int = Field(8, ge=1, le=50)
+    # Settings batch 2 (user preferences) — wires the caller-toggle
+    # Retriever.retrieve() already accepted (services/retriever.py,
+    # FEAT-009's opt-in rerank follow-up) into the actual request
+    # surface for the first time; nothing passed this through before.
+    # Defaults to False, matching the retrieval layer's own default and
+    # this project's already-recorded decision (.agent/MEMORY.md,
+    # 2026-07-27) to keep reranking opt-in given its real measured cost
+    # (~380ms added Voyage rerank-2.5 call) — a client sending nothing
+    # gets byte-identical behavior to before this field existed.
+    rerank: bool = False
 
 
 class CitationResponse(BaseModel):

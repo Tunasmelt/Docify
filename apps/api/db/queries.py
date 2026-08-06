@@ -522,3 +522,104 @@ def list_citations_for_messages(client, *, message_ids: list[str], user_id: str)
     for row in rows:
         grouped.setdefault(row["message_id"], []).append(row)
     return grouped
+
+
+# Settings batch 3, part 1: GET /export/conversations (routes/export.py).
+# Deliberately a SEPARATE set of queries from the ones above, not a
+# reuse of list_conversations()/list_messages_for_conversation()/
+# list_citations_for_messages() with different args bolted on — those
+# three are each shaped for a single bounded view (one page, one
+# conversation, one batch of message ids) and one of them
+# (list_citations_for_messages) actively filters 'unsupported' verdicts
+# to match what a live chat turn ever showed. An export's job is the
+# opposite: everything this user has, unfiltered, in one pass — reusing
+# the live-view queries and trying to bolt a "no really, ALL of it"
+# flag onto them would leave the underlying filtering assumption sitting
+# right next to code that must never apply it, an easy place for a
+# future edit to silently reintroduce it. Separate functions make the
+# completeness guarantee the export route depends on impossible to
+# accidentally weaken by editing the wrong shared function.
+
+
+def list_all_conversations_for_export(client, *, user_id: str) -> list[dict]:
+    """Every conversation belonging to user_id, oldest first — no
+    pagination, unlike list_conversations() (GET /conversations' own
+    keyset-paginated listing). An export exists specifically to be
+    complete; a page-limited fetch here would silently truncate past
+    whatever page size was chosen, exactly the failure mode this
+    feature exists to prevent. Unbounded is an accepted, stated choice
+    at this project's real portfolio/demo scale (.agent/SCOPE.md) — not
+    something to revisit without real evidence usage has grown past it."""
+    return (
+        client.table("conversations")
+        .select("id,title,document_ids,created_at,updated_at")
+        .eq("user_id", user_id)
+        .order("created_at")
+        .execute()
+        .data
+    )
+
+
+def list_all_messages_for_user(client, *, user_id: str) -> list[dict]:
+    """Every message across every one of user_id's conversations, in one
+    query — avoids an N+1 fetch per conversation. Includes raw_content
+    (list_messages_for_conversation(), the live-view query, never
+    needed it): routes/export.py's Markdown rendering deliberately uses
+    raw_content instead of the UI-facing content for assistant messages
+    — see that module for why."""
+    return (
+        client.table("messages")
+        .select("id,conversation_id,role,content,raw_content,created_at")
+        .eq("user_id", user_id)
+        .order("conversation_id")
+        .order("created_at")
+        .execute()
+        .data
+    )
+
+
+EXPORT_CITATION_COLUMNS = (
+    "id,message_id,marker,claim_span,claim_start,claim_end,verdict,supporting_quote,"
+    "verifier_model,verified_at,chunk_id,"
+    "chunks(document_id,page_number,element_type,documents(filename))"
+)
+
+
+def list_all_citations_for_export(client, *, user_id: str) -> list[dict]:
+    """Every citation belonging to user_id — deliberately UNFILTERED,
+    including 'unsupported' verdicts that list_citations_for_messages()
+    (the live-view query) drops to match what a chat turn's own
+    response ever showed on screen. A citation the app silently
+    dropped from the visible answer is still part of this user's real,
+    persisted audit trail (create_query_turn's own "full audit trail —
+    /query itself filters" comment) and belongs in their export: this
+    feature exists to give a user real confidence in what's about to be
+    exported/deleted, and a completeness guarantee that quietly
+    excludes some of their own citations would undermine exactly that."""
+    return (
+        client.table("citations")
+        .select(EXPORT_CITATION_COLUMNS)
+        .eq("user_id", user_id)
+        .order("marker")
+        .execute()
+        .data
+    )
+
+
+def get_document_filenames(client, *, document_ids: list[str], user_id: str) -> dict[str, str]:
+    """id -> filename map, scoped to user_id. Used only to LABEL a
+    conversation's document_ids / a citation's source with a real,
+    readable name — never to include document CONTENT, which is
+    explicitly out of scope for this export (routes/export.py's module
+    docstring has the full reasoning)."""
+    if not document_ids:
+        return {}
+    rows = (
+        client.table("documents")
+        .select("id,filename")
+        .in_("id", document_ids)
+        .eq("user_id", user_id)
+        .execute()
+        .data
+    )
+    return {row["id"]: row["filename"] for row in rows}
