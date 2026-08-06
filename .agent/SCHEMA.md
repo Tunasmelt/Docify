@@ -163,6 +163,29 @@ create index citations_chunk_idx   on citations(chunk_id);
 create index citations_user_idx    on citations(user_id);
 ```
 
+### `usage_counters`
+Postgres-backed daily rate-limit bookkeeping (FEAT-024 follow-up,
+`migrations/20260802_001_usage_counters.sql`) — added 2026-08-02 but
+missing from this doc until the settings batch 3 account-deletion audit
+(2026-08-06) found the gap by grepping migrations directly rather than
+trusting this file. One row per `(user_id, route, day)`. No RLS
+policies — RLS is enabled with zero policies defined, so only
+`service_role` (`BYPASSRLS`) can ever touch it; not user-facing, never
+queried by any client-facing route.
+
+```sql
+create table usage_counters (
+  user_id  uuid not null references auth.users(id) on delete cascade,
+  route    text not null,
+  day      date not null,
+  count    int not null default 0,
+  primary key (user_id, route, day)
+);
+```
+No separate `user_id` index — the composite primary key `(user_id,
+route, day)` already covers every real lookup this table serves
+(`increment_usage_counter`'s own atomic upsert-by-exact-key).
+
 ---
 
 ## Row-Level Security policies
@@ -209,11 +232,19 @@ create policy citations_select on citations for select using (auth.uid() = user_
 
 ## Supabase Storage buckets & policies
 
-Two buckets, both private, both RLS-scoped to `user_id` in the path.
+Three buckets, all path-scoped `{user_id}/...`. `uploads`/`figures` are
+private, RLS-scoped to `user_id` on SELECT too; `avatars` (added
+2026-08-04, missing from this doc until the 2026-08-06 account-deletion
+audit found the gap) is deliberately public-read — see
+`migrations/20260804_001_avatars_bucket.sql`'s own comment for the full
+reasoning (an avatar is categorically lower-sensitivity than real
+document content, and public-read avoids needing a signed-URL refresh
+mechanism everywhere identity renders).
 
 ```
 uploads/{user_id}/{document_uuid}.pdf       -- original uploaded PDFs
 figures/{user_id}/{document_id}/{fig}.png   -- cropped figure images from parsing
+avatars/{user_id}/avatar                    -- profile picture, one fixed object per user
 ```
 
 Storage policies (Supabase Dashboard or SQL):
@@ -230,7 +261,31 @@ create policy uploads_delete on storage.objects for delete
 -- figures bucket — read-only from user; writes are service-role only
 create policy figures_select on storage.objects for select
   using (bucket_id = 'figures' and (storage.foldername(name))[1] = auth.uid()::text);
+
+-- avatars bucket — write (insert/update/delete) scoped to owner; SELECT
+-- is open to any bucket_id='avatars' row with no owner check (content
+-- is already public via the bucket's own public flag, so this reveals
+-- nothing additional — found necessary by real testing, not assumed:
+-- upload(..., upsert:true)'s own conflict-resolution needs to SELECT
+-- the existing row, which a zero-policy SELECT would block even though
+-- INSERT/UPDATE were each individually correct).
+create policy avatars_insert on storage.objects for insert
+  with check (bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text);
+create policy avatars_update on storage.objects for update
+  using (bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text);
+create policy avatars_delete on storage.objects for delete
+  using (bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text);
+create policy avatars_select on storage.objects for select
+  using (bucket_id = 'avatars');
 ```
+
+**None of these three buckets cascade on `auth.users` deletion** —
+`storage.objects` has no real foreign key to `auth.users` (it's
+Supabase Storage's own extension schema); `DELETE /account`
+(`routes/account.py`, settings batch 3) removes every object under
+each bucket's `{user_id}/` prefix explicitly, the same requirement
+`DELETE /documents/{id}` already established for `uploads`/`figures`
+per-document.
 
 ---
 
@@ -268,3 +323,6 @@ create policy figures_select on storage.objects for select
 |---|---|---|
 | 2026-07-22 | `apps/api/migrations/20260722_001_initial.sql` | Initial schema — everything in this document (extensions, enums, 5 tables, indexes incl. HNSW on `chunks.embedding`, RLS policies, `uploads`/`figures` storage buckets + policies). Applied manually via Supabase dashboard SQL editor against the live project; verified clean with `apps/api/migrations/verify_20260722_001.sql` (all checks `OK`). Applied via the dashboard SQL editor rather than `supabase db push`, so it's not recorded in Supabase's own CLI-tracked migration history (confirmed via `supabase migration list` returning empty for this project) — that's expected, not a gap. |
 | 2026-07-22 | `apps/api/migrations/20260722_002_grant_table_privileges.sql` | **Fixes a real gap found only by live-testing enforcement, not by reading the SQL.** `001_initial.sql` created all 5 tables with RLS policies but never granted the underlying table-level privileges (`SELECT`/`INSERT`/`UPDATE`/`DELETE`) to `anon`/`authenticated`/`service_role` — Postgres requires both a GRANT and a matching RLS policy; RLS alone doesn't unlock a table a role has no base privilege on. This blocked *everything*, including `service_role` (which has `BYPASSRLS` — irrelevant here, since GRANT and RLS bypass are independent layers). Confirmed the live project has the identical gap (nothing has ever written to these tables there). Grants added mirror the existing policies exactly: `authenticated` gets only the operations a policy exists for (full CRUD on `documents`/`conversations`, `SELECT`-only on `chunks`/`messages`/`citations`); `service_role` gets full CRUD everywhere; `anon` gets nothing. Applied and verified locally via `supabase start`; **not yet applied to the live project** — needs the same dashboard-SQL-editor treatment as `001`. |
+| 2026-08-02 | `apps/api/migrations/20260802_001_usage_counters.sql` | Adds `usage_counters` (Postgres-backed daily rate-limit bookkeeping, FEAT-024 follow-up — see this doc's own `usage_counters` section for the full table and RLS reasoning). **This table + migration existed since 2026-08-02 but was missing from this log and from the `### usage_counters` schema section entirely until the 2026-08-06 settings-batch-3 account-deletion audit found the gap by grepping every migration for `user_id`/`storage.buckets` directly rather than trusting this document** — the audit's own explicit mandate ("grep, don't rely on memory of what existed"). Backfilled here rather than left stale. |
+| 2026-08-04 | `apps/api/migrations/20260804_001_avatars_bucket.sql` | Adds the `avatars` Storage bucket (public-read, RLS-scoped writes — see this doc's own Storage buckets section for the full policy set and reasoning). Same gap as the row above: existed since 2026-08-04, missing from this log until the 2026-08-06 account-deletion audit's enumeration pass found it. Backfilled here rather than left stale. |
+| 2026-08-06 | *(no new migration — settings batch 3, part 2: account deletion, `apps/api/routes/account.py`)* | `DELETE /account` needed no schema change at all: every one of the 6 user-scoped tables already cascades on `auth.users` deletion via its existing `on delete cascade` FK (confirmed by grepping every migration, not assumed), so deleting the auth user is sufficient by itself for the DB side. Storage cleanup (the one part that genuinely needs code, not schema) is explicit application-level removal across all 3 user-scoped buckets, reusing `DELETE /documents/{id}`'s already-proven Storage-before-DB-row pattern. Listed here as a real, deliberate "no migration needed" entry rather than a silent omission — the enumeration itself (this row's whole justification) is the correctness-critical artifact for this feature, not any SQL. |
