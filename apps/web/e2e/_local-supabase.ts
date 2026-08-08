@@ -8,6 +8,10 @@ export const LOCAL_SUPABASE_SERVICE_ROLE_KEY =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." +
   "eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0." +
   "EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU";
+export const LOCAL_SUPABASE_ANON_KEY =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." +
+  "eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9." +
+  "CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0";
 
 export async function deleteTestUserByEmail(email: string): Promise<void> {
   const listRes = await fetch(
@@ -30,6 +34,23 @@ export async function deleteTestUserByEmail(email: string): Promise<void> {
       },
     });
   }
+}
+
+/** Real password-grant login against the local stack, outside the
+ * browser — used when a test needs a real bearer token for a direct
+ * REST call (e.g. a Storage RLS boundary check) rather than driving the
+ * UI. Real GoTrue token exchange, not a fabricated JWT. */
+export async function getAccessToken(email: string, password: string): Promise<string> {
+  const res = await fetch(`${LOCAL_SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+    method: "POST",
+    headers: { apikey: LOCAL_SUPABASE_ANON_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!res.ok) {
+    throw new Error(`getAccessToken failed: ${res.status} ${await res.text()}`);
+  }
+  const { access_token } = (await res.json()) as { access_token: string };
+  return access_token;
 }
 
 export async function createTestUser(
