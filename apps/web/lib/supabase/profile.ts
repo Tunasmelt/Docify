@@ -132,3 +132,47 @@ export async function signOutOtherSessions(): Promise<void> {
   const { error } = await supabase.auth.signOut({ scope: "others" });
   if (error) throw new ProfileError(error.message);
 }
+
+/** Settings batch 3, part 2 — permanent account deletion. Reauthentication
+ * is the SAME real signInWithPassword() check as requestEmailChange
+ * above, reused deliberately (item 3 of the task this was built from):
+ * a destructive, irreversible action deserves at least the same bar as
+ * a metadata change, not less. This function's own job stops at
+ * confirming the password and calling the backend — components/settings/
+ * delete-account-dialog.tsx additionally requires typing the account's
+ * real email before this is ever even invoked (pure UI friction against
+ * misclicks, not a security boundary; the security boundary is the
+ * password check here).
+ *
+ * The actual deletion (Storage across all three user-scoped buckets,
+ * then the auth.users row itself, which cascades every user-scoped
+ * table — routes/account.py has the full ordering/enumeration writeup)
+ * happens server-side via the service-role client, which this browser
+ * session never has access to — this function only ever calls the
+ * backend's DELETE /account with this user's own bearer token, the
+ * same trust boundary every other authenticated route in this API
+ * already rests on. */
+export async function deleteAccount(currentEmail: string, currentPassword: string): Promise<void> {
+  if (!currentPassword) throw new ProfileError("Enter your current password to confirm this.");
+
+  const supabase = createClient();
+  const { error: reauthError } = await supabase.auth.signInWithPassword({
+    email: currentEmail,
+    password: currentPassword,
+  });
+  if (reauthError) throw new ProfileError("Current password is incorrect.");
+
+  const { data } = await supabase.auth.getSession();
+  const token = data.session?.access_token;
+  if (!token) throw new ProfileError("Your session expired — sign in again and retry.");
+
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL!;
+  const res = await fetch(`${apiUrl}/account`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new ProfileError(body?.error?.message ?? "Couldn't delete your account. Try again.");
+  }
+}
