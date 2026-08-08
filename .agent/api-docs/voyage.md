@@ -68,3 +68,40 @@ All other `voyageai.error.VoyageError` subtypes (`AuthenticationError`, `Invalid
 - [Text Embeddings](https://docs.voyageai.com/docs/embeddings)
 - [Multimodal Embeddings API reference](https://docs.voyageai.com/reference/multimodal-embeddings-api)
 - Installed SDK source (`apps/api/.venv/Lib/site-packages/voyageai/`, version pinned in `apps/api/pyproject.toml`) — authoritative for request/response shape, retry behavior, and the (non-)existence of a client-side batch cap, since these weren't fully covered by the fetched docs pages.
+
+---
+
+## Reranking (verified 2026-07-27, FEAT-009 rerank follow-up — live call + installed SDK source, not assumed)
+
+**Docs:** https://docs.voyageai.com/docs/reranker
+
+**Model:** `rerank-2.5` — the current/latest reranker (also `rerank-2.5-lite`, cheaper/faster; older `rerank-2`, `rerank-2-lite`, `rerank-1`, `rerank-lite-1` still exist but are not what a new integration should pick). No default in the SDK — `model` is a required, non-optional parameter of `Client.rerank()` (confirmed via `inspect.signature`), unlike `multimodal_embed()` which at least has a documented convention; there is no "just omit it and get something sane" fallback here.
+
+**Limits (rerank-2.5):**
+| Limit | Value |
+|---|---|
+| Max documents per call | **1,000** |
+| Max query tokens | 8,000 |
+| Max (query + one document) tokens | 32,000 |
+| Max total tokens across all documents in one call | 600,000 |
+
+All comfortably above this project's usage — reranking is only ever called on RRF's already-small candidate pool (`RERANK_POOL_SIZE = 20` in `retriever.py`), not the full corpus.
+
+**Request (`Client.rerank(query, documents, model, top_k=None, truncation=True)`):** `documents` is a plain `list[str]` (this project passes each candidate chunk's `content` field — text only; Voyage's reranker, unlike the multimodal embedder, is text-only, no image segments). `top_k` is optional — if set, the SDK/API does the top-k selection itself and returns only that many results, already sorted; `retriever.py` passes the real final `k` directly rather than fetching all 20 and slicing client-side.
+
+**Response (`RerankingObject`, verified via SDK source `voyageai/object/reranking.py`):**
+- `.results: list[RerankingResult]`, each with `.index` (position in the original `documents` list you sent — **not** a new/reranked position), `.document` (the original string, round-tripped), `.relevance_score` (float, higher = more relevant). **`.results` is already sorted by `relevance_score` descending** — confirmed via a real live call (three sample documents, most/least relevant to a test query, came back in relevance order, not input order).
+- `.total_tokens: int` — usage accounting for the call.
+
+**Real live verification (`rerank-2.5`, demo query against 3 short documents):**
+```
+query="What is the capital of France?"
+documents=["Paris is the capital of France.", "Berlin is the capital of Germany.", "The Eiffel Tower is in Paris."]
+→ results: [(index=0, score=0.887, "Paris is the capital..."), (index=2, score=0.605, "The Eiffel Tower..."), (index=1, score=0.355, "Berlin...")]
+total_tokens=32
+```
+Confirms: correct relevance ordering, `index` maps back to input position (not `documents` in sorted order), scores are a real bounded relevance signal (not just a re-ranking of an opaque score), and the call succeeds with the same `VOYAGE_API_KEY`/`voyageai.Client` already used for embeddings — no separate credential.
+
+**Error handling:** `Client.rerank()` shares the same `voyageai.error.VoyageError` hierarchy and the same SDK-internal `max_retries` retry wrapper (`RateLimitError`/`ServiceUnavailableError`/`Timeout` retried automatically; everything else raises immediately) documented above for `multimodal_embed()` — nothing reranking-specific here. `services/retriever.py`'s `Reranker` treats every failure mode identically (log + return `None`, caller falls back to RRF's own ranking) rather than distinguishing retryable/non-retryable the way `embedder.py` does, since there's no "retry ourselves" path for a query-time call on the request-serving hot path — a slow retried failure would just make the user wait longer for the same fallback.
+
+**Pricing/free-tier:** not covered by the fetched docs page — this project's existing Voyage account (no payment method, 3 RPM cap observed empirically on embeddings in FEAT-009's real quality test, `.agent/MEMORY.md`) is assumed to apply the same or a similar cap to reranking; not separately confirmed since rate-limit-hitting reranking wasn't observed during this feature's real testing.
