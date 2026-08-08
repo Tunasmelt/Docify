@@ -16,9 +16,11 @@ import { DocumentScopeChips } from "@/components/chat/document-scope-chips";
 import { RenameConversationDialog } from "@/components/conversations/rename-conversation-dialog";
 import { DeleteConversationDialog } from "@/components/conversations/delete-conversation-dialog";
 import { useChatShortcuts } from "@/hooks/use-chat-shortcuts";
+import { useCurrentUser } from "@/hooks/use-current-user";
+import { usePreferences } from "@/hooks/use-preferences";
 import type { ChatMessage, Citation } from "@/lib/types/chat";
 import { createClient } from "@/lib/supabase/browser";
-import { askQuestionStream } from "@/lib/api/query";
+import { askQuestion, askQuestionStream } from "@/lib/api/query";
 import { buildAssistantMessage } from "@/lib/chat/parse-message";
 import {
   getConversationMessages,
@@ -36,7 +38,7 @@ import { ApiError } from "@/lib/api/client";
 // across browsers, not a real reading-distance threshold.
 const NEAR_BOTTOM_THRESHOLD_PX = 96;
 
-const USER = { initials: "AK", name: "Ana Kovač", email: "ana@firm.com" };
+const EMPTY_USER = { initials: "", name: "", email: "" };
 
 function truncateTitle(text: string): string {
   return text.length > 60 ? `${text.slice(0, 60)}…` : text;
@@ -44,6 +46,8 @@ function truncateTitle(text: string): string {
 
 export default function ChatPage({ params }: { params: { conversation_id: string } }) {
   const router = useRouter();
+  const currentUser = useCurrentUser();
+  const [preferences] = usePreferences();
   const searchParams = useSearchParams();
   const supabase = React.useMemo(() => createClient(), []);
 
@@ -239,6 +243,39 @@ export default function ChatPage({ params }: { params: { conversation_id: string
     const controller = new AbortController();
     abortControllerRef.current = controller;
 
+    // Settings batch 2 — streaming preference. Non-streaming reuses the
+    // exact same "retrieving" loading UI (LoadingStages) by setting the
+    // identical state a real retrieving SSE event would; it just never
+    // gets a token/verifying transition since askQuestion() only
+    // resolves once, with the complete, already-verified answer. Known,
+    // deliberate simplification: Stop generation (batch 2, part 1)
+    // targets the streaming fetch's AbortSignal specifically — this
+    // path doesn't wire cancellation, since a plain POST /query round
+    // trip has no partial state to abandon mid-flight the way an open
+    // SSE connection does, and streaming stays the default.
+    if (!preferences.streaming) {
+      try {
+        const result = await askQuestion(question, documentIds, conversationId, {
+          k: preferences.defaultK,
+          rerank: preferences.rerank,
+        });
+        setMessages((prev) => [...prev, result.assistantMessage]);
+        if (!title) setTitle(truncateTitle(question));
+        if (result.conversationId && !conversationId) {
+          setConversationId(result.conversationId);
+          router.replace(`/chat/${result.conversationId}`);
+        }
+      } catch (err) {
+        setMessages((prev) => prev.filter((m) => m.id !== userMessageId));
+        setAskError(err instanceof ApiError ? err.message : "Something went wrong asking that question. Try again.");
+      } finally {
+        setStreamingId(null);
+        setStreamingStage(null);
+        abortControllerRef.current = null;
+      }
+      return;
+    }
+
     try {
       await askQuestionStream(question, documentIds, conversationId, {
         onRetrieving: () => setStreamingStage("retrieving"),
@@ -287,7 +324,7 @@ export default function ChatPage({ params }: { params: { conversation_id: string
           // an unindicated partial answer.
           setAskError(message);
         },
-      }, controller.signal);
+      }, controller.signal, { k: preferences.defaultK, rerank: preferences.rerank });
     } catch (err) {
       // Failed before any streaming began at all (network error opening
       // the connection, or a non-2xx validation/ownership/auth response)
@@ -459,7 +496,7 @@ export default function ChatPage({ params }: { params: { conversation_id: string
     <div className="grid h-screen grid-cols-1 grid-rows-[minmax(0,1fr)] overflow-hidden bg-bg text-ink md:grid-cols-[248px_1fr]">
       <Sidebar
         librarySection={librarySection}
-        user={USER}
+        user={currentUser ?? EMPTY_USER}
         mobileOpen={mobileMenuOpen}
         onMobileClose={() => setMobileMenuOpen(false)}
         onSignOut={handleSignOut}

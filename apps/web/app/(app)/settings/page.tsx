@@ -11,6 +11,8 @@ import { EmailSection } from "@/components/settings/email-section";
 import { SecuritySection } from "@/components/settings/security-section";
 import { AppearanceSection } from "@/components/settings/appearance-section";
 import { PreferencesSection } from "@/components/settings/preferences-section";
+import { ExportSection } from "@/components/settings/export-section";
+import { DangerZoneSection } from "@/components/settings/danger-zone-section";
 import { createClient } from "@/lib/supabase/browser";
 import { useCurrentUser } from "@/hooks/use-current-user";
 
@@ -59,6 +61,8 @@ export default function SettingsPage() {
                 <SecuritySection />
                 <AppearanceSection />
                 <PreferencesSection />
+                <ExportSection />
+                <DangerZoneSection accountEmail={currentUser.email} />
               </>
             ) : (
               <div className="flex flex-col gap-6">

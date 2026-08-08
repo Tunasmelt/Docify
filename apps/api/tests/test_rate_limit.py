@@ -290,7 +290,7 @@ def test_query_stream_rate_limited_returns_clean_429_not_a_stream(app_client, ad
         assert parsed["error"]["code"] == "RATE_LIMITED"
 
 
-# Acceptance criterion: documents/conversations routes are explicitly NOT rate-limited (SCOPE.md scopes this to /ingest + /query only)
+# Acceptance criterion: documents/conversations/export routes are explicitly NOT rate-limited (SCOPE.md scopes this to /ingest + /query only)
 def test_documents_and_conversations_routes_are_not_rate_limited(app_client, admin, user_a):
     user_id, token = user_a
     # Comfortably more calls than either /ingest's or /query's real
@@ -303,6 +303,13 @@ def test_documents_and_conversations_routes_are_not_rate_limited(app_client, adm
     for _ in range(calls):
         resp = app_client.get("/conversations", headers={"Authorization": f"Bearer {token}"})
         assert resp.status_code == 200, f"conversations route was unexpectedly rate-limited: {resp.status_code} {resp.text}"
+    # Settings batch 3, part 1 (export): read-only, no Voyage/Gemini calls
+    # -- same real-cost profile as documents/conversations above, not a
+    # different one (routes/export.py's own module comment). Proven the
+    # same way, not just asserted by the absence of a decorator.
+    for _ in range(calls):
+        resp = app_client.get("/export/conversations", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200, f"export route was unexpectedly rate-limited: {resp.status_code} {resp.text}"
 
 
 # --- Part 2 (2026-08-02 FEAT-024 follow-up): Postgres-backed daily counters ---

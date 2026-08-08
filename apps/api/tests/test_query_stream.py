@@ -209,6 +209,38 @@ def test_stream_full_event_sequence_and_supported_citation_kept(app_client, admi
     assert done["metadata"]["retrieved_count"] == 1
 
 
+# Settings batch 2 — same rerank wiring proof as test_query.py's
+# equivalent test, mirrored for the streaming path (this project's own
+# discipline: streaming must never silently diverge from the
+# non-streaming request contract).
+def test_stream_rerank_field_reaches_retriever_retrieve(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id = _ingest_doc_with_content(app_client, admin, user_id, token, "doc.pdf", "content")
+    chunk_row = _real_chunk_row(admin, document_id)
+
+    fake_retriever = FakeRetriever([_retrieved_chunk(document_id, chunk_row)])
+    final = GenerateStreamResult(
+        answer="n/a", cited_indices=[], hallucinated_markers=[],
+        model="m", input_tokens=0, output_tokens=0, latency_ms=0,
+    )
+    _override(
+        retriever=fake_retriever,
+        generator=FakeStreamingGenerator([], final),
+        verifier=type("V", (), {"verify_batch": staticmethod(lambda pairs: [])})(),
+    )
+
+    with app_client.stream(
+        "POST", "/query/stream",
+        json={"question": "q", "document_ids": [document_id], "rerank": True},
+        headers={"Authorization": f"Bearer {token}"},
+    ) as response:
+        assert response.status_code == 200
+        _parse_sse(response)
+
+    assert len(fake_retriever.calls) == 1
+    assert fake_retriever.calls[0]["rerank"] is True
+
+
 # Acceptance: unsupported citations dropped from citations-resolved,
 # marker stripped from the resolved answer text — same rule as
 # test_query.py's test_unsupported_citations_are_dropped_from_response_markers_stri.
@@ -485,7 +517,7 @@ class _SlowFakeRetriever:
         self._delay_s = delay_s
         self.calls = []
 
-    def retrieve(self, question, document_ids, user_id, k=8):
+    def retrieve(self, question, document_ids, user_id, k=8, rerank=False):
         self.calls.append({"question": question})
         time.sleep(self._delay_s)
         return self._chunks
@@ -604,7 +636,7 @@ class _RecordingSlowRetriever:
         self._delay_s = delay_s
         self.call_count = 0
 
-    def retrieve(self, question, document_ids, user_id, k=8):
+    def retrieve(self, question, document_ids, user_id, k=8, rerank=False):
         self.call_count += 1
         time.sleep(self._delay_s)
         return self._chunks

@@ -36,13 +36,18 @@ function SettingsIcon() {
 const NAV_ITEMS = [
   { href: "/documents", label: "Documents", icon: DocumentsIcon },
   { href: "/chat", label: "Conversations", icon: ConversationsIcon },
-  { href: "#", label: "Settings", icon: SettingsIcon },
+  // Was a "#" placeholder (ARCHITECTURE.md's original module map listed
+  // settings/ as a Phase 4 stub) — real now.
+  { href: "/settings", label: "Settings", icon: SettingsIcon },
 ] as const;
 
 export interface SidebarUser {
   initials: string;
   name: string;
   email: string;
+  /** Settings, batch 1 item 2 — public URL from the avatars bucket.
+   * Renders in place of the initials circle when present. */
+  avatarUrl?: string;
 }
 
 export interface SidebarProps {
@@ -94,7 +99,7 @@ export function Sidebar({ librarySection, user, mobileOpen, onMobileClose, onSig
         </div>
         <nav className="flex flex-col gap-0.5 px-3">
           {NAV_ITEMS.map((item) => {
-            const isActive = item.href !== "#" && pathname?.startsWith(item.href);
+            const isActive = pathname?.startsWith(item.href);
             const Icon = item.icon;
             return (
               <Link
@@ -116,9 +121,21 @@ export function Sidebar({ librarySection, user, mobileOpen, onMobileClose, onSig
         </nav>
         {librarySection}
         <div className="mt-auto flex items-center gap-2.5 border-t border-line px-4 py-3.5">
-          <div className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-full bg-accent text-[12px] font-semibold text-on-accent">
-            {user.initials}
-          </div>
+          {user.avatarUrl ? (
+            // eslint-disable-next-line @next/next/no-img-element -- a
+            // plain public Storage URL (avatars bucket is public-read,
+            // see migrations/…_avatars.sql), no signed-URL expiry to
+            // fight with next/image's remote-pattern caching over.
+            <img
+              src={user.avatarUrl}
+              alt=""
+              className="h-[30px] w-[30px] shrink-0 rounded-full object-cover"
+            />
+          ) : (
+            <div className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-full bg-accent text-[12px] font-semibold text-on-accent">
+              {user.initials}
+            </div>
+          )}
           <div className="min-w-0 flex-1">
             <div className="truncate text-[13px] font-medium">{user.name}</div>
             <div className="truncate text-[11px] text-faint">{user.email}</div>

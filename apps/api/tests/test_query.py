@@ -51,8 +51,10 @@ class FakeRetriever:
         self._chunks = chunks
         self.calls: list[dict] = []
 
-    def retrieve(self, question, document_ids, user_id, k=8):
-        self.calls.append({"question": question, "document_ids": document_ids, "user_id": user_id, "k": k})
+    def retrieve(self, question, document_ids, user_id, k=8, rerank=False):
+        self.calls.append(
+            {"question": question, "document_ids": document_ids, "user_id": user_id, "k": k, "rerank": rerank}
+        )
         return self._chunks
 
 
@@ -908,6 +910,65 @@ def test_retriever_retrieve_s_user_id_arg_is_passed_request_state_use(app_client
 
     assert len(fake_retriever.calls) == 1
     assert fake_retriever.calls[0]["user_id"] == user_id
+
+
+# Settings batch 2 — QueryRequest.rerank (default False) now threads
+# through to Retriever.retrieve()'s own already-existing rerank param
+# (FEAT-009 follow-up) — confirms the actual wiring, not just that the
+# field exists on the Pydantic model.
+def test_rerank_field_defaults_false_and_is_not_passed_when_omitted(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id = _ingest_doc_with_content(app_client, admin, user_id, token, "doc.pdf", "content")
+
+    fake_retriever = FakeRetriever([])
+    _override(retriever=fake_retriever, generator=FakeGenerator(
+        GenerateResult(answer="n/a", cited_indices=[], hallucinated_markers=[], model="m", input_tokens=0, output_tokens=0, latency_ms=0)
+    ), verifier=FakeVerifier({}))
+
+    app_client.post(
+        "/query", json={"question": "q", "document_ids": [document_id]}, headers={"Authorization": f"Bearer {token}"}
+    )
+
+    assert len(fake_retriever.calls) == 1
+    assert fake_retriever.calls[0]["rerank"] is False
+
+
+def test_rerank_true_in_request_body_reaches_retriever_retrieve(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id = _ingest_doc_with_content(app_client, admin, user_id, token, "doc.pdf", "content")
+
+    fake_retriever = FakeRetriever([])
+    _override(retriever=fake_retriever, generator=FakeGenerator(
+        GenerateResult(answer="n/a", cited_indices=[], hallucinated_markers=[], model="m", input_tokens=0, output_tokens=0, latency_ms=0)
+    ), verifier=FakeVerifier({}))
+
+    response = app_client.post(
+        "/query",
+        json={"question": "q", "document_ids": [document_id], "rerank": True},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    assert len(fake_retriever.calls) == 1
+    assert fake_retriever.calls[0]["rerank"] is True
+
+
+def test_k_in_request_body_reaches_retriever_retrieve(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id = _ingest_doc_with_content(app_client, admin, user_id, token, "doc.pdf", "content")
+
+    fake_retriever = FakeRetriever([])
+    _override(retriever=fake_retriever, generator=FakeGenerator(
+        GenerateResult(answer="n/a", cited_indices=[], hallucinated_markers=[], model="m", input_tokens=0, output_tokens=0, latency_ms=0)
+    ), verifier=FakeVerifier({}))
+
+    app_client.post(
+        "/query",
+        json={"question": "q", "document_ids": [document_id], "k": 3},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert fake_retriever.calls[0]["k"] == 3
 
 
 # Acceptance criterion: GenerateResult.cited_indices (1-indexed

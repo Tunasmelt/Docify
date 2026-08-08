@@ -11,11 +11,12 @@ import { ConversationCard, type ConversationCardData } from "@/components/conver
 import { RenameConversationDialog, type RenameConversationTarget } from "@/components/conversations/rename-conversation-dialog";
 import { DeleteConversationDialog, type DeleteConversationTarget } from "@/components/conversations/delete-conversation-dialog";
 import { createClient } from "@/lib/supabase/browser";
+import { useCurrentUser } from "@/hooks/use-current-user";
 import { ApiError } from "@/lib/api/client";
 import { listConversations, renameConversation, deleteConversation, type ApiConversation } from "@/lib/api/conversations";
 import { listDocuments } from "@/lib/api/documents";
 
-const USER = { initials: "AK", name: "Ana Kovač", email: "ana@firm.com" };
+const EMPTY_USER = { initials: "", name: "", email: "" };
 
 function formatUpdatedAt(iso: string): string {
   return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric" })
@@ -42,6 +43,7 @@ function toCardData(conv: ApiConversation, docNamesById: Map<string, string>): C
 
 export default function ConversationListPage() {
   const router = useRouter();
+  const currentUser = useCurrentUser();
   const supabase = React.useMemo(() => createClient(), []);
   const [conversations, setConversations] = React.useState<ApiConversation[]>([]);
   const [docNamesById, setDocNamesById] = React.useState<Map<string, string>>(new Map());
@@ -152,7 +154,7 @@ export default function ConversationListPage() {
 
   return (
     <div className="grid min-h-screen grid-cols-1 bg-bg text-ink md:grid-cols-[248px_1fr]">
-      <Sidebar user={USER} mobileOpen={mobileMenuOpen} onMobileClose={() => setMobileMenuOpen(false)} onSignOut={handleSignOut} />
+      <Sidebar user={currentUser ?? EMPTY_USER} mobileOpen={mobileMenuOpen} onMobileClose={() => setMobileMenuOpen(false)} onSignOut={handleSignOut} />
       <div className="flex min-w-0 flex-col">
         <Topbar
           left={

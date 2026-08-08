@@ -24,7 +24,7 @@ class FakeRetriever:
     def __init__(self, chunks):
         self._chunks = chunks
 
-    def retrieve(self, question, document_ids, user_id, k=8):
+    def retrieve(self, question, document_ids, user_id, k=8, rerank=False):
         return self._chunks
 
 

@@ -391,7 +391,7 @@ async def post_query(
 
     started = time.perf_counter()
 
-    retrieved = retriever.retrieve(payload.question, payload.document_ids, user_id, k=payload.k)
+    retrieved = retriever.retrieve(payload.question, payload.document_ids, user_id, k=payload.k, rerank=payload.rerank)
 
     if not retrieved:
         # A legitimate, benign outcome (no matching content) — not an
@@ -779,7 +779,7 @@ async def _stream_query_events(
         # call), and this is the very first potentially-long gap in the
         # whole stream, right after only one small event has gone out.
         retrieve_task = asyncio.ensure_future(
-            asyncio.to_thread(retriever.retrieve, payload.question, payload.document_ids, user_id, k=payload.k)
+            asyncio.to_thread(retriever.retrieve, payload.question, payload.document_ids, user_id, k=payload.k, rerank=payload.rerank)
         )
         async for heartbeat in _yield_heartbeats_until_done(retrieve_task):
             yield heartbeat

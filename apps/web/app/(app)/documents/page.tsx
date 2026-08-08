@@ -11,6 +11,7 @@ import { UploadZone, type UploadedDocument } from "@/components/documents/upload
 import { DocumentCard, type DocumentCardData } from "@/components/documents/document-card";
 import { DeleteConfirmDialog } from "@/components/documents/delete-confirm-dialog";
 import { createClient } from "@/lib/supabase/browser";
+import { useCurrentUser } from "@/hooks/use-current-user";
 import {
   ApiError,
   deleteDocument,
@@ -19,7 +20,10 @@ import {
 } from "@/lib/api/documents";
 import type { DocumentStatus } from "@/lib/status-styles";
 
-const USER = { initials: "AK", name: "Ana Kovač", email: "ana@firm.com" };
+// Real identity (Settings, batch 1) — was a hardcoded fake, independently
+// copy-pasted across this page/chat/page.tsx/chat/[id]/page.tsx before
+// useCurrentUser() existed as one shared source.
+const EMPTY_USER = { initials: "", name: "", email: "" };
 
 const NON_TERMINAL_STATUSES: DocumentStatus[] = ["uploaded", "parsing", "embedded"];
 const POLL_BASE_INTERVAL_MS = 2000;
@@ -48,6 +52,7 @@ function toCardData(doc: ApiDocument): DocumentCardData {
 
 export default function DocumentsPage() {
   const router = useRouter();
+  const currentUser = useCurrentUser();
   const supabase = React.useMemo(() => createClient(), []);
   const [docs, setDocs] = React.useState<ApiDocument[]>([]);
   const [loading, setLoading] = React.useState(true);
@@ -252,7 +257,7 @@ export default function DocumentsPage() {
     <div className="grid min-h-screen grid-cols-1 bg-bg text-ink md:grid-cols-[248px_1fr]">
       <Sidebar
         librarySection={librarySection}
-        user={USER}
+        user={currentUser ?? EMPTY_USER}
         mobileOpen={mobileMenuOpen}
         onMobileClose={() => setMobileMenuOpen(false)}
         onSignOut={handleSignOut}
@@ -269,9 +274,14 @@ export default function DocumentsPage() {
           right={
             <>
               <ThemeToggle />
-              <div className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-accent text-xs font-semibold text-on-accent">
-                {USER.initials}
-              </div>
+              {currentUser?.avatarUrl ? (
+                // eslint-disable-next-line @next/next/no-img-element -- public Storage URL, see hooks/use-current-user.ts
+                <img src={currentUser.avatarUrl} alt="" className="h-8 w-8 rounded-full object-cover" />
+              ) : (
+                <div className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-accent text-xs font-semibold text-on-accent">
+                  {(currentUser ?? EMPTY_USER).initials}
+                </div>
+              )}
             </>
           }
         />
