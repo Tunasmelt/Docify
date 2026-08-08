@@ -145,6 +145,8 @@ Every feature has tests at up to three levels:
 - **No mocking of Supabase in integration tests** — use `supabase start` for a local instance
 - **E2E tests hit real backend via Playwright's page** — not a mock; run against `npm run dev` for both apps
 - **Snapshot tests only for stable UI primitives** — never for evolving business components
+- **A real `git clone` (or `git stash`) + fresh install + build/test is required before closing out any multi-file feature — `tsc --noEmit`/`pytest`/`next dev`/Playwright-against-a-local-dev-server are not sufficient on their own.** Added 2026-08-07 after a real, project-wide gap: those four checks all run against the *working tree*, which during active development always includes uncommitted and untracked files alongside committed ones — none of them can distinguish "this file exists on disk" from "this file is actually in git history." A fresh-clone check closes that blind spot; nothing else in this stack does. Full incident writeup: `.agent/MEMORY.md`'s 2026-08-07 anti-pattern entry (four independent missing-commit bugs found across four recent feature commits, none caught by any prior verification pass).
+- **Frontend verification must include a real `next build`, not just `next dev`/`tsc --noEmit`.** Added 2026-08-07 for the same reason as above: `next build` runs ESLint as a hard, build-blocking gate (`react/no-unescaped-entities` and others); `next dev` only warns, and `tsc --noEmit` doesn't run ESLint at all. `next build` had never actually been run against this repo before this date — six files were failing it, three of them pre-dating this session entirely. "The dev server runs" and "the production build succeeds" are different guarantees; only the first was ever being checked.
 
 ---
 
