@@ -46,8 +46,22 @@ def create_test_user(client: Client, *, password: str = "test-password-123") -> 
 def delete_test_user(client: Client, user_id: str) -> None:
     """Cascades to that user's documents/chunks via the schema's `on
     delete cascade` FKs — does not touch storage objects, which have no
-    such FK; callers that upload files must clean those up separately."""
-    client.auth.admin.delete_user(user_id)
+    such FK; callers that upload files must clean those up separately.
+
+    Tolerates the user already being gone (2026-08-06, test_account.py's
+    DELETE /account tests): a test that itself deletes the account via
+    the real endpoint under test leaves nothing here for the user_a/
+    user_b fixture's own teardown to clean up — that's the test doing
+    its job correctly, not an error condition. Without this, every
+    passing account-deletion test would report a spurious teardown
+    failure trying to delete an already-deleted user, obscuring real
+    failures in the same suite. Same "no-op on already-gone" discipline
+    routes/documents.py's Storage remove() already relies on."""
+    try:
+        client.auth.admin.delete_user(user_id)
+    except Exception as exc:
+        if "not found" not in str(exc).lower() and "user_not_found" not in str(exc).lower():
+            raise
 
 
 def login(email: str, password: str = "test-password-123") -> str:
