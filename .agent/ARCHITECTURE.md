@@ -14,27 +14,49 @@ Multi-tenant SaaS web app: users upload documents (PDFs), ask natural-language q
 
 ## System diagram
 
+**Corrected 2026-08-07 (docs-reconciliation pass) — the original plan below was a Next.js-
+proxy-to-FastAPI architecture; that was never built.** The browser talks to FastAPI directly
+(`NEXT_PUBLIC_API_URL`, `apps/web/lib/api/client.ts`'s `apiFetch()`), attaching the Supabase
+JWT as a bearer token itself — this is *why* `main.py` has `CORSMiddleware` at all (a same-
+origin proxy would never have needed it). `apps/web/app/api/` exists on disk but is empty — no
+route handler was ever added to it. The one real Next.js route handler in this app,
+`app/auth/callback/route.ts`, is a Supabase Auth PKCE callback, not a FastAPI proxy. Pure
+Supabase Auth/Storage operations (login, session refresh, avatar upload, password
+reauthentication) also go directly from the browser to Supabase via the JS SDK — FastAPI is
+never in that path at all, only in the path for this app's own domain data (documents,
+conversations, query, export, account deletion).
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  Browser                                                    │
-└───────────────────┬─────────────────────────────────────────┘
-                    │ HTTPS
-┌───────────────────▼─────────────────────────────────────────┐
-│  Next.js 14 App Router (Vercel)                             │
-│  ├─ Server components + client components                   │
-│  ├─ API routes → thin proxy to FastAPI (auth check, forward)│
-│  └─ Supabase JS SDK (auth session, storage upload)          │
-└─────┬────────────────────────────────────────┬──────────────┘
-      │ REST /ingest /query                    │ Direct SQL
-      │ Bearer <supabase_jwt>                  │ via SDK (RLS-guarded)
-┌─────▼────────────────────────────┐   ┌───────▼──────────────┐
-│  FastAPI (Render)                │   │  Supabase            │
-│  ├─ /ingest → pdfplumber parse   │   │  ├─ Auth (JWT)       │
-│  ├─ /query → retrieve + generate │◄──┤  ├─ Postgres         │
-│  ├─ /verify → citation check     │   │  │  ├─ pgvector      │
-│  ├─ Supabase service-role client │   │  │  └─ RLS policies  │
-│  └─ Voyage / Gemini SDK          │   │  └─ Storage (files)  │
-└─────┬────────────────────────────┘   └──────────────────────┘
+└───────┬───────────────────────────────────────┬─────────────┘
+        │ HTTPS, Bearer <supabase_jwt>           │ Supabase JS SDK
+        │ (apiFetch, lib/api/client.ts)          │ (auth session, storage upload,
+        │                                        │  direct RLS-guarded queries)
+┌───────▼────────────────────────────┐   ┌───────▼──────────────┐
+│  Next.js 14 App Router (Vercel)    │   │  Supabase             │
+│  ├─ Server components + client     │   │  ├─ Auth (JWT)        │
+│  │  components                     │   │  ├─ Postgres          │
+│  ├─ middleware.ts — route guard    │   │  │  ├─ pgvector       │
+│  │  only (no proxying)             │◄──┤  │  └─ RLS policies   │
+│  └─ app/api/ — empty, unused       │   │  └─ Storage (files)   │
+└───────┬─────────────────────────────┘   └───────▲──────────────┘
+        │ REST, direct from browser                │ service-role client
+        │ (documents/conversations/query/           │ (bypasses RLS; explicit
+        │  export/account)                          │  user_id in every query)
+┌───────▼────────────────────────────┐              │
+│  FastAPI (Render)                  │──────────────┘
+│  ├─ /ingest, /reindex → parse      │
+│  ├─ /documents, /conversations     │
+│  ├─ /query, /query/stream          │
+│  │  → retrieve + generate + verify │
+│  ├─ /export/conversations          │
+│  ├─ /account → delete (Storage,    │
+│  │  then auth.admin.delete_user)   │
+│  ├─ CORSMiddleware (browser calls  │
+│  │  this origin directly)          │
+│  └─ Voyage / Gemini SDK            │
+└─────┬────────────────────────────┘
       │
 ┌─────▼──────────────┐  ┌───────────────────────┐  ┌──────────────────┐
 │  Voyage API        │  │  Gemini API           │  │  Gemini API      │
@@ -56,7 +78,7 @@ Multi-tenant SaaS web app: users upload documents (PDFs), ask natural-language q
 | Backend framework | FastAPI | 0.115+ | Native async, OpenAPI generation, Pydantic |
 | Language (backend) | Python | 3.12 | Current stable |
 | Layout parsing | pdfplumber + python-docx + python-pptx + selectolax | latest | Heuristic-based, self-hosted, no per-page cost, native table extraction (FEAT-027, replaced Docling 2026-08-01 — Docling's 441MB import cost / 1144.6MB peak parse memory OOM-crashed `/ingest` on Render's 512MB free tier) |
-| OCR fallback | Gemini Flash | 2.5 | Free tier 1,500 req/day, vision-native, used only for low-confidence parse pages |
+| OCR fallback | Gemini Flash | 2.5 | Free tier **20 req/day** (`GenerateRequestsPerDayPerProjectPerModel-FreeTier`, per-model — confirmed live via a real `429`, not the docs; corrected 2026-08-07 from an earlier, wrong "1,500 req/day" figure — see `.agent/MEMORY.md`'s 2026-07-26 entry), vision-native, used only for low-confidence parse pages, real tier-1 of FEAT-017's 3-tier OCR chain (OCR.space, then Tesseract, follow) |
 | Embeddings | Voyage AI | multimodal-3.5 | Unified encoder (no CLIP modality gap), 200M tokens + 150B pixels free, Anthropic-recommended |
 | Generation | Gemini | 3.6 Flash | Frontier multimodal generation, consolidates all LLM calls on one provider (embeddings already free-tier via Voyage, OCR already on Gemini) |
 | Verification | Gemini | 3.5 Flash-Lite | Cheap, fast LLM-as-judge for citation grounding |
@@ -74,55 +96,95 @@ Multi-tenant SaaS web app: users upload documents (PDFs), ask natural-language q
 ## Request flows
 
 ### Ingest flow
+**Corrected 2026-08-07** — steps 3-4 below described a Next.js proxy hop that was never built;
+the browser calls FastAPI directly (see System diagram above).
 ```
 1. User uploads PDF via web upload page
 2. Web uploads file directly to Supabase Storage bucket: uploads/{user_id}/{uuid}.pdf
-3. Web POSTs to Next.js API route /api/ingest with { storage_path, filename }
-4. Next.js API route validates Supabase JWT, forwards to FastAPI /ingest with user_id + storage_path
-5. FastAPI:
+3. Web POSTs directly to FastAPI POST /ingest with { storage_path, filename, mime_type,
+   size_bytes }, Bearer <supabase_jwt> — JWTAuthMiddleware verifies the JWT and attaches
+   user_id; no Next.js hop involved
+4. FastAPI:
    a. Creates documents row with status='uploaded'
    b. Downloads file from Storage using service-role client
    c. Runs pdfplumber/python-docx/python-pptx/selectolax parse → typed elements (text, tables, figures, headings)
    d. For each element, renders coordinates + page number metadata
    e. For each figure, uploads cropped image to Storage: figures/{user_id}/{document_id}/{figure_id}.png
    f. Batches text elements (with figure captions inline) into ~500-token chunks respecting element boundaries
-   g. Calls Voyage embed API on chunks (multimodal input where figure images are included)
+   g. Calls Voyage embed API on chunks (multimodal input where figure images are included) —
+      falls back to Gemini's embedding-2 per-batch if Voyage's real 3 RPM ceiling is exhausted
+      mid-ingest (services/embedder.py); each chunk's embedding_provider column records which
+      provider actually produced it
    h. Bulk-inserts chunks rows with embedding vectors + metadata + user_id
    i. Updates documents row status='ready'
-6. Returns document_id to frontend
-7. Frontend polls or subscribes to documents row for status transitions
+5. Returns document_id to frontend
+6. Frontend polls the documents row for status transitions (GET /documents; real-time
+   subscription was considered and explicitly not built — see Locked decisions)
 ```
 
 ### Query flow
+**Corrected 2026-08-07** — step 3 below described a Next.js proxy hop that was never built (see
+System diagram above); retrieval described a fixed two-list vector+FTS pair, which is no longer
+accurate once a document's chunks can span more than one embedding provider (the Gemini
+fallback in the ingest flow above).
 ```
 1. User submits question via chat page
-2. Web POSTs to Next.js API route /api/query with { question, document_ids }
-3. Next.js API route validates JWT, forwards to FastAPI /query with user_id
-4. FastAPI:
-   a. Embeds question with Voyage (same model for symmetric retrieval)
-   b. Runs vector search: SELECT ... FROM chunks WHERE user_id = $auth AND document_id IN (...) ORDER BY embedding <=> $qvec LIMIT k
-   c. Runs BM25 search: SELECT ... WHERE user_id = $auth AND ts_vector @@ plainto_tsquery($question) LIMIT k
-   d. Reciprocal Rank Fusion merges the two lists → top-k final chunks
-   e. Constructs prompt: system instruction + retrieved chunks (numbered [1]...[k]) + user question
-   f. Calls Gemini 3.6 Flash with prompt; response includes inline [N] citation markers
-   g. Parses response for citations, maps back to chunk IDs
-   h. Runs verification pass (see verify flow) on each cited claim
-   i. Writes conversation + message + citations rows
-5. Returns { answer, citations: [{ chunk_id, verdict, page, doc_name, snippet }] }
+2. Web POSTs directly to FastAPI POST /query or POST /query/stream with { question,
+   document_ids, conversation_id?, k?, rerank? }, Bearer <supabase_jwt> — no Next.js hop
+3. FastAPI (services/retriever.py):
+   a. Determines which embedding provider(s) actually have chunks in this document_ids scope
+      (almost always just "voyage"; "gemini" only appears for chunks embedded via the fallback
+      above) — a provider with zero chunks in scope never gets a query-embed call
+   b. Embeds the question once PER distinct provider found, each in its own thread, and runs
+      that provider's own vector search: SELECT ... FROM chunks WHERE user_id = $auth AND
+      document_id IN (...) AND embedding_provider = $provider ORDER BY embedding <=> $qvec
+      LIMIT k — a Voyage-space vector is never compared against a Gemini-space one; comparing
+      across providers is a standing anti-pattern (.agent/MEMORY.md, 2026-07-31)
+   c. Runs one BM25 search in parallel: SELECT ... WHERE user_id = $auth AND ts_vector @@
+      plainto_tsquery($question) LIMIT k
+   d. Reciprocal Rank Fusion merges ALL of the above (one list per provider present, plus FTS —
+      2 lists in the common single-provider case, N+1 in general) purely on each list's own
+      rank, never raw distance → top-k final chunks
+   e. If rerank=true (opt-in, default false — see Locked decisions): sends RRF's top candidate
+      pool to Voyage's rerank-2.5; any failure falls back to RRF's own order unchanged
+   f. Constructs prompt: system instruction + retrieved chunks (numbered [1]...[k]) + up to the
+      last 5 conversation turns as history + user question
+   g. Calls Gemini 3.6 Flash with prompt; response includes inline [N] citation markers
+   h. Parses response for citations, maps back to chunk IDs
+   i. Runs verification pass (see verify flow) on each cited claim
+   j. Writes conversation + message + citations rows
+4. Returns { answer, citations: [{ chunk_id, verdict, page, doc_name, snippet, ... }],
+   metadata } (or streams the same shape as SSE events via /query/stream)
 ```
 
 ### Verify flow (called from query, not a public endpoint)
+**Rewritten 2026-08-07** — the version below described an `[unverified]` inline tag on
+unsupported claims; the real behavior is drop + strip the marker entirely, and a whole fourth
+verdict (`unverified`, distinct from `unsupported`) exists that this doc never mentioned at
+all.
 ```
 For each (claim_span, cited_chunk_id) pair from the generated answer:
 1. Fetch chunk text/image from DB
 2. Call Gemini 3.5 Flash-Lite with:
    system: "Given a source and a claim, answer: supported | partial | unsupported. Quote the supporting span if any."
    user: source + claim
-3. Parse verdict + supporting quote
-4. Verdict determines UI treatment:
-   - supported: citation chip renders normally
-   - partial: citation chip renders with warning icon
-   - unsupported: claim span in answer text gets [unverified] tag, citation is dropped
+3. Parse verdict + supporting quote — a Gemini call that errors, times out, or returns a
+   malformed/non-schema response converts into a real fourth verdict, `unverified` (distinct
+   from `unsupported` — added 2026-08-02 after finding a real-usage case where verification
+   genuinely could not run, and the response was silently, incorrectly treated the same as a
+   model judging the claim false), rather than crashing or defaulting to `unsupported`
+4. Real verdict labels and their treatment — `supported`, `partial`, `unsupported`,
+   `unverified`:
+   - `supported` / `partial` / `unverified`: kept. Citation chip renders with its own distinct
+     styling per verdict (solid for supported, dotted-amber warning for partial, dashed-muted
+     for unverified — "we couldn't check this one," not a claim the content is wrong)
+   - `unsupported` ONLY: a real model judgment the claim is false (or a caught fabricated/
+     ungrounded quote) — dropped from the response, and its `[N]` marker is stripped out of the
+     answer text entirely (`_strip_dropped_markers`, `routes/query.py`) rather than left dangling
+     or shown as `[unverified]` inline. `unsupported` citations ARE still persisted to the
+     `citations` table (full audit trail) even though never returned to the client — see
+     `GET /export/conversations`'s deliberately-unfiltered export query for the one place that
+     surfaces them
 5. Store (claim_span, chunk_id, verdict, quote, verifier_model, verified_at) in citations table
 ```
 
@@ -130,41 +192,66 @@ For each (claim_span, cited_chunk_id) pair from the generated answer:
 
 ## Module map
 
+**Corrected 2026-08-07** — three real drifts fixed: `settings/` is fully built, not a Phase 4
+stub; `/verify` is not its own route (it's `services/verifier.py`, called internally from
+`/query` and `/query/stream` — never a public endpoint, see the Verify flow above); and the
+`[claude-design]`/`[claude-code]` ownership split never actually operated — every one of this
+repo's 60 commits is tagged `[claude-code]` (confirmed via `git log`), so ownership tags are
+removed rather than corrected to a different split that doesn't exist either. (The "Four-agent
+workflow with lane discipline" Locked Decision below references this same dropped workflow —
+flagged separately rather than silently edited, since it's a Locked Decision.)
+
 ```
 apps/
-├── web/                          [claude-design owns]
+├── web/
 │   ├── app/
 │   │   ├── (auth)/               login/signup pages
 │   │   ├── (app)/                protected app routes
 │   │   │   ├── documents/        upload + list + delete
-│   │   │   ├── chat/             chat UI + source panel
-│   │   │   └── settings/         phase 4
-│   │   ├── api/                  Next route handlers (thin proxies)
+│   │   │   ├── chat/             chat UI + source panel (+ [conversation_id]/ detail view)
+│   │   │   └── settings/         profile, email, security, appearance, preferences,
+│   │   │                         export, danger zone (account deletion) — fully built
+│   │   ├── auth/callback/        Supabase Auth PKCE callback (the one real Next.js route
+│   │   │                         handler in this app — not a FastAPI proxy)
+│   │   ├── api/                  empty, unused — no proxy route was ever added here
 │   │   └── layout.tsx
 │   ├── components/
 │   │   ├── ui/                   shadcn primitives
 │   │   ├── documents/            upload, list, card
-│   │   ├── chat/                 message, citation-chip, source-panel
-│   │   └── layout/               nav, sidebar
+│   │   ├── chat/                 message-bubble, citation-marker, source-panel
+│   │   ├── conversations/        rename/delete dialogs
+│   │   ├── settings/             profile/email/security/appearance/preferences/export/
+│   │   │                         danger-zone sections + delete-account-dialog
+│   │   └── layout/               nav, sidebar, topbar
+│   ├── hooks/                    use-current-user, use-preferences, use-chat-shortcuts,
+│   │                             use-relative-time
 │   └── lib/
-│       ├── supabase/             browser + server clients
-│       ├── api/                  FastAPI client wrapper
+│       ├── supabase/             browser + server clients, profile.ts (reauth-gated
+│       │                         email-change/account-deletion, avatar upload)
+│       ├── api/                  FastAPI client wrapper (client, documents, conversations,
+│       │                         query, export)
 │       └── types/                shared TS types (mirror API contract)
 │
-├── api/                          [claude-code owns]
-│   ├── main.py                   FastAPI app + routes
+├── api/
+│   ├── main.py                   FastAPI app + routes + CORSMiddleware
 │   ├── routes/
-│   │   ├── ingest.py             /ingest endpoint
-│   │   ├── query.py              /query endpoint
+│   │   ├── ingest.py             /ingest, /reindex
+│   │   ├── query.py              /query, /query/stream (verification runs internally —
+│   │   │                         see Verify flow; not its own route)
+│   │   ├── documents.py          GET/DELETE /documents
+│   │   ├── conversations.py      GET/POST/DELETE /conversations
+│   │   ├── export.py             GET /export/conversations
+│   │   ├── account.py            DELETE /account (permanent deletion)
 │   │   └── health.py             /health
 │   ├── services/
 │   │   ├── document_model.py     ElementType/BBox/ParsedElement/ParsedDocument (no heavy deps; chunker.py depends on this, not parser.py)
 │   │   ├── parser.py             pdfplumber/python-docx/python-pptx/selectolax parser (FEAT-027)
 │   │   ├── chunker.py            element → chunk logic
-│   │   ├── embedder.py           Voyage client wrapper
-│   │   ├── retriever.py          hybrid search + RRF
+│   │   ├── embedder.py           Voyage client wrapper (+ Gemini embedding-2 fallback)
+│   │   ├── retriever.py          hybrid search (N provider-partitioned vector lists + FTS) + RRF + optional rerank
 │   │   ├── generator.py          Gemini 3.6 Flash wrapper
-│   │   └── verifier.py           Gemini 3.5 Flash-Lite citation-check
+│   │   ├── verifier.py           Gemini 3.5 Flash-Lite citation-check (4 verdicts: supported/partial/unsupported/unverified)
+│   │   └── figure_fetcher.py     signed figure URLs for citation responses
 │   ├── db/
 │   │   ├── client.py             Supabase service-role client
 │   │   └── queries.py            typed query builders
@@ -179,10 +266,16 @@ docs/                             cross-cutting docs (readme, decisions)
 
 ## Patterns
 
-- **Thin Next.js API routes** — Next handlers only do auth check + forward. All business logic lives in FastAPI. Frontend never talks to Voyage/Gemini/the parser directly.
+- **Direct browser-to-FastAPI calls, no Next.js proxy layer** (corrected 2026-08-07 — the
+  original plan was a thin-proxy pattern; it was never built, see System diagram above).
+  `apps/web/lib/api/client.ts`'s `apiFetch()` calls FastAPI directly from the browser with the
+  Supabase JWT as a bearer token; `main.py`'s `CORSMiddleware` exists specifically because of
+  this. All business logic lives in FastAPI; the frontend never talks to Voyage/Gemini/the
+  parser directly. Pure Supabase Auth/Storage operations (login, session refresh, avatar
+  upload) go directly from the browser to Supabase instead — FastAPI is never in that path.
 - **Service-role client for background writes** — FastAPI uses Supabase service-role key for cross-user work; user_id is always passed explicitly and included in INSERT/SELECT WHERE clauses so RLS still validates.
 - **Pydantic contract mirroring** — API request/response models in `apps/api/models/` are the source. Matching TS types in `apps/web/lib/types/` are hand-mirrored (or generated later via a script). API_CONTRACT.md is the specification both sides read.
-- **Status-transition documents** — `documents.status` moves through explicit states (uploaded → parsing → embedded → ready | failed). Frontend polls or subscribes; never assumes ready.
+- **Status-transition documents** — `documents.status` moves through explicit states (uploaded → parsing → embedded → ready | failed). Frontend polls (`GET /documents`); Supabase realtime was considered and explicitly not built — see Locked decisions. Never assumes ready.
 - **Explicit user_id in every query** — even though RLS enforces it, application code includes `WHERE user_id = $x` for clarity, testability, and defense in depth.
 
 ---
@@ -196,16 +289,11 @@ docs/                             cross-cutting docs (readme, decisions)
 - [x] **pgvector, not a dedicated vector DB.** One Postgres serves metadata + vectors + FTS.
 - [x] **Voyage multimodal-3.5 for embeddings.** Unified encoder; CLIP-style models rejected because of modality gap on cross-modal retrieval.
 - [x] **Gemini for gen + verify.** 3.6 Flash (generation) + 3.5 Flash-Lite (verification) — consolidates all LLM calls on one provider.
-- [x] **Four-agent workflow with lane discipline.** See AGENT.md §AGENT ROLES.
-
----
-
-## Open decisions
-
-- [ ] Chunker strategy: fixed-token vs. element-boundary-respecting (leaning element-boundary)
-- [ ] Rerank in Phase 2 or defer to Phase 4 (leaning defer — measure quality without it first)
-- [ ] Query-time query rewriting (multi-query fanout) — probably Phase 4
-- [ ] Real-time doc processing status: polling vs. Supabase realtime subscription (leaning polling for simplicity)
+- [x] **Four-agent workflow with lane discipline.** See AGENT.md §AGENT ROLES. **FLAGGED 2026-08-07, not silently edited:** this did not actually operate — every one of this repo's 60 commits is tagged `[claude-code]` (confirmed via `git log`), zero `[claude-design]`/`[gemini]`/`[codex]`. This entry's *content* needs a substantive correction (what workflow actually ran), not just a wording/status fix, which is outside a docs-reconciliation pass's mandate — left as-is pending a decision on how to record what actually happened.
+- [x] **Chunker strategy: element-boundary-respecting, not fixed-token.** Decided by FEAT-005's actual implementation (`services/chunker.py` groups adjacent elements up to `MAX_CHUNK_TOKENS`, never splits a table row or heading) — moved here 2026-08-07 from "Open decisions," where it had sat unresolved since before FEAT-005 shipped.
+- [x] **Rerank: opt-in, default off, not built into every query.** Decided by FEAT-009's own real quality fixture (RRF alone landed the expected chunk in the top-5 4/4 times) — `.agent/MEMORY.md`'s 2026-07-27 entry, `services/retriever.py`'s `rerank: bool = False` parameter, later surfaced as a real user-facing preference (Settings, "rerank results for relevance," default off) with its own measured ~380ms cost disclosed in the UI. Moved here 2026-08-07.
+- [x] **No query-time query rewriting.** Decided by FEAT-019 (conversation memory, 2026-07-27): prior turns fold into the generation prompt only; `Retriever.retrieve()` still searches on the raw current-turn question alone. Explicit, stated limitation (a follow-up with no lexical/semantic overlap with its own target content may retrieve poorly even though generation has the right conversational context) — not an oversight. Moved here 2026-08-07 from "Open decisions."
+- [x] **Document status: polling, not Supabase realtime.** Decided by FEAT-014's actual implementation — `apps/web/app/(app)/documents/page.tsx` polls `GET /documents`. Moved here 2026-08-07 from "Open decisions," where it had sat unresolved since before FEAT-014 shipped.
 
 ---
 

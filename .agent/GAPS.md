@@ -86,7 +86,10 @@ foreign-key violation surfaced in the backend logs: `run_ingest_pipeline`'s back
 to insert chunk rows for a `document_id` that no longer existed in `documents` — the row had
 already been deleted while the pipeline was still mid-flight.
 
-- [ ] **`DELETE /documents/{document_id}`'s 409 guard (`routes/documents.py`) only blocks
+- [x] **RESOLVED 2026-07-25, commit `4a4c73e` ("fix(FEAT-008): block DELETE during 'embedded'
+  status, not just 'parsing'") — closed out properly 2026-08-07 during the docs-reconciliation
+  pass (this entry was still marked open, a real doc-drift bug of its own, not silently deleted
+  per this project's own convention of leaving a resolution note).** `DELETE /documents/{document_id}`'s 409 guard (`routes/documents.py`) only blocks
   `status == 'parsing'`.** But `run_ingest_pipeline` (`routes/ingest.py`) still has real
   in-flight work after the status flips to `'embedded'` — figure upload, the bulk `chunks`
   insert, and `mark_ready` all happen strictly after `mark_embedded()`. A delete landing in that
@@ -102,7 +105,13 @@ already been deleted while the pipeline was still mid-flight.
   UI *can* hit the identical race if their click lands during the `'embedded'` window specifically
   (a real, if narrow, timing window — not purely a test artifact), so this is worth fixing
   properly, not dismissing as test-only.
-  **Suggested fix (not implemented — out of scope for a wiring-correctness pass):** broaden the
+  **Fix actually applied (option 1 of the two suggested below):** the 409 guard was broadened to
+  `status in ('parsing', 'embedded')` — confirmed still in place in the current code
+  (`routes/documents.py`, `if document["status"] in ("parsing", "embedded"):`), not just applied
+  and later reverted. The re-check-before-insert_chunks alternative (option 2) was not also
+  built — the broadened guard alone closes the real race, since a delete can no longer land
+  during either in-flight window at all.
+  **Original suggested fix (for historical context — option 1 is what shipped):** broaden the
   409 guard to `status in ('parsing', 'embedded')`, or — more robustly — have
   `run_ingest_pipeline` re-check the document row still exists immediately before `insert_chunks`
   and treat a missing row as a clean, silent abort rather than letting the FK violation surface

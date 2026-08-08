@@ -20,7 +20,7 @@ Coding standards and conventions for this project. Violations are flagged in GAP
 - **Hooks:** `useSomething` prefix
 - **Python classes:** `PascalCase`, one class per file for services
 - **Test files:**
-  - Frontend: `foo.test.ts` for unit, `foo.spec.ts` for integration/e2e (Playwright)
+  - Frontend: `foo.test.ts` for unit, `foo.e2e.ts` for integration/e2e (Playwright) — corrected 2026-08-07, all 12 real Playwright files in `apps/web/e2e/` use `.e2e.ts`; `.spec.ts` was the originally planned suffix and was never actually used
   - Backend: `test_foo.py` for pytest
 
 ### Database
@@ -40,21 +40,27 @@ Coding standards and conventions for this project. Violations are flagged in GAP
 ## Structure
 
 ### Frontend directory layout
+**Corrected 2026-08-07** — `app/api/` was planned as a thin-proxy layer; it was never built
+(see ARCHITECTURE.md's System diagram). The browser calls FastAPI directly via `lib/api/`'s
+`apiFetch()`, which is why FastAPI's own CORS middleware exists at all.
 ```
 apps/web/
 ├── app/                       Next.js App Router pages
 │   ├── (auth)/                unauthenticated pages
 │   ├── (app)/                 authenticated pages (protected by middleware)
-│   └── api/                   thin proxy route handlers
+│   ├── auth/callback/         Supabase Auth PKCE callback (the one real route handler
+│   │                          in this app — not a FastAPI proxy)
+│   └── api/                   empty, unused — no proxy route was ever added here
 ├── components/
 │   ├── ui/                    shadcn primitives — never modify these directly
 │   ├── {feature}/             feature-scoped components
 │   └── layout/                nav, sidebar, shell
 ├── lib/
-│   ├── supabase/              client wrappers
-│   ├── api/                   FastAPI client
+│   ├── supabase/              client wrappers (browser talks to Supabase directly for
+│   │                          Auth/Storage — not proxied through FastAPI either)
+│   ├── api/                   FastAPI client — called directly from the browser
 │   └── types/                 shared TS types
-└── middleware.ts              auth gate for (app)/*
+└── middleware.ts              auth gate for (app)/* — route guard only, never proxies
 ```
 
 ### Backend directory layout
@@ -192,8 +198,8 @@ Explicit forbidden patterns. `/gap-check` looks for these:
 - Magic numbers — extract to named constants
 - Any-typed values in TS (`: any`) except at explicit API boundaries with a comment explaining why
 - `# type: ignore` in Python without a comment explaining why
-- Direct Supabase queries from `apps/web` for user-owned tables that could go through `apps/api` — the frontend should be a thin client
-- Business logic in Next.js API routes — those are proxies only
+- Direct Supabase queries from `apps/web` for user-owned tables (`documents`, `chunks`, `conversations`, `messages`, `citations`) that could go through `apps/api` — the frontend should be a thin client. (Pure Supabase Auth/Storage operations — login, session management, avatar upload — are the one legitimate exception; those go directly from the browser to Supabase by design, see ARCHITECTURE.md's System diagram.)
+- Business logic in Next.js API routes — **corrected 2026-08-07: this app has no Next.js API routes at all** (`app/api/` is empty; the browser calls FastAPI directly). If one is ever added, it must stay a thin proxy — auth check + forward, nothing more.
 - Skipping `/api-check` before writing external API code
 - Storing API keys anywhere other than env vars
 - Committing before running `/gap-check` locally

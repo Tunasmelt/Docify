@@ -206,11 +206,22 @@ test.describe("Chat UI modernization batch 2: stop generation + regenerate", () 
 
       // Now idle again -- regenerate must be offered on exactly the
       // LAST assistant message, never the first/earlier one.
+      //
+      // The button is unconditionally present in the DOM once the app
+      // decides to render it (message-bubble.tsx's own
+      // `{onRegenerate ? <button data-testid="regenerate-message-button">
+      // : null}`) -- hover only reveals it visually via CSS
+      // (opacity-0 group-hover:opacity-100), it does not mount/unmount
+      // it. A page-wide getByTestId(...).toHaveCount() therefore can't
+      // tell WHICH message the one real button belongs to -- it must be
+      // scoped to each message bubble's own subtree instead (found live:
+      // the original page-wide assertion failed here even though the
+      // real scoping logic, `msg.id === lastMessage?.id`, is correct by
+      // inspection -- a test bug in the assertion technique, not an app
+      // regression).
       const messages = page.getByTestId("assistant-message");
-      await messages.first().hover();
-      await expect(page.getByTestId("regenerate-message-button")).toHaveCount(0);
-      await messages.last().hover();
-      await expect(page.getByTestId("regenerate-message-button")).toHaveCount(1);
+      await expect(messages.first().getByTestId("regenerate-message-button")).toHaveCount(0);
+      await expect(messages.last().getByTestId("regenerate-message-button")).toHaveCount(1);
     } finally {
       await deleteTestUserByEmail(email);
     }

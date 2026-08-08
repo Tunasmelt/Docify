@@ -1046,13 +1046,186 @@ This is a real EPA letter about lead service line compliance — confirms both t
 
 ---
 
+### [FEAT-028] UNVERIFIED citation state, distinct from UNSUPPORTED
+**Phase:** 4
+**Status:** complete
+**Owner:** claude-code
+**Depends on:** FEAT-011 (verifier), FEAT-012/FEAT-016 (query routes)
+**Files:**
+- `apps/api/migrations/20260803_001_citation_verdict_unverified.sql` — adds `'unverified'` to the `verdict` enum
+- `apps/api/services/verifier.py` — a Gemini call that errors, times out, or returns a malformed/non-schema response now converts into `VerdictLabel.UNVERIFIED` (fail-safe), rather than being silently treated as `UNSUPPORTED`
+- `apps/api/routes/query.py` — both `/query` and `/query/stream`: `UNVERIFIED` citations are kept (same as `SUPPORTED`/`PARTIAL`), only `UNSUPPORTED` is dropped/marker-stripped
+- `apps/api/db/queries.py`, `.agent/API_CONTRACT.md`, `.agent/SCHEMA.md` — schema/contract docs updated same-commit (not left stale)
+- `apps/web/components/chat/citation-marker.tsx` — distinct styling (dashed-muted underline — "we couldn't check this one," not a warning the content is wrong, differentiated deliberately from `partial`'s dotted-amber)
+- `apps/web/lib/chat/parse-message.ts`, `apps/web/lib/status-styles.ts`, `apps/web/lib/types/chat.ts`
+**Tests:**
+- `apps/api/tests/test_verifier.py`, `test_query.py`, `test_query_stream.py` — real coverage of the fail-safe conversion path (transport error, malformed response) and that `unverified` citations are kept/returned while `unsupported` ones are dropped
+**Acceptance criteria:**
+- [x] A verification call that genuinely cannot run (Gemini error/timeout/malformed response) produces `unverified`, not `unsupported` and not a crash
+- [x] `unverified` citations are kept in the response (same as `supported`/`partial`) — never dropped, never marker-stripped
+- [x] Client renders `unverified` with its own distinct indicator, not conflated with `partial`
+
+**Changelog:** See CHANGELOG.md 2026-08-04, commit `0984082`.
+
+---
+
+### [FEAT-029] Chat UI modernization, batch 1 — copy, timestamps, streaming cursor, scroll pill, shortcuts, scope chips, citation preview
+**Phase:** 3 (frontend polish, post-FEAT-015)
+**Status:** complete
+**Owner:** claude-code
+**Files:**
+- `apps/web/app/(app)/chat/[conversation_id]/page.tsx`
+- `apps/web/components/chat/citation-marker.tsx`, `message-bubble.tsx`, `question-input.tsx`
+- `apps/web/components/chat/document-scope-chips.tsx` (new), `scroll-to-bottom-pill.tsx` (new)
+- `apps/web/hooks/use-chat-shortcuts.ts` (new), `use-relative-time.ts` (new)
+- `apps/web/lib/api/conversations.ts`, `query.ts`, `lib/chat/parse-message.ts`, `lib/types/chat.ts`
+- `apps/web/e2e/chat-modernization.e2e.ts` (new, 465 lines)
+**Tests:**
+- `apps/web/e2e/chat-modernization.e2e.ts` — real Playwright coverage of the batch
+**Acceptance criteria:** (drawn from the shipped feature set, not independently re-verified for this backfill entry — see commit `d66373d` for the original session's own verification detail)
+- [x] Relative timestamps on messages, a visible streaming-cursor indicator, a scroll-to-bottom pill once scrolled up during a long answer, keyboard shortcuts, document-scope chips showing which documents a conversation covers, and a citation hover-preview excerpt
+
+**Changelog:** See CHANGELOG.md 2026-08-04, commit `d66373d`.
+
+---
+
+### [FEAT-030] Chat UI modernization, batch 2 — stop generation, regenerate
+**Phase:** 3 (frontend polish)
+**Status:** complete
+**Owner:** claude-code
+**Depends on:** FEAT-016 (streaming), FEAT-029
+**Files:**
+- `apps/web/app/(app)/chat/[conversation_id]/page.tsx`, `components/chat/message-bubble.tsx`, `question-input.tsx`
+- `apps/web/lib/api/query.ts` — `askQuestionStream()` gained an `AbortSignal` parameter
+- `apps/api/tests/test_query_stream.py` (+110 lines), `apps/web/e2e/chat-generation-controls.e2e.ts` (new)
+**Acceptance criteria:**
+- [x] **Stop generation** — `AbortController.abort()` closes the same TCP connection a real disconnect does, confirmed to hit the exact `_watch_for_disconnect`/`http.disconnect` mechanism already proven for accidental tab-closes (FEAT-016's follow-up) — no backend changes needed. A stopped turn is discarded server-side, identically to a disconnect (never persisted with unverified citation markers); partial text stays visible client-side for the current session only. Verified: a backend test closes the connection genuinely mid-generation via a fake generator with a real timing assertion; a real Playwright test confirms tokens stop immediately, nothing persists (checked against the DB), input re-enables instantly.
+- [x] **Regenerate** — re-asks the original question through the same `ask()` path, APPENDING a new turn rather than replacing in place (no message-delete/update endpoint exists — logged as a known, stated gap in `## Considered Suggestions` below, not silently accepted as permanent). Verified across 5 real attempts (backend restarts, paced waits) — every regenerate click triggers a genuinely distinct `POST /query/stream` call, never cached/replayed.
+- [x] **Scoping test** — regenerate is offered only on the most recent assistant message, never while a turn is streaming. **Independently re-verified 2026-08-06** (deferred-test-closure pass, after this feature's original session hit real Gemini quota exhaustion before it could confirm live) — found and fixed a real bug in the TEST itself (not the app): the original assertion used a page-wide `getByTestId(...).toHaveCount()`, but the button is CSS hover-revealed (`opacity-0 group-hover:opacity-100`), not conditionally mounted, so the count couldn't tell which message it belonged to. The real scoping logic (`msg.id === lastMessage?.id`, `page.tsx`) was correct all along; the test now scopes the check per-message-bubble and passes cleanly.
+
+**Changelog:** See CHANGELOG.md 2026-08-04, commit `94289f6`; test-closure follow-up 2026-08-06 (no separate commit — working-tree test fix only, see `apps/web/e2e/chat-generation-controls.e2e.ts`).
+
+---
+
+### [FEAT-031] Chat UI modernization, batch 3 — conversation rename + delete
+**Phase:** 3 (frontend polish)
+**Status:** complete
+**Owner:** claude-code
+**Depends on:** FEAT-026 (`GET /conversations`)
+**Files:**
+- `apps/api/db/queries.py`, `models/conversations.py`, `routes/conversations.py` — `POST /conversations/{id}/rename`, `DELETE /conversations/{id}` (this closes the message-mutation-endpoint gap FEAT-030's own entry flagged as blocking true in-place regenerate — a rename/delete endpoint exists now, but no per-message mutation endpoint; regenerate's append behavior is unchanged)
+- `apps/web/app/(app)/chat/[conversation_id]/page.tsx`, `chat/page.tsx`
+- `apps/web/components/conversations/conversation-card.tsx`, `delete-conversation-dialog.tsx` (new), `rename-conversation-dialog.tsx` (new)
+- `apps/web/lib/api/conversations.ts`
+- `.agent/API_CONTRACT.md` updated same-commit
+**Tests:**
+- `apps/api/tests/test_conversations.py` (+169 lines), `apps/web/e2e/conversation-management.e2e.ts` (new, 257 lines — 7 tests)
+**Acceptance criteria:**
+- [x] Rename from the conversation list and from inside an open conversation's header, persists and survives reload, does not reorder the list (`updated_at` unchanged — a rename is a metadata edit, not new activity)
+- [x] Delete from the conversation list and from inside an open conversation (navigates back to `/chat`), cascades server-side (messages/citations via `on delete cascade`)
+- [x] Multi-tenant: user B cannot rename or delete user A's conversation via direct API calls — verified `7/7` real, independently re-confirmed 2026-08-06 (deferred-test-closure pass)
+
+**Changelog:** See CHANGELOG.md 2026-08-04, commit `05b406b`.
+
+---
+
+### [FEAT-032] Settings, profile + security (batch 1) — display name, avatar, email change, password change, sign-out-other-sessions
+**Phase:** 4 (Settings — explicitly deferred from Phase 3, see SCOPE.md)
+**Status:** complete, **with one real gap: its own Storage migration is not committed** (see below)
+**Owner:** claude-code
+**Files:**
+- `apps/web/app/(app)/settings/page.tsx`
+- `apps/web/components/settings/profile-section.tsx`, `email-section.tsx`, `security-section.tsx`, `appearance-section.tsx`, `settings-section.tsx`
+- `apps/web/hooks/use-current-user.ts` (new — replaces three independently-copy-pasted hardcoded `USER` fake-identity constants previously in documents/chat pages)
+- `apps/web/lib/supabase/profile.ts` (new) — `updateDisplayName`, `uploadAvatar`, `requestEmailChange`, `signOutOtherSessions`, `deleteAccount`
+- `apps/api/migrations/20260804_001_avatars_bucket.sql` — **UNCOMMITTED as of 2026-08-07** (confirmed via `git status`; the code that depends on it, `uploadAvatar`/the `avatars` bucket policies, IS committed and has been tested against it locally — this is a real, current gap between what's in git and what the working tree/local Supabase actually has applied, not a documentation issue). Flagged here rather than silently treated as done.
+- `apps/web/e2e/settings.e2e.ts` (new, 376 lines)
+**Tests:**
+- `apps/web/e2e/settings.e2e.ts` — 8 tests: display name persistence, avatar upload + RLS (user B can read but not write user A's avatar), password-change link, sign-out-other-sessions (a second real session genuinely invalidated), email change (real Mailpit, both addresses, either link alone completes it), and the wrong-password-blocks-email-change regression test below
+**Acceptance criteria:**
+- [x] Display name persists via `user_metadata`, avatar uploads to a public-read/owner-write `avatars` Storage bucket (real 2-user RLS test: user B can read, cannot write/overwrite user A's avatar)
+- [x] Email change: real Mailpit-delivered confirmation to both old and new addresses
+- [x] Password change links to the existing `/account/update-password` page (not duplicated)
+- [x] Sign-out-other-sessions genuinely invalidates a second real session's refresh token (and, confirmed independently 2026-08-05, the full session — not just the next refresh attempt)
+
+**SECURITY FIX, 2026-08-05/06 (independent audit, `.agent/reviews/2026-08-05-settings-audit.md`):** email-change confirmation completes on a bare, unauthenticated GET to either confirmation link, independent of PKCE (PKCE only protects session-token issuance at a separate exchange step). No native Supabase/GoTrue lever exists to close this (checked: no config flag, no Auth Hook, `verifyOtp` has the same trust model). **Mitigation shipped:** `requestEmailChange` now requires the current password (real `signInWithPassword` check) before a change can even be initiated — raises the bar on who can start a change; does not and cannot close the confirmation-side gap, which is tracked as an accepted, open risk in `.agent/GAPS.md`. Full corrected writeup in `.agent/MEMORY.md`'s "Email-change confirmation" entry — an earlier version of this finding (same audit) overstated it as a full session-hijack; that escalation is superseded, not left standing.
+
+**Changelog:** Code committed 2026-08-06, commit `fbc4a5b` (the commit message names only the email-change fix, but the diff carries the whole batch 1 UI — see that commit's own file list). Security audit: `.agent/reviews/2026-08-05-settings-audit.md`.
+
+---
+
+### [FEAT-033] Settings, preferences (batch 2) — theme, default k, rerank, streaming
+**Phase:** 4 (Settings)
+**Status:** complete but **UNCOMMITTED as of 2026-08-07**
+**Owner:** claude-code
+**Depends on:** FEAT-032
+**Files:**
+- `apps/web/hooks/use-preferences.ts` — **UNCOMMITTED.** `apps/web/components/settings/preferences-section.tsx` (which imports this hook) IS committed (as part of FEAT-032's `fbc4a5b`) — **the repository as currently committed is broken**: a fresh clone at `fbc4a5b` has a component importing a hook file that has never been committed. Confirmed via `git log --all -- apps/web/hooks/use-preferences.ts` returning empty. This needs a decision (commit the hook, or revert the component's dependency on it) before this is genuinely "done" from git's own point of view, not just in the working tree.
+- `apps/web/components/settings/preferences-section.tsx` (committed, see above)
+- `apps/api/models/query.py`, `routes/query.py` — `QueryRequest.rerank` wired through (the `k` field was already wired before this batch); `.agent/API_CONTRACT.md` updated
+- `apps/web/e2e/preferences.e2e.ts` — **UNCOMMITTED**
+**Tests:**
+- `apps/web/e2e/preferences.e2e.ts` — 5 tests: theme persistence (no flash, next-themes' own pre-hydration script), k/rerank/streaming persistence across reload, real request-body verification (k and rerank genuinely reach `POST /query/stream`), streaming-off genuinely uses `POST /query` not `/query/stream`, and a rerank on/off round-trip proving both real code paths complete successfully (not gated on a live timing comparison — see below)
+**Acceptance criteria:**
+- [x] Storage decision: plain `localStorage`, matching next-themes' own already-working pattern — investigated first, found no project rule against it (despite the task brief's own assumption there might be one) and no preference here ever needs server-side lookup
+- [x] `rerank` defaults off, discloses its own real measured ~380ms cost in the UI copy (`.agent/MEMORY.md`'s 2026-07-27 measurement), not presented as a free toggle
+- [x] Real backend wiring proven via request-body inspection, not just "the toggle state saved" — **not** via a live latency comparison, which was tried first and found genuinely unreliable in this environment (two different measurement approaches both produced real, contradictory swings from Gemini generation's own independent latency variance) and deliberately dropped in favor of the request-body proof
+
+**Changelog:** Not yet committed — see the file-level gap noted above. No CHANGELOG.md entry exists for this batch.
+
+---
+
+### [FEAT-034] Export conversations (Settings batch 3, part 1)
+**Phase:** 4 (Settings)
+**Status:** complete
+**Owner:** claude-code
+**Depends on:** FEAT-026, FEAT-032
+**Files:**
+- `apps/api/routes/export.py` (new), `models/export.py` (new), `db/queries.py` (deliberately separate, unfiltered query functions — reusing the live-view queries would have silently inherited their `unsupported`-verdict filtering)
+- `apps/web/components/settings/export-section.tsx` (new), `lib/api/export.ts` (new)
+- `.agent/API_CONTRACT.md` updated same-commit; replaces a stale "Not-yet-defined" stub that had anticipated a narrower, single-conversation, Markdown-only shape
+**Tests:**
+- `apps/api/tests/test_export.py` (346 lines) — completeness proven against ground-truth DB counts across all four verdict labels including `unsupported` (which the live UI never shows), real two-user content-inspection isolation test
+- `apps/web/e2e/export.e2e.ts` — 3 tests, real browser download inspected directly (not just "the request returned 200")
+**Acceptance criteria:**
+- [x] Scope is conversations/messages/citations only, explicitly not source documents — stated in code, UI copy, and API_CONTRACT.md
+- [x] Both JSON (complete, including fields never in any live API response — `claim_span`, `verifier_model`, `verified_at`) and Markdown (footnote-style citations matching the app's own motif) — real 2-format e2e coverage
+- [x] Synchronous, unrated-limited — both justified explicitly against this project's real portfolio-scale rather than defaulted into a job-queue/rate-limit pattern
+- [x] **Real bug found and fixed via the e2e test actually inspecting the downloaded file, not trusting a 200:** CORS wasn't exposing `Content-Disposition`, so real browser downloads silently got a generic filename instead of the real one — fixed in `main.py`'s `CORSMiddleware` (`expose_headers`)
+
+**Changelog:** See CHANGELOG.md 2026-08-07, commit `f5d8d32`.
+
+---
+
+### [FEAT-035] Permanent account deletion (Settings batch 3, part 2)
+**Phase:** 4 (Settings)
+**Status:** complete
+**Owner:** claude-code
+**Depends on:** FEAT-032, FEAT-034
+**Files:**
+- `apps/api/routes/account.py` (new) — `DELETE /account`
+- `.agent/SCHEMA.md` updated same-commit (found and fixed stale during this feature's own required enumeration step — `usage_counters` and the `avatars` bucket were both missing from SCHEMA.md entirely before this)
+**Tests:**
+- `apps/api/tests/test_account.py` (361 lines) — seeds real data across every user-scoped category (document+chunk+figure, conversation+message+citation, `usage_counters`, avatar), deletes, independently verifies via direct admin/Storage queries that all 6 tables, all 3 buckets, and the `auth.users` row itself are empty/gone; a real Storage-outage simulation proves retry-safety; two tests prove the real post-deletion session behavior (a stale access token resolves to empty results, not a crash; the refresh path is closed immediately)
+- `apps/web/e2e/account-deletion.e2e.ts` (3 tests) — real password + typed-email-match confirmation dialog, wrong password blocks deletion (account survives), real deletion confirmed by a subsequent real failed sign-in attempt
+**Acceptance criteria:**
+- [x] Full enumeration by grepping every migration for `user_id`/`storage.buckets`, not from memory — 6 tables (all cascade automatically via existing `on delete cascade` FKs), 3 Storage buckets (all need explicit cleanup — `storage.objects` has no real FK to `auth.users`)
+- [x] Storage cleaned first (fixed order), auth user deleted last, only once all three buckets succeed — a mid-sequence failure leaves the account fully intact and retry-safe, proven live
+- [x] Password reauthentication + typed-email-match confirmation, both required
+- [x] **Real bug caught by the e2e suite, not assumed away:** the initial version skipped client-side sign-out, reasoning the account was already gone server-side — not sufficient, since the browser's own Supabase session cookie was untouched and Next.js middleware used it to bounce the post-deletion redirect straight back to `/documents`. Fixed with a local-only `signOut({scope:'local'})` before navigating.
+
+**Changelog:** See CHANGELOG.md 2026-08-07, commit `e765e34`.
+
+---
+
 ## Phase 5 — Deploy (see SCOPE.md for full list)
 
 - [FEAT-021] Vercel prod deploy — planned
-- [FEAT-022] Render prod deploy — planned
+- [FEAT-022] Render prod deploy — **done 2026-07-27/28, not "planned"** (corrected 2026-08-07 docs-reconciliation pass — SCOPE.md's own Phase 5 checklist already had this checked off with real evidence; this one-line status just never got updated to match). Live at `https://docify-api.onrender.com`. See CHANGELOG.md 2026-07-28 "docs: document the real Render production deploy."
 - [FEAT-023] Landing page + demo — planned
 - (FEAT-024 built 2026-07-28 — see its entry above, filed after FEAT-020, its most recent code dependency)
 - [FEAT-025] Error tracking (Sentry free) — planned
+- (FEAT-028 through FEAT-035 built 2026-08-04 through 2026-08-07 — filed under Phase 3/4 above, near their nearest code dependency, not here — Settings/chat-modernization work, not a Phase 5 deploy concern)
 
 ---
 
