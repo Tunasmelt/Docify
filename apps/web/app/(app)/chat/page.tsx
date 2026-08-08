@@ -192,7 +192,7 @@ export default function ConversationListPage() {
               </div>
             ) : loadError ? (
               <div className="mt-14 text-center">
-                <p className="m-0 font-serif text-lg text-muted">Couldn't load your conversations</p>
+                <p className="m-0 font-serif text-lg text-muted">Couldn&apos;t load your conversations</p>
                 <p className="mx-auto mt-1 max-w-[320px] text-sm leading-relaxed text-faint">{loadError}</p>
                 <Button type="button" variant="outline" size="sm" className="mt-4" onClick={handleRetryLoad}>
                   Try again

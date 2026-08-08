@@ -85,7 +85,7 @@ export function EmailSection({ currentEmail }: EmailSectionProps) {
         >
           <p className="m-0 font-medium">Check your inbox to confirm</p>
           <p className="m-0 mt-1">
-            We've sent confirmation links to <span className="font-medium">{currentEmail}</span> (your current
+            We&apos;ve sent confirmation links to <span className="font-medium">{currentEmail}</span> (your current
             address) and <span className="font-medium">{pendingEmail}</span> (the new one). Click the link in
             either email to complete the change.
           </p>

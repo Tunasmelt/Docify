@@ -60,7 +60,7 @@ export default function UpdatePasswordPage() {
             <em className="italic text-[#8FC5A8]">password</em>.<sup className="text-2xl text-[#4C9B75]">1</sup>
           </h1>
           <p className="m-0 max-w-[400px] text-base leading-relaxed text-[#B8AF9F]">
-            Choose something you haven't used before. You'll be signed
+            Choose something you haven&apos;t used before. You&apos;ll be signed
             straight back into your workspace.
           </p>
         </div>

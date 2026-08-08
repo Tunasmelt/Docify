@@ -57,10 +57,10 @@ export function SecuritySection() {
           <div>
             <p className="m-0 text-[14px] font-medium">Other sessions</p>
             <p className="m-0 mt-0.5 max-w-[420px] text-[13px] leading-relaxed text-faint">
-              Revoke access everywhere else you're logged in — this browser stays signed in. Other sessions
-              stop working the next time they'd need to refresh, not necessarily this instant. A device list
-              isn't something Supabase Auth exposes, but this covers the same real need if you think your
-              account was accessed somewhere you don't recognize.
+              Revoke access everywhere else you&apos;re logged in — this browser stays signed in. Other sessions
+              stop working the next time they&apos;d need to refresh, not necessarily this instant. A device list
+              isn&apos;t something Supabase Auth exposes, but this covers the same real need if you think your
+              account was accessed somewhere you don&apos;t recognize.
             </p>
           </div>
           <Button

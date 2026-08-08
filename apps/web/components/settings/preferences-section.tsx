@@ -77,8 +77,8 @@ export function PreferencesSection() {
             <span className="mt-0.5 block max-w-[440px] text-[13px] leading-relaxed text-faint">
               Sends retrieved passages through a second, real reranking pass before answering.{" "}
               <span className="font-medium text-ink">Adds roughly 380ms to every question</span> — this
-              project's own measurements found it made results no worse, but improvement over the default
-              wasn't demonstrated for typical questions either. Off by default; turn on if you're seeing
+              project&apos;s own measurements found it made results no worse, but improvement over the default
+              wasn&apos;t demonstrated for typical questions either. Off by default; turn on if you&apos;re seeing
               retrieval quality issues.
             </span>
           </span>
@@ -95,7 +95,7 @@ export function PreferencesSection() {
           <span>
             <span className="block text-[14px] font-medium">Stream answers as they generate</span>
             <span className="mt-0.5 block max-w-[440px] text-[13px] leading-relaxed text-faint">
-              Shows text as it's written, with live retrieving/verifying progress. Turn off to wait for the
+              Shows text as it&apos;s written, with live retrieving/verifying progress. Turn off to wait for the
               complete, verified answer in one response — {" "}
               {preferences.streaming ? "default." : "no live progress indicator, single wait instead."}
             </span>
