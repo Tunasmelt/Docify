@@ -3,6 +3,14 @@ import { NextResponse, type NextRequest } from "next/server";
 
 const AUTH_PATHS = ["/login", "/signup"];
 
+// The landing page ("/") — public like AUTH_PATHS (an unauthenticated
+// visitor must see it, not bounce to /login), but also redirects an
+// authenticated visitor onward like AUTH_PATHS do, straight to
+// /documents rather than showing marketing copy to someone already
+// signed in. Exact-match only: pathname.startsWith("/") would match
+// every route in the app, unlike AUTH_PATHS's prefix check.
+const LANDING_PATH = "/";
+
 // The PKCE code-exchange route (OAuth + password recovery) establishes auth
 // state itself — it must never be bounced by either redirect branch below,
 // since at the point middleware runs, that state doesn't exist yet.
@@ -42,8 +50,9 @@ export async function middleware(request: NextRequest) {
   const { data } = await supabase.auth.getClaims();
   const isAuthenticated = data !== null;
   const isAuthPath = AUTH_PATHS.some((path) => pathname.startsWith(path));
+  const isLandingPath = pathname === LANDING_PATH;
 
-  if (!isAuthenticated && !isAuthPath) {
+  if (!isAuthenticated && !isAuthPath && !isLandingPath) {
     const url = request.nextUrl.clone();
     url.pathname = "/login";
     const redirectResponse = NextResponse.redirect(url);
@@ -51,7 +60,7 @@ export async function middleware(request: NextRequest) {
     return redirectResponse;
   }
 
-  if (isAuthenticated && isAuthPath) {
+  if (isAuthenticated && (isAuthPath || isLandingPath)) {
     const url = request.nextUrl.clone();
     url.pathname = "/documents";
     const redirectResponse = NextResponse.redirect(url);

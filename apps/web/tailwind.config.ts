@@ -65,6 +65,10 @@ const config: Config = {
           "0%": { transform: "translateX(-100%)" },
           "100%": { transform: "translateX(300%)" },
         },
+        caret: {
+          "0%, 100%": { opacity: "1" },
+          "50%": { opacity: "0" },
+        },
       },
       animation: {
         shimmer: "shimmer 1.4s linear infinite",
@@ -72,6 +76,7 @@ const config: Config = {
         "fade-up": "fadeUp 0.5s ease both",
         "slide-in": "slideIn 0.25s ease both",
         "indeterminate-bar": "indeterminate 1.2s ease-in-out infinite",
+        caret: "caret 1s step-end infinite",
       },
     },
   },
