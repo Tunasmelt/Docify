@@ -43,7 +43,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 # alone trusted silently; the explicit list below is what actually needs
 # to exist at runtime (main.py's imports, migrations/ for reference only —
 # not applied by the running app, kept out on purpose, see below).
-COPY main.py errors.py ./
+COPY main.py errors.py rate_limit.py ./
 COPY db ./db
 COPY middleware ./middleware
 COPY models ./models
