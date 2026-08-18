@@ -20,16 +20,21 @@
 # which the default (non-test) path now uses for batch-splitting token
 # counts instead of chunker.py's char/4 proxy.
 
+import copy
 import os
 from unittest.mock import patch
 
+import httpx
 import pytest
 import voyageai
+from google.genai.errors import ClientError as GeminiClientError
 from PIL import Image
 from voyageai.error import AuthenticationError, InvalidRequestError, RateLimitError
 
 from services.chunker import Chunk, Chunker
 from services.embedder import (
+    GEMINI_DEFAULT_RETRY_DELAY_SECONDS,
+    GEMINI_FALLBACK_MAX_ATTEMPTS,
     GEMINI_MAX_INPUT_TOKENS,
     GEMINI_MAX_INPUTS_PER_BATCH,
     MAX_INPUTS_PER_BATCH,
@@ -39,6 +44,9 @@ from services.embedder import (
     _chunk_to_input,
     _estimate_gemini_input_tokens,
     _gemini_image_tokens,
+    _is_gemini_rate_limit_error,
+    _parse_gemini_retry_delay_seconds,
+    _RetryAfterAwareVoyageClient,
     _GEMINI_SAFE_INPUT_TOKENS,
 )
 from services.parser import ElementType, Parser
@@ -161,6 +169,95 @@ class ShortCountVoyageClient:
 
 def make_embedder(client=None):
     return Embedder(client=client or FakeVoyageClient(), tokenizer=FakeTokenizer())
+
+
+# --- 2026-08-18 real production incident: a 108-chunk document exhausted
+# Voyage's real 3 RPM ceiling, correctly fell back to Gemini, then ALSO
+# exhausted Gemini's real 100 RPM ceiling on the very first fallback call
+# — total ingest failure. Root cause: neither provider's retry logic read
+# the real, server-provided retry delay both actually expose. See
+# .agent/MEMORY.md and the module comments in services/embedder.py for
+# the full investigation. The payload below is the REAL error text from
+# this incident's Render logs, used verbatim, not a paraphrase.
+_REAL_INCIDENT_GEMINI_429_PAYLOAD = {
+    "error": {
+        "code": 429,
+        "message": (
+            "You exceeded your current quota, please check your plan and billing details. "
+            "For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits. "
+            "To monitor your current usage, head to: https://ai.dev/rate-limit. \n"
+            "* Quota exceeded for metric: generativelanguage.googleapis.com/embed_content_free_tier_requests, "
+            "limit: 100, model: gemini-embedding-2\nPlease retry in 15.65861672s."
+        ),
+        "status": "RESOURCE_EXHAUSTED",
+        "details": [
+            {
+                "@type": "type.googleapis.com/google.rpc.Help",
+                "links": [
+                    {
+                        "description": "Learn more about Gemini API quotas",
+                        "url": "https://ai.google.dev/gemini-api/docs/rate-limits",
+                    }
+                ],
+            },
+            {
+                "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                "violations": [
+                    {
+                        "quotaMetric": "generativelanguage.googleapis.com/embed_content_free_tier_requests",
+                        "quotaId": "EmbedContentRequestsPerMinutePerUserPerProjectPerModel-FreeTier",
+                        "quotaDimensions": {"model": "gemini-embedding-2", "location": "global"},
+                        "quotaValue": "100",
+                    }
+                ],
+            },
+            {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "15s"},
+        ],
+    }
+}
+
+
+def _real_gemini_429_error(retry_delay: str | None = "15s") -> GeminiClientError:
+    """Builds a REAL google.genai.errors.ClientError the same way the SDK
+    itself does (errors.py's raise_for_response) — a real httpx.Response,
+    not a hand-rolled fake with stubbed attributes — using the exact
+    verbatim payload from the 2026-08-18 incident, optionally with a
+    different or absent retryDelay to test parsing/fallback specifically.
+    Mirrors test_verifier.py's own `_fake_client_error` helper, which
+    uses this identical real-httpx.Response technique for the same SDK."""
+    payload = copy.deepcopy(_REAL_INCIDENT_GEMINI_429_PAYLOAD)
+    if retry_delay is None:
+        payload["error"]["details"] = [d for d in payload["error"]["details"] if not d["@type"].endswith("RetryInfo")]
+    else:
+        for d in payload["error"]["details"]:
+            if d["@type"].endswith("RetryInfo"):
+                d["retryDelay"] = retry_delay
+    response = httpx.Response(429, json=payload)
+    return GeminiClientError(429, response)
+
+
+class _FlakyGeminiModels:
+    """Raises the given error for the first `fail_times` embed_content
+    calls, then succeeds — proves the new bounded retry genuinely
+    retries and eventually returns a real result, not just parses the
+    error and gives up anyway."""
+
+    def __init__(self, error: Exception, fail_times: int, dim=1024):
+        self.error = error
+        self.fail_times = fail_times
+        self.dim = dim
+        self.calls = []
+
+    def embed_content(self, *, model, contents, config=None):
+        self.calls.append({"model": model, "contents": contents, "config": config})
+        if len(self.calls) <= self.fail_times:
+            raise self.error
+        return FakeGeminiResponse([FakeGeminiEmbedding(values=[float(i)] * self.dim) for i in range(len(contents))])
+
+
+class _FlakyGeminiClient:
+    def __init__(self, error: Exception, fail_times: int, dim=1024):
+        self.models = _FlakyGeminiModels(error, fail_times, dim=dim)
 
 
 # Acceptance criterion: `Embedder.embed(chunks) -> list[Vector]` handles text-only and text+image chunks
@@ -613,6 +710,209 @@ def test_gemini_image_tokens_matches_the_real_verified_flat_constant(width, heig
         assert _gemini_image_tokens(image) == 258
     finally:
         image.close()
+
+
+# --- Part 1 (2026-08-18 incident fix): Gemini fallback retry, honoring
+# the real server-provided retryDelay --------------------------------------
+
+
+def test_is_gemini_rate_limit_error_true_only_for_a_genuine_429():
+    assert _is_gemini_rate_limit_error(_real_gemini_429_error()) is True
+    assert _is_gemini_rate_limit_error(GeminiClientError(400, httpx.Response(400, json={"error": {"message": "bad request", "status": "INVALID_ARGUMENT"}}))) is False
+    assert _is_gemini_rate_limit_error(GeminiClientError(401, httpx.Response(401, json={"error": {"message": "bad key", "status": "UNAUTHENTICATED"}}))) is False
+    assert _is_gemini_rate_limit_error(RuntimeError("not even an APIError")) is False
+
+
+def test_parse_gemini_retry_delay_seconds_reads_the_real_incident_value():
+    assert _parse_gemini_retry_delay_seconds(_real_gemini_429_error()) == 15.0
+
+
+def test_parse_gemini_retry_delay_seconds_reads_a_different_real_value():
+    """Proves this genuinely PARSES the field rather than coincidentally
+    returning a hardcoded 15.0 that happens to match both the real
+    incident value and the module's own default."""
+    assert _parse_gemini_retry_delay_seconds(_real_gemini_429_error(retry_delay="30s")) == 30.0
+    assert _parse_gemini_retry_delay_seconds(_real_gemini_429_error(retry_delay="2.5s")) == 2.5
+
+
+def test_parse_gemini_retry_delay_seconds_falls_back_to_default_when_missing():
+    assert _parse_gemini_retry_delay_seconds(_real_gemini_429_error(retry_delay=None)) == GEMINI_DEFAULT_RETRY_DELAY_SECONDS
+
+
+def test_parse_gemini_retry_delay_seconds_falls_back_to_default_when_malformed():
+    assert (
+        _parse_gemini_retry_delay_seconds(_real_gemini_429_error(retry_delay="not-a-duration"))
+        == GEMINI_DEFAULT_RETRY_DELAY_SECONDS
+    )
+
+
+def test_gemini_fallback_retries_on_the_real_incident_payload_and_succeeds():
+    """The core fix, proven against the VERBATIM real incident error text
+    (not a paraphrase): one failure with a real retryDelay, one retry,
+    one success. sleep_fn is a plain recorder, not a real time.sleep —
+    this test must run in milliseconds, not 15 real seconds, so the real
+    delay VALUE is asserted directly instead of timed."""
+    sleeps = []
+    error = _real_gemini_429_error()  # real incident payload, retryDelay: '15s'
+    fake_gemini = _FlakyGeminiClient(error=error, fail_times=1)
+    real_voyage = voyageai.Client(api_key="dummy-key-never-sent", max_retries=3)
+    embedder = Embedder(
+        client=real_voyage, tokenizer=FakeTokenizer(), gemini_client=fake_gemini, sleep_fn=sleeps.append
+    )
+
+    with patch("voyageai.MultimodalEmbedding.create", side_effect=RateLimitError("simulated 429, never recovers")):
+        embedded = embedder.embed([make_chunk(content="hello")])
+
+    assert len(fake_gemini.models.calls) == 2, "expected exactly 2 real Gemini calls: 1 failed + 1 succeeded"
+    assert sleeps == [15.0], f"expected the retry to wait exactly the real incident's retryDelay (15.0s), got {sleeps}"
+    assert len(embedded) == 1
+    assert embedded[0].provider == "gemini"
+    assert len(embedded[0].vector) == 1024
+
+
+def test_gemini_fallback_honors_a_different_real_retry_delay_value():
+    sleeps = []
+    error = _real_gemini_429_error(retry_delay="7.5s")
+    fake_gemini = _FlakyGeminiClient(error=error, fail_times=1)
+    real_voyage = voyageai.Client(api_key="dummy-key-never-sent", max_retries=3)
+    embedder = Embedder(
+        client=real_voyage, tokenizer=FakeTokenizer(), gemini_client=fake_gemini, sleep_fn=sleeps.append
+    )
+
+    with patch("voyageai.MultimodalEmbedding.create", side_effect=RateLimitError("simulated 429, never recovers")):
+        embedder.embed([make_chunk(content="hello")])
+
+    assert sleeps == [7.5]
+
+
+def test_gemini_fallback_stops_retrying_after_max_attempts_and_raises_embed_error():
+    """Bounded, not indefinite — this is already a last-resort fallback
+    path; it must not become its own quota-burning problem."""
+    sleeps = []
+    error = _real_gemini_429_error()
+    # Never recovers — fails every single call, more than GEMINI_FALLBACK_MAX_ATTEMPTS.
+    fake_gemini = _FlakyGeminiClient(error=error, fail_times=999)
+    real_voyage = voyageai.Client(api_key="dummy-key-never-sent", max_retries=3)
+    embedder = Embedder(
+        client=real_voyage, tokenizer=FakeTokenizer(), gemini_client=fake_gemini, sleep_fn=sleeps.append
+    )
+
+    with patch("voyageai.MultimodalEmbedding.create", side_effect=RateLimitError("simulated 429, never recovers")):
+        with pytest.raises(EmbedError):
+            embedder.embed([make_chunk(content="hello")])
+
+    assert len(fake_gemini.models.calls) == GEMINI_FALLBACK_MAX_ATTEMPTS == 3
+    assert len(sleeps) == GEMINI_FALLBACK_MAX_ATTEMPTS - 1 == 2, "sleeps between attempts only, never after the final one"
+
+
+def test_gemini_fallback_does_not_retry_on_a_non_rate_limit_error():
+    """Cost/scope guard: a genuine misconfiguration (bad request, auth
+    failure) must fail immediately, exactly like before this fix — only
+    the real 429/RESOURCE_EXHAUSTED signal is retry-worthy."""
+    sleeps = []
+    bad_request = GeminiClientError(
+        400, httpx.Response(400, json={"error": {"message": "malformed request", "status": "INVALID_ARGUMENT"}})
+    )
+    fake_gemini = _FlakyGeminiClient(error=bad_request, fail_times=999)
+    real_voyage = voyageai.Client(api_key="dummy-key-never-sent", max_retries=3)
+    embedder = Embedder(
+        client=real_voyage, tokenizer=FakeTokenizer(), gemini_client=fake_gemini, sleep_fn=sleeps.append
+    )
+
+    with patch("voyageai.MultimodalEmbedding.create", side_effect=RateLimitError("simulated 429, never recovers")):
+        with pytest.raises(EmbedError):
+            embedder.embed([make_chunk(content="hello")])
+
+    assert len(fake_gemini.models.calls) == 1, "no retry — must fail on the very first attempt"
+    assert sleeps == []
+
+
+# --- Part 2 (2026-08-18 incident fix): Voyage's own retry wait strategy,
+# now honoring a real server-provided retry-after header instead of a
+# fixed exponential-jitter schedule -----------------------------------------
+
+
+def test_voyage_retry_honors_a_real_retry_after_header_and_succeeds_on_retry():
+    """_RetryAfterAwareVoyageClient overrides ONLY the wait strategy —
+    same real SDK request/response machinery as every other test in this
+    file (voyageai.MultimodalEmbedding.create patched), same
+    stop_after_attempt(3), same retryable-exception set. The only thing
+    under test here is: does a real retry-after header actually get
+    read and honored, instead of thrown away."""
+    sleeps = []
+    call_count = 0
+
+    def flaky_create(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # Real shape: api_requestor.py's handle_error_response passes
+            # the real HTTP response headers straight through to the
+            # raised exception — headers={"retry-after": "5"} here mirrors
+            # exactly what a real 429 response with that header produces.
+            raise RateLimitError("simulated 429 with a real retry-after header", headers={"retry-after": "5"})
+        return _fake_sdk_response(1)
+
+    real_client = _RetryAfterAwareVoyageClient(api_key="dummy-key-never-sent", max_retries=3, sleep_fn=sleeps.append)
+    embedder = Embedder(client=real_client, tokenizer=FakeTokenizer())
+
+    with patch("voyageai.MultimodalEmbedding.create", side_effect=flaky_create):
+        vectors = embedder.embed([make_chunk(content="hello")])
+
+    assert len(vectors) == 1
+    assert call_count == 2  # 1 failure + 1 success
+    assert sleeps == [5.0], f"expected the real retry-after header (5s) to be honored exactly, got {sleeps}"
+
+
+def test_voyage_retry_falls_back_to_exponential_jitter_when_no_retry_after_header():
+    """No header present -> behavior must be UNCHANGED from the SDK's
+    original fixed jittered-exponential curve (can't assert an exact
+    value since it's genuinely randomized — asserts it's a real,
+    reasonable positive wait instead, and that retry still happens)."""
+    sleeps = []
+    call_count = 0
+
+    def flaky_create(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise RateLimitError("simulated 429, no retry-after header at all")  # headers defaults to {}
+        return _fake_sdk_response(1)
+
+    real_client = _RetryAfterAwareVoyageClient(api_key="dummy-key-never-sent", max_retries=3, sleep_fn=sleeps.append)
+    embedder = Embedder(client=real_client, tokenizer=FakeTokenizer())
+
+    with patch("voyageai.MultimodalEmbedding.create", side_effect=flaky_create):
+        vectors = embedder.embed([make_chunk(content="hello")])
+
+    assert len(vectors) == 1
+    assert len(sleeps) == 1
+    assert 0 < sleeps[0] <= 16, f"expected the original wait_exponential_jitter(initial=1, max=16) range, got {sleeps[0]}"
+
+
+def test_voyage_retry_after_header_ignored_when_non_numeric():
+    """A malformed/non-numeric retry-after header must degrade to the
+    original jittered-exponential behavior, never crash the retry path
+    itself."""
+    sleeps = []
+    call_count = 0
+
+    def flaky_create(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise RateLimitError("simulated 429 with a garbage retry-after header", headers={"retry-after": "not-a-number"})
+        return _fake_sdk_response(1)
+
+    real_client = _RetryAfterAwareVoyageClient(api_key="dummy-key-never-sent", max_retries=3, sleep_fn=sleeps.append)
+    embedder = Embedder(client=real_client, tokenizer=FakeTokenizer())
+
+    with patch("voyageai.MultimodalEmbedding.create", side_effect=flaky_create):
+        vectors = embedder.embed([make_chunk(content="hello")])
+
+    assert len(vectors) == 1
+    assert len(sleeps) == 1
+    assert 0 < sleeps[0] <= 16
 
 
 def test_embed_query_uses_voyage_by_default():

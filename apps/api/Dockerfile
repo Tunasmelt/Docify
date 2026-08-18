@@ -39,6 +39,21 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
+# Bundle Voyage's real tokenizer files into the image at build time
+# (2026-08-18 incident fix) instead of fetching them from HuggingFace Hub
+# on every cold start. Render's ephemeral filesystem means a fresh
+# container starts with an empty local cache every time — confirmed live
+# (real, cleared-cache local measurement): an unauthenticated fetch takes
+# ~1.9s of real network time, and HF Hub's own warning says unauthenticated
+# requests get reduced rate limits — a second, fragile external dependency
+# this removes entirely, not just a latency optimization. tokenizer()
+# never calls Voyage's own API at all (confirmed against the installed
+# SDK source: tokenizers.Tokenizer.from_pretrained only touches the
+# public HF Hub repo "voyageai/<model>"), so a dummy API key is genuinely
+# correct here, not a placeholder standing in for a real one. The string
+# below must match services/embedder.py's MODEL constant.
+RUN .venv/bin/python -c "import voyageai; voyageai.Client(api_key='build-time-tokenizer-warmup').tokenizer('voyage-multimodal-3.5')"
+
 # Real app source — deliberately not `COPY . .` with a blanket .dockerignore
 # alone trusted silently; the explicit list below is what actually needs
 # to exist at runtime (main.py's imports, migrations/ for reference only —

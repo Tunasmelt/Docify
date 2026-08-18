@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import time
 from dataclasses import dataclass
 from io import BytesIO
 from typing import TYPE_CHECKING
@@ -9,6 +11,8 @@ from typing import TYPE_CHECKING
 import voyageai
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError as GeminiAPIError
+from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 from voyageai.error import RateLimitError, ServiceUnavailableError, Timeout, VoyageError
 
 # 2026-08-01 (FEAT-027): same fix as db/queries.py — Chunk is used only as a
@@ -25,6 +29,77 @@ logger = logging.getLogger(__name__)
 MODEL = "voyage-multimodal-3.5"
 OUTPUT_DIMENSION = 1024  # matches .agent/SCHEMA.md's chunks.embedding vector(1024)
 MAX_RETRIES = 3
+
+
+# ── Voyage retry-after wiring (2026-08-18 incident fix) ──────────────────
+#
+# Real incident: a 108-chunk document exhausted Voyage's real 3 RPM
+# ceiling, fell back to Gemini per the existing chain, then ALSO
+# exhausted Gemini's real 100 RPM ceiling — total ingest failure. Root
+# cause investigation found BOTH providers' SDKs expose a real,
+# server-provided retry delay that neither's retry logic ever reads:
+# Voyage's `VoyageHttpResponse.retry_after` property parses a real
+# `retry-after` response header but is never wired into anything: the
+# SDK's own `_make_retry_controller()` (voyageai/client.py) always uses a
+# FIXED `wait_exponential_jitter(initial=1, max=16)` schedule, completely
+# independent of what the server actually says to wait. Confirmed via
+# the installed SDK source (api_requestor.py's `handle_error_response`)
+# that the real HTTP response headers ARE passed straight through onto
+# the raised RateLimitError/ServiceUnavailableError/Timeout as `.headers`
+# — the data is there, just never used.
+#
+# Fix: override ONLY the wait strategy, via the SDK's own extension point
+# (`_make_retry_controller()`) — not a second, separate outer retry loop
+# stacked on top (that would multiply attempts, since the SDK's own
+# `stop_after_attempt(max_retries)` still runs unmodified underneath).
+# stop/retry conditions (which exceptions are retryable, how many total
+# attempts) are byte-identical to the real SDK's own; only how long each
+# wait is changes.
+def _voyage_retry_after_wait(retry_state) -> float:
+    """Dynamic, server-guided wait for Voyage's retry controller. Reads
+    the real `retry-after` header off the exception that just failed
+    (present on RateLimitError/ServiceUnavailableError/Timeout per
+    api_requestor.py's `handle_error_response`, confirmed against
+    installed SDK source) and waits exactly that long. Falls back to the
+    SDK's own original `wait_exponential_jitter(initial=1, max=16)`
+    curve whenever the header is absent or doesn't parse as a real
+    number — behavior is UNCHANGED from before for any failure that
+    doesn't carry a real server-guided delay."""
+    outcome = retry_state.outcome
+    exc = outcome.exception() if outcome is not None else None
+    headers = getattr(exc, "headers", None) or {}
+    raw = headers.get("retry-after")
+    if raw is not None:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            logger.warning("Voyage retry-after header %r did not parse as a number — using the default backoff curve instead", raw)
+    return wait_exponential_jitter(initial=1, max=16)(retry_state)
+
+
+class _RetryAfterAwareVoyageClient(voyageai.Client):
+    """Identical to voyageai.Client in every respect except the wait
+    strategy between retries. `sleep_fn` is injectable so tests can
+    observe/short-circuit real waits without literally sleeping for the
+    real delay (default `time.sleep`, matching tenacity's own default)."""
+
+    def __init__(self, *args, sleep_fn=time.sleep, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._sleep_fn = sleep_fn
+
+    def _make_retry_controller(self) -> Retrying:
+        return Retrying(
+            reraise=True,
+            stop=stop_after_attempt(self.max_retries),
+            wait=_voyage_retry_after_wait,
+            retry=(
+                retry_if_exception_type(RateLimitError)
+                | retry_if_exception_type(ServiceUnavailableError)
+                | retry_if_exception_type(Timeout)
+            ),
+            sleep=self._sleep_fn,
+        )
+
 
 # Fallback provider (2026-07-31) — see .agent/MEMORY.md's "embedding
 # spaces are not comparable" entry before touching this. gemini-embedding-2
@@ -160,12 +235,14 @@ def _batch_chunks(chunks: list[Chunk], tokenizer) -> list[list[Chunk]]:
     return batches
 
 
-def _default_client() -> voyageai.Client:
+def _default_client(sleep_fn=time.sleep) -> voyageai.Client:
     # max_retries=3: the Voyage SDK's own tenacity-based retry (exponential
-    # backoff + jitter) already handles RateLimitError/
+    # backoff + jitter, now overridden to honor a real server-provided
+    # retry-after delay when one is present — see
+    # _RetryAfterAwareVoyageClient above) already handles RateLimitError/
     # ServiceUnavailableError/Timeout natively — see .agent/api-docs/
     # voyage.md. No hand-rolled retry loop needed or wanted here.
-    return voyageai.Client(max_retries=MAX_RETRIES)
+    return _RetryAfterAwareVoyageClient(max_retries=MAX_RETRIES, sleep_fn=sleep_fn)
 
 
 # ── Gemini fallback (2026-07-31) ─────────────────────────────────────────
@@ -242,6 +319,63 @@ def _default_client() -> voyageai.Client:
 
 GEMINI_MAX_INPUTS_PER_BATCH = 100
 GEMINI_MAX_INPUT_TOKENS = 8_192
+
+# ── Gemini retry-after wiring (2026-08-18 incident fix) ──────────────────
+#
+# Real incident: this fallback made exactly ONE real embed_content call
+# for a whole 108-chunk document (Gemini's real batching already covers
+# this — see GEMINI_MAX_INPUTS_PER_BATCH above — so this was never a
+# call-volume problem) and had ZERO retry of any kind: any exception,
+# including a genuinely transient 429 RESOURCE_EXHAUSTED, immediately
+# failed the entire document. Confirmed against the installed
+# google-genai SDK source (_api_client.py, errors.py, models.py) that
+# the SDK itself implements no retry logic anywhere — this project's own
+# call site is the only place one could exist. The real error payload
+# DOES carry the server's own suggested wait
+# (google.rpc.RetryInfo.retryDelay, e.g. '15s' in the real incident) —
+# previously computed by Google and thrown away unread.
+GEMINI_FALLBACK_MAX_ATTEMPTS = 3  # 1 initial attempt + up to 2 retries — bounded on purpose; this is
+# already a last-resort fallback path, not somewhere that should be free to retry indefinitely and
+# become its own quota-burning problem.
+GEMINI_DEFAULT_RETRY_DELAY_SECONDS = 15.0  # matches the real value observed in the 2026-08-18 incident;
+# used whenever a genuine rate-limit error's retryDelay field is absent or doesn't parse — deliberately
+# a safe, honest default rather than silently waiting 0s or letting a malformed field crash the retry
+# path meant to recover from the original error.
+
+
+def _is_gemini_rate_limit_error(exc: Exception) -> bool:
+    """True only for a genuine 429 RESOURCE_EXHAUSTED — the one real,
+    transient, retry-worthy failure mode. Every other GeminiAPIError
+    (bad request, auth failure, ...) or non-APIError exception (network,
+    timeout) must NOT retry — mirrors this module's own Voyage
+    RateLimitError-vs-VoyageError distinction in Embedder.embed() for
+    the same reason: retrying a genuine misconfiguration would just
+    silently delay a failure that retrying can never fix."""
+    if not isinstance(exc, GeminiAPIError):
+        return False
+    return exc.code == 429 or exc.status == "RESOURCE_EXHAUSTED"
+
+
+def _parse_gemini_retry_delay_seconds(exc: Exception) -> float:
+    """Extracts the real, server-provided retryDelay from a genuine
+    429's error payload (a google.rpc.RetryInfo entry in
+    error.details[], e.g. '15s' — confirmed against the real 2026-08-18
+    incident payload, verbatim). Falls back to
+    GEMINI_DEFAULT_RETRY_DELAY_SECONDS whenever the field is missing or
+    doesn't match the documented "<number>s" duration format —
+    deliberately never raises here: a malformed field must degrade to a
+    safe default, not crash the retry path meant to recover from the
+    original error."""
+    details = getattr(exc, "details", None)
+    if isinstance(details, dict):
+        for item in details.get("error", {}).get("details", []) or []:
+            if not isinstance(item, dict) or not str(item.get("@type", "")).endswith("RetryInfo"):
+                continue
+            match = re.fullmatch(r"(\d+(?:\.\d+)?)s", str(item.get("retryDelay", "")))
+            if match:
+                return float(match.group(1))
+            break
+    return GEMINI_DEFAULT_RETRY_DELAY_SECONDS
 
 # Local, no-extra-API-call estimate for the pre-send safety check below —
 # deliberately conservative (i.e. deliberately overestimates token count),
@@ -322,31 +456,61 @@ def _chunk_to_gemini_content(chunk: Chunk) -> types.Content:
     return types.Content(parts=parts)
 
 
-def _gemini_embed_contents(client: genai.Client, contents: list, task_type: str) -> list[Vector]:
-    """Thin wrapper around one real embed_content call — batches natively
-    (confirmed live: multiple `contents` entries in one call return one
-    embedding per entry, in order, via the same batchEmbedContents
-    endpoint models.py routes through). Raises EmbedError on any SDK
-    failure or a response whose embedding count doesn't match the input
-    count — same no-partial-result discipline as Voyage's path below."""
-    try:
-        response = client.models.embed_content(
-            model=GEMINI_MODEL,
-            contents=contents,
-            config={"task_type": task_type, "output_dimensionality": GEMINI_OUTPUT_DIMENSION},
-        )
-    except Exception as exc:  # genai raises its own exception hierarchy, not VoyageError's
-        raise EmbedError(f"Gemini embedding failed: {exc}") from exc
+def _gemini_embed_contents(
+    client: genai.Client, contents: list, task_type: str, sleep_fn=time.sleep
+) -> list[Vector]:
+    """Wrapper around embed_content — batches natively (confirmed live:
+    multiple `contents` entries in one call return one embedding per
+    entry, in order, via the same batchEmbedContents endpoint models.py
+    routes through), and now retries a genuine rate-limit failure up to
+    GEMINI_FALLBACK_MAX_ATTEMPTS times, honoring the real server-provided
+    retryDelay each time (2026-08-18 incident fix — see the module
+    comment above `_is_gemini_rate_limit_error`). Any other failure
+    (bad request, auth, network) raises immediately with no retry, same
+    as before. Raises EmbedError on final failure or a response whose
+    embedding count doesn't match the input count — same no-partial-
+    result discipline as Voyage's path below."""
+    last_exc: Exception | None = None
+    for attempt in range(1, GEMINI_FALLBACK_MAX_ATTEMPTS + 1):
+        try:
+            response = client.models.embed_content(
+                model=GEMINI_MODEL,
+                contents=contents,
+                config={"task_type": task_type, "output_dimensionality": GEMINI_OUTPUT_DIMENSION},
+            )
+        except Exception as exc:  # genai raises its own exception hierarchy, not VoyageError's
+            if attempt < GEMINI_FALLBACK_MAX_ATTEMPTS and _is_gemini_rate_limit_error(exc):
+                delay = _parse_gemini_retry_delay_seconds(exc)
+                logger.warning(
+                    "Gemini embed_content rate-limited (attempt %d/%d, %d input(s)) — honoring the "
+                    "real server-provided retryDelay and retrying in %.2fs",
+                    attempt,
+                    GEMINI_FALLBACK_MAX_ATTEMPTS,
+                    len(contents),
+                    delay,
+                )
+                sleep_fn(delay)
+                last_exc = exc
+                continue
+            raise EmbedError(f"Gemini embedding failed: {exc}") from exc
+        else:
+            if len(response.embeddings) != len(contents):
+                raise EmbedError(
+                    f"Gemini returned {len(response.embeddings)} embeddings for {len(contents)} inputs — "
+                    "refusing to return a partial/misaligned result"
+                )
+            return [list(e.values) for e in response.embeddings]
 
-    if len(response.embeddings) != len(contents):
-        raise EmbedError(
-            f"Gemini returned {len(response.embeddings)} embeddings for {len(contents)} inputs — "
-            "refusing to return a partial/misaligned result"
-        )
-    return [list(e.values) for e in response.embeddings]
+    # Unreachable in practice — the loop above always either returns on
+    # success or raises EmbedError on a non-retryable/final failure —
+    # but keeps this function's contract explicit rather than relying on
+    # that being obvious from the loop shape alone.
+    raise EmbedError(f"Gemini embedding failed after {GEMINI_FALLBACK_MAX_ATTEMPTS} attempts: {last_exc}")
 
 
-def _embed_batch_with_gemini_fallback(batch: list[Chunk], client: genai.Client | None) -> list[EmbeddedChunk]:
+def _embed_batch_with_gemini_fallback(
+    batch: list[Chunk], client: genai.Client | None, sleep_fn=time.sleep
+) -> list[EmbeddedChunk]:
     """The actual fallback: re-embeds one already-failed Voyage batch via
     Gemini, tagging every resulting vector provider="gemini". A failure
     here (missing GEMINI_API_KEY, Gemini's own quota, network) raises
@@ -385,7 +549,7 @@ def _embed_batch_with_gemini_fallback(batch: list[Chunk], client: genai.Client |
     embedded: list[EmbeddedChunk] = []
     for sub_batch in _batch_for_gemini(batch):
         contents = [_chunk_to_gemini_content(c) for c in sub_batch]
-        vectors = _gemini_embed_contents(resolved_client, contents, task_type="RETRIEVAL_DOCUMENT")
+        vectors = _gemini_embed_contents(resolved_client, contents, task_type="RETRIEVAL_DOCUMENT", sleep_fn=sleep_fn)
         embedded.extend(EmbeddedChunk(vector=v, provider="gemini") for v in vectors)
     return embedded
 
@@ -396,6 +560,7 @@ class Embedder:
         client: voyageai.Client | None = None,
         tokenizer=None,
         gemini_client: genai.Client | None = None,
+        sleep_fn=time.sleep,
     ):
         # Lazily resolved on first real use (embed()/embed_query()), not
         # here — a bare voyageai.Client() construction was confirmed live
@@ -420,10 +585,15 @@ class Embedder:
         # download; the default path (no injection) always uses Voyage's
         # real tokenizer.
         self._tokenizer = tokenizer
+        # Injectable so tests can observe/short-circuit real retry waits
+        # (both the Voyage retry-after wait and the Gemini fallback's own
+        # bounded retry, 2026-08-18 incident fix) without literally
+        # sleeping for the real delay. Default is a real time.sleep.
+        self._sleep_fn = sleep_fn
 
     def _get_client(self) -> voyageai.Client:
         if self._client is None:
-            self._client = _default_client()
+            self._client = _default_client(sleep_fn=self._sleep_fn)
         return self._client
 
     def _get_gemini_client(self) -> genai.Client:
@@ -480,7 +650,9 @@ class Embedder:
                     exc,
                 )
                 try:
-                    embedded.extend(_embed_batch_with_gemini_fallback(batch, self._gemini_client))
+                    embedded.extend(
+                        _embed_batch_with_gemini_fallback(batch, self._gemini_client, sleep_fn=self._sleep_fn)
+                    )
                     continue
                 except EmbedError as gemini_exc:
                     raise EmbedError(
@@ -546,6 +718,7 @@ class Embedder:
                 self._get_gemini_client(),
                 [types.Content(parts=[types.Part.from_text(text=text)])],
                 task_type="RETRIEVAL_QUERY",
+                sleep_fn=self._sleep_fn,
             )
             return vectors[0]
 
