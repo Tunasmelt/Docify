@@ -22,6 +22,7 @@ import time
 import pytest
 
 from main import app
+from rate_limit import daily_limit_exceeded_response
 from routes.ingest import INGEST_GLOBAL_MINUTE_LIMIT, INGEST_MINUTE_LIMIT
 from routes.query import QUERY_MINUTE_LIMIT
 from services.generator import GenerateResult, GenerateStreamResult
@@ -31,6 +32,13 @@ from tests.conftest import override_pipeline, clear_pipeline_override, ingest_re
 from tests.test_query import FakeGenerator, FakeRetriever, _clear_overrides, _override, _real_chunk_row, _verdict
 
 NIL_UUID = "00000000-0000-0000-0000-000000000000"
+
+
+def test_daily_limit_message_distinguishes_daily_exhaustion_from_retry_window():
+    response = daily_limit_exceeded_response()
+    assert response.status_code == 429
+    assert b"UTC daily reset" in response.body
+    assert "Retry-After" not in response.headers
 
 
 @pytest.fixture(autouse=True)

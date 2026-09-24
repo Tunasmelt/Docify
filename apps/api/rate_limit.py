@@ -102,13 +102,14 @@ def check_daily_limit(client, *, user_id: str, route: str, limit: int) -> None:
 
 
 def daily_limit_exceeded_response() -> JSONResponse:
-    """Same error envelope/status code as slowapi's own 429 handler below
-    — a client shouldn't be able to tell, from the response alone,
-    whether a 429 came from the in-memory per-minute check or this
-    Postgres-backed daily one."""
+    """Use the standard 429 envelope but distinguish daily exhaustion
+    from the temporary, Retry-After-bearing minute window."""
     return JSONResponse(
         status_code=429,
-        content=error_envelope("RATE_LIMITED", "Rate limit exceeded: daily limit"),
+        content=error_envelope(
+            "RATE_LIMITED",
+            "Daily request limit reached; retry after the UTC daily reset",
+        ),
     )
 
 
