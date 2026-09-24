@@ -278,13 +278,13 @@ class _PartiallyFailingStorageClient:
         return _StorageProxyWithOneFailingBucket(self._real.storage, self._fail_bucket)
 
 
-def test_delete_account_storage_failure_leaves_everything_intact_and_is_retry_safe(app_client, admin, user_a):
+@pytest.mark.parametrize("fail_bucket", ["uploads", "figures", "avatars"])
+def test_delete_account_storage_failure_reports_partial_progress_and_is_retry_safe(
+    app_client, admin, user_a, fail_bucket
+):
     user_id, token = user_a
     seeded = _seed_full_account(app_client, admin, user_id, token)
-    # uploads is cleaned first (routes/account.py's fixed bucket order)
-    # -- failing figures (the second bucket) proves a mid-sequence
-    # failure stops everything after it, including the auth-user delete.
-    failing_client = _PartiallyFailingStorageClient(admin, fail_bucket="figures")
+    failing_client = _PartiallyFailingStorageClient(admin, fail_bucket=fail_bucket)
 
     with patch.object(account_module, "get_service_role_client", return_value=failing_client):
         first_response = app_client.delete("/account", headers={"Authorization": f"Bearer {token}"})
@@ -292,21 +292,39 @@ def test_delete_account_storage_failure_leaves_everything_intact_and_is_retry_sa
     body = first_response.json()
     assert body["error"]["code"] == "STORAGE_ERROR"
     assert "retry" in body["error"]["message"].lower()
+    assert "some files may already be deleted" in body["error"]["message"].lower()
 
-    # Nothing deleted yet: the auth user, every DB row, AND the figures
-    # object (the one that "failed") all still exist. uploads' own
-    # object is already gone (its remove() ran and succeeded before the
-    # figures failure) -- real, expected partial progress, not a bug.
+    # The account and database rows remain. Buckets before the failure
+    # may already be empty; the failed bucket and later buckets remain.
     assert admin.auth.admin.get_user_by_id(user_id).user is not None
     assert admin.table("documents").select("id").eq("user_id", user_id).execute().data != []
-    with pytest.raises(Exception):
-        admin.storage.from_("uploads").download(seeded["uploads_path"])
-    assert len(admin.storage.from_("figures").download(seeded["figure_path"])) > 0
 
     # Retry with the real client -- no simulated failure this time.
     second_response = app_client.delete("/account", headers={"Authorization": f"Bearer {token}"})
     assert second_response.status_code == 204
 
+    _assert_nothing_remains_for_user(admin, user_id, seeded)
+
+
+def test_delete_account_auth_failure_reports_storage_was_removed_and_retry_succeeds(app_client, admin, user_a):
+    user_id, token = user_a
+    seeded = _seed_full_account(app_client, admin, user_id, token)
+
+    with patch.object(admin.auth.admin, "delete_user", side_effect=RuntimeError("simulated auth outage")):
+        response = app_client.delete("/account", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 500
+    body = response.json()
+    assert body["error"]["code"] == "DELETE_FAILED"
+    assert "stored files were removed" in body["error"]["message"].lower()
+    assert admin.auth.admin.get_user_by_id(user_id).user is not None
+    assert admin.table("documents").select("id").eq("user_id", user_id).execute().data != []
+    assert admin.storage.from_("uploads").list(user_id) == []
+    assert admin.storage.from_("figures").list(user_id) == []
+    assert admin.storage.from_("avatars").list(user_id) == []
+
+    retry = app_client.delete("/account", headers={"Authorization": f"Bearer {token}"})
+    assert retry.status_code == 204
     _assert_nothing_remains_for_user(admin, user_id, seeded)
 
 

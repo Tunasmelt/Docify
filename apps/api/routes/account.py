@@ -77,9 +77,10 @@ router = APIRouter()
 # to finish the cleanup — an interrupted mid-deletion would leave those
 # Storage objects permanently unreachable through this app's own RLS,
 # recoverable only via a manual dashboard/service-role intervention.
-# Storage-first means a failure ANYWHERE in Storage cleanup leaves the
-# auth user (and therefore every DB row) fully intact — safe to retry
-# the whole request, same retry-safety delete_document already proves
+# Storage-first means a failure anywhere in Storage cleanup leaves the
+# auth user (and therefore every DB row) intact, although objects removed
+# from earlier buckets stay removed. Retrying safely resumes cleanup,
+# matching the retry-safety delete_document already proves
 # (its own docstring's 2026-07-23 self-verification).
 #
 # PARTIAL-FAILURE END STATE (item 5): buckets are cleaned in a fixed
@@ -139,7 +140,8 @@ def _storage_deletion_failed(user_id: str, *, bucket: str) -> JSONResponse:
         status_code=500,
         content=error_envelope(
             "STORAGE_ERROR",
-            "failed to delete your account data — nothing has been deleted yet, retrying is safe",
+            "account deletion stopped while removing stored files — some files may already "
+            "be deleted, but your account and database records still exist; retrying is safe",
         ),
     )
 
@@ -194,7 +196,8 @@ def delete_account(request: Request):
         return JSONResponse(
             status_code=500,
             content=error_envelope(
-                "DELETE_FAILED", "failed to delete your account — your data was not modified, retrying is safe"
+                "DELETE_FAILED",
+                "stored files were removed, but your account and database records still exist — retrying is safe",
             ),
         )
 
