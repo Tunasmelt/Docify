@@ -7,9 +7,9 @@ which covers failures the routes catch and turn into error responses, and
 background ingest failures that never surface as an HTTP error.
 
 Privacy: requests carry users' questions and documents carry their content,
-so request bodies, local variables in stack frames, and default PII (IP
-addresses, cookies, auth headers) are all left out. Performance tracing is
-off to stay inside the free tier's quota.
+so request bodies and local variables in stack frames are left out. Default
+PII (IP addresses, cookies, auth headers) is sent, by the owner's choice.
+Performance tracing is off to stay inside the free tier's quota.
 """
 
 import os
@@ -26,7 +26,7 @@ def sentry_options() -> dict | None:
         "environment": os.environ.get("SENTRY_ENVIRONMENT", "production"),
         # Render injects the deployed commit; ties each error to a release.
         "release": os.environ.get("RENDER_GIT_COMMIT") or None,
-        "send_default_pii": False,
+        "send_default_pii": True,
         "max_request_body_size": "never",
         "include_local_variables": False,
         "traces_sample_rate": 0.0,

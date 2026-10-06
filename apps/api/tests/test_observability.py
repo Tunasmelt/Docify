@@ -16,13 +16,13 @@ def test_sentry_is_off_without_a_dsn(monkeypatch):
     assert init_sentry() is False
 
 
-def test_sentry_options_leave_out_bodies_locals_and_pii(monkeypatch):
+def test_sentry_options_leave_out_bodies_and_locals_but_send_pii(monkeypatch):
     monkeypatch.setenv("SENTRY_DSN", "https://public@o0.ingest.sentry.io/0")
     monkeypatch.setenv("RENDER_GIT_COMMIT", "abc123")
     options = sentry_options()
 
     assert options["release"] == "abc123"
-    assert options["send_default_pii"] is False
+    assert options["send_default_pii"] is True
     assert options["max_request_body_size"] == "never"
     assert options["include_local_variables"] is False
     assert options["traces_sample_rate"] == 0.0
