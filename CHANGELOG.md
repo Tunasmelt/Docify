@@ -6,6 +6,51 @@ Entry types: `feature` · `fix` · `decision` · `refactor` · `test` · `infra`
 
 ---
 
+## 2026-10-06 — docs: documentation accuracy pass across .agent/, AGENT.md, and new developer/deploy guides
+
+**Phase:** 5
+**Feature:** n/a (docs)
+**Context:** A review of all project documentation found claims that no longer matched the code, deployment state, or each other.
+**Changed:**
+- **Multi-tenancy description corrected** (ARCHITECTURE.md, SCHEMA.md, STANDARDS.md, AGENT.md, MEMORY.md anti-pattern note). FastAPI uses the service-role key, which bypasses RLS, so the explicit `user_id` filter is the tenant boundary on that path. RLS protects only direct browser→Supabase access. The docs previously claimed the database enforced isolation for all paths.
+- **Docling references removed or marked historical** (AGENT.md stack, API_CONTRACT.md error codes and the stale "known OOM limitation", SCHEMA.md page-number notes, STANDARDS.md examples, `pyproject.toml` comments).
+- **Status brought current:** Vercel deploy (FEAT-021), landing page (FEAT-023), and the FEAT-032/033 "uncommitted" notes are resolved; migration `002` is applied to production; MEMORY.md's chunking and polling open questions are moved to Resolved.
+- **SCHEMA.md:** complete migration log (13 migrations), new RPC function reference, `citations.marker` column, Gemini `verifier_model` example, format-specific `page_number` semantics based on the current parser.
+- **API_CONTRACT.md:** `/health` now documents `commit`; the error-code table matches the codes the API actually returns; contract-version note.
+- **History removed from reference docs.** ARCHITECTURE, SCOPE, SCHEMA, and API_CONTRACT now state current truth; edit history stays in this file and git.
+- **Single-agent workflow recorded** (AGENT.md §AGENT ROLES, ARCHITECTURE.md Locked decisions, MEMORY.md decision log 2026-10-06), replacing the four-agent lane model that never operated.
+- **STANDARDS.md** now matches reality: dependency-pinning policy, env var list, test tooling (no vitest), e2e count, `Embedder` naming, `master` as default branch, and the absence of CI and a Python linter noted as gaps.
+- **New:** `docs/DEVELOPMENT.md` (local stack, migrations, env, tests, contributing), `docs/DEPLOYMENT.md` (Render/Vercel/Supabase runbook), `SECURITY.md`, `.agent/api-docs/parser-libs.md` (version and API-surface inventory, not yet re-verified against upstream docs).
+- `apps/api/.env.example` now lists `FRONTEND_ORIGINS`. `pyproject.toml` and `main.py` comments are condensed with no code or dependency changes (verified: parsed TOML identical, Python AST identical, `uv lock --check` clean).
+- References to the never-committed review files `2026-08-01-parser-research.md` and `2026-08-02-parser-rewrite-audit.md` now point at the matching CHANGELOG entries. The past CHANGELOG entries themselves are left as written.
+- This entry plus backfilled entries for 2026-08-04 → 2026-09-02, which were missing.
+**Not changed:** `README.md`, at the owner's request.
+**Rollback:** `git revert` this commit. Docs and comments only.
+
+---
+
+## 2026-09-02 — docs: MIT license, external-facing README, real screenshots *(backfilled 2026-10-06)*
+
+**Changed:** `LICENSE` (MIT), `README.md` rewritten for an external audience, `docs/screenshots/` (5 captures from the live deployment), `"license": "MIT"` in `package.json`/`pyproject.toml`. Commit `396145d`.
+
+---
+
+## 2026-08-19 — feature: `GET /health` reports the running commit *(backfilled 2026-10-06)*
+
+**Context:** Twice, a committed fix silently never reached production (the Dockerfile COPY gap and an unpushed retry fix). Both were found only by forensic log reading.
+**Changed:** `HealthResponse.commit` from Render's `RENDER_GIT_COMMIT` (`"unknown"` elsewhere). `routes/health.py`, `models/health.py`, `tests/test_health.py`, MEMORY.md anti-pattern 2026-08-18. Commit `91436d1`.
+**Rollback:** revert the commit; additive field only.
+
+---
+
+## 2026-08-19 — fix: honor server-guided retry timing for both embedding providers *(backfilled 2026-10-06)*
+
+**Context:** Production incident. A 108-chunk document exhausted Voyage's 3 RPM limit, fell back to Gemini, then hit Gemini's per-minute 429, and the whole ingest failed. Neither client honored the server's retry delay: google-genai has no retry logic, and Voyage's SDK parses `retry_after` but never uses it.
+**Changed:** `services/embedder.py`. The Gemini fallback retries up to 3 attempts, sleeping the `retryDelay` from the 429 payload (default 15s), and only on 429/RESOURCE_EXHAUSTED. Voyage now uses a tenacity wait strategy that honors `retry-after`. `tenacity` is declared as a direct dependency. The Dockerfile pre-downloads the Voyage tokenizer at build time. Tests replay the real incident payload. Commit `fdfed16`.
+**Rollback:** revert the commit.
+
+---
+
 ## 2026-08-09 — infra: first production deploy of apps/web to Vercel, and a real production-currency fix on Render
 
 **Phase:** 5 (final deployment step — frontend goes live)
@@ -24,6 +69,64 @@ First deployment triggered git-sourced (not a file upload) against current `mast
 **Changed:** `apps/api/Dockerfile` (`184e972`). Vercel project `docify-web` created and configured entirely via API (no source changes on the apps/web side).
 **Impact:** the deployed backend now genuinely matches `master`, closing a gap where the original portfolio-defining bug (Docling OOM on `/ingest`) had silently been live in production for 32 commits' worth of unrelated feature work. The frontend is live for the first time, git-linked for continuous deployment rather than a one-off snapshot.
 **Rollback:** Render — redeploy commit `4be11f30cb76` via the dashboard/API (not recommended, reintroduces the OOM bug). Vercel — delete project `docify-web` via the dashboard/API; no data/schema impact either way.
+
+---
+
+## 2026-08-08 — feature: landing page (FEAT-023) *(backfilled 2026-10-06)*
+
+**Changed:** `apps/web/app/page.tsx` was a bare redirect to `/login`. It now renders a public landing page (`components/landing/*`, built from the Claude Design reference). `middleware.ts` makes `/` public and sends signed-in users to `/documents`. `e2e/landing.e2e.ts`. Commit `ef70e5f`.
+
+---
+
+## 2026-08-08 — feature: settings batch 2 — preferences wiring (FEAT-033) *(backfilled 2026-10-06)*
+
+**Changed:** `QueryRequest.rerank` threaded to `Retriever.retrieve()` on `/query` and `/query/stream`. Chat/documents pages read `defaultK`/`rerank`/`streaming` from `usePreferences()` (localStorage) and choose streaming vs non-streaming. `useCurrentUser()` replaces the hard-coded placeholder identity, and the sidebar shows the real avatar. The settings page now renders the export and danger-zone sections that batch 3 had committed but left unreachable. Commits `6959763` (hook), `d9cedee`.
+
+---
+
+## 2026-08-08 — fix: commit files that earlier feature commits depended on but never included *(backfilled 2026-10-06)*
+
+**Context:** A fresh-clone check found committed code importing files that existed only in the working tree, so a clean checkout of `master` did not build.
+**Changed:** `hooks/use-preferences.ts` (`6959763`), `migrations/20260804_001_avatars_bucket.sql` (`3dc50bf`), `deleteAccount()` in `lib/supabase/profile.ts` (`32f5895`), `e2e/_local-supabase.ts` helpers (`bbfca55`), `tests/_local_supabase.py` tolerance for already-deleted users (`30488ba`). Also fixed unescaped apostrophes that failed `next build` (`755d89e`). Standing rules added: fresh-clone verification and `next build` (STANDARDS.md `490c4af`, MEMORY.md `b9c7978`).
+
+---
+
+## 2026-08-08 — docs: reconciliation pass across .agent/ *(backfilled 2026-10-06)*
+
+**Changed:** ARCHITECTURE (direct browser→FastAPI calls, not a proxy; Gemini OCR quota corrected to 20/day; verify flow rewritten; four stale open decisions locked), STANDARDS, GAPS, FEATURES (FEAT-028–035 backfilled), SCOPE (phase statuses), `api-docs/voyage.md` rerank section. Commits `68690ae`, `48c1be5`.
+
+---
+
+## 2026-08-07 — feature: settings batch 3 — data export (FEAT-034) and permanent account deletion (FEAT-035) *(backfilled 2026-10-06)*
+
+**Changed:**
+- `GET /export/conversations?format=json|markdown`: all conversations, messages, and citations, deliberately **unfiltered** (it includes `unsupported` citations). CORS now exposes `Content-Disposition`. Commit `f5d8d32`.
+- `DELETE /account`: removes Storage objects under `{user_id}/` in `uploads` → `figures` → `avatars`, then deletes the auth user (all 6 tables cascade). A mid-sequence failure leaves the account intact. The client requires the current password plus typed-email confirmation. SCHEMA.md backfilled with `usage_counters` and `avatars`. Commit `e765e34`.
+**Rollback:** revert the commits. No schema changes.
+
+---
+
+## 2026-08-06 — fix: settings batch 1 (FEAT-032) — email change requires the current password *(backfilled 2026-10-06)*
+
+**Context:** An audit found that Supabase completes an email change on an unauthenticated GET of the confirmation link (platform behaviour, independent of PKCE). An earlier same-day escalation to "session hijack" was wrong and has been corrected (`.agent/reviews/2026-08-05-settings-audit.md`).
+**Changed:** `requestEmailChange` now verifies the current password first. The same commit carries the settings batch 1 UI: profile, avatar, email, password, and sign-out of other sessions (`components/settings/*`, `hooks/use-current-user.ts`, `lib/supabase/profile.ts`, `e2e/settings.e2e.ts`). Commit `fbc4a5b`.
+
+---
+
+## 2026-08-04 — feature: chat UI modernization batches 1–3 (FEAT-029/030/031) *(backfilled 2026-10-06)*
+
+**Changed:**
+- Batch 1 (`d66373d`): copy message, relative timestamps, streaming cursor, scroll-to-bottom pill, keyboard shortcuts, document scope chips, citation hover preview. Frontend only.
+- Batch 2 (`94289f6`): stop generation (aborts the fetch; the server discards the turn exactly as for a disconnect) and regenerate (appends a new turn, since no message-update endpoint exists).
+- Batch 3 (`05b406b`): `POST /conversations/{id}/rename` (doesn't bump `updated_at`) and `DELETE /conversations/{id}` (FK cascade), with dialogs in the conversation list and chat header.
+
+---
+
+## 2026-08-04 — feature: `unverified` citation verdict, distinct from `unsupported` (FEAT-028) *(backfilled 2026-10-06)*
+
+**Context:** Every verification failure (network error, quota, malformed response) was coerced to `unsupported` and dropped, conflating "checked and false" with "never checked."
+**Changed:** The verifier's infrastructure-failure paths now return `unverified`, which is kept and shown with its own dashed style. Fabricated-quote detection stays `unsupported`. Migration `20260803_001_citation_verdict_unverified.sql` (`alter type verdict add value`). Commit `0984082`.
+**Rollback:** Postgres can't drop an enum value. Reverting the code is enough, since nothing writes `unverified` afterwards.
 
 ---
 

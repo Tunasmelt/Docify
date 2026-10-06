@@ -2,14 +2,14 @@
 
 Specification for the internal FastAPI endpoints. Both `apps/api` (Pydantic models) and `apps/web` (TS types) must conform to this document. Changes require a CHANGELOG entry and a version bump if breaking.
 
-**Scope:** internal endpoints only. External API references (Voyage, Gemini, Supabase, Docling) live under `.agent/api-docs/` and are populated by `/api-check`.
+**Scope:** internal endpoints only. External API references (Voyage, Gemini, Supabase, OCR.space, parser libraries) live under `.agent/api-docs/` and are populated by `/api-check`.
 
 ---
 
 ## Base URL
 
 - Development: `http://localhost:8000`
-- Production: `https://docify-api.onrender.com` — real, deployed 2026-07-27 (Render web service `docify-api`, Docker runtime, connected to the real production Supabase project). `/health` and authenticated `GET /conversations` verified live with a real Supabase-issued JWT. **Known limitation, not yet resolved:** `POST /ingest` reliably OOM-crashes the free-tier instance (512MB RAM) during real Docling parsing — confirmed live, not assumed (Render platform logs show the process going silent mid-model-load, no Python traceback, followed by an automatic restart ~2 minutes later — the signature of a kernel OOM-kill, not a caught exception). The CPU-only-torch fix (pyproject.toml, 2026-07-27) was necessary and fixed a *different*, earlier OOM at container *startup*, but real inference memory still exceeds what the free tier provides. See CHANGELOG.md's deploy entry for the full investigation.
+- Production: `https://docify-api.onrender.com` (Render, Docker runtime). Free-tier instances spin down after ~15 minutes idle, so the first request after a pause can take ~1 minute. `GET /health` reports the running commit.
 
 ## Auth model
 
@@ -24,11 +24,11 @@ The FastAPI middleware:
 
 `user_id` is **never accepted from the request body** for user-owned resources — always derived from the JWT.
 
-**Note on `SUPABASE_JWT_SECRET`:** still present in `.env` and `.env.example`, but currently unused by the auth middleware — it's the legacy HS256 shared secret, and this project's Supabase instance issues ES256 tokens verified via JWKS instead. Kept in case a future Supabase config change reverts to legacy signing, or another service needs it. FEAT-003 originally implemented HS256-against-this-secret verification and it was wrong for this project; see CHANGELOG 2026-07-22 and MEMORY.md §Anti-patterns for how that was caught.
+**`SUPABASE_JWT_SECRET`** (legacy HS256 shared secret) is listed in `.env.example` but unused — tokens are ES256, verified via JWKS. Kept only in case the Supabase project ever reverts to legacy signing.
 
 ## Standard error envelope
 
-All errors return this shape with the appropriate HTTP status:
+Every error the API itself returns uses this shape:
 
 ```json
 {
@@ -40,38 +40,43 @@ All errors return this shape with the appropriate HTTP status:
 }
 ```
 
-### Common error codes
+Two exceptions, both from the framework rather than route code: a request body/query param that fails Pydantic validation returns FastAPI's default `422 { "detail": [...] }`, and an unhandled exception returns a plain `500`.
+
+### Error codes
 
 | Code | HTTP | Meaning |
 |---|---|---|
-| `UNAUTHORIZED` | 401 | Missing or invalid JWT |
-| `FORBIDDEN` | 403 | Authenticated but not allowed (e.g. accessing another user's doc) |
-| `NOT_FOUND` | 404 | Resource doesn't exist or isn't visible to user |
-| `CONFLICT` | 409 | Action not allowed given the resource's current state (e.g. deleting a document that's still being parsed) — added 2026-07-23, FEAT-008, was missing despite `DELETE /documents/{id}`'s own spec already documenting a 409 |
-| `VALIDATION_ERROR` | 422 | Request body failed schema validation |
-| `RATE_LIMITED` | 429 | Either a downstream API's own free-tier ceiling was hit, or (added 2026-07-28, FEAT-024) this app's own proactive per-user rate limit on `POST /ingest`/`POST /query`/`POST /query/stream` was hit — see those endpoints' entries below for the real, vendor-quota-derived limit values and reasoning. A `Retry-After` header (seconds) is included on the proactive-limit case. |
-| `PARSE_FAILED` | 500 | Docling could not parse the document |
-| `EMBED_FAILED` | 502 | Both embedding providers failed for a batch — Voyage's own retries exhausted AND (2026-07-31) the Gemini fallback also failed. Voyage alone failing no longer surfaces this code if the Gemini fallback for that batch succeeds; see `POST /ingest`'s entry below. |
-| `GENERATE_FAILED` | 502 | Gemini API call failed |
-| `STORAGE_ERROR` | 500 | A Supabase Storage call failed (e.g. `DELETE /documents/{id}` couldn't remove a file) — transient infrastructure failure, not a client error; the resource being acted on is left unmodified and retrying is safe. Added 2026-07-23, FEAT-008 follow-up |
-| `INTERNAL` | 500 | Anything unexpected |
+| `UNAUTHORIZED` | 401 | Missing or invalid JWT (same message for every failure stage) |
+| `FORBIDDEN` | 403 | Authenticated but not allowed — a `storage_path` outside the caller's prefix, or `document_ids` the caller doesn't own |
+| `NOT_FOUND` | 404 | Resource doesn't exist **or** belongs to another user (deliberately indistinguishable) |
+| `CONFLICT` | 409 | Not allowed in the resource's current state (e.g. deleting or re-indexing a document that is still processing) |
+| `VALIDATION_ERROR` | 422 | A route-level check failed (empty question, unsupported mime type, bad cursor, bad title) |
+| `RATE_LIMITED` | 429 | This API's per-user or global limit was hit (see `/ingest` and `/query`). Includes `Retry-After` (seconds) |
+| `GENERATE_FAILED` | 502 | The Gemini generation call failed |
+| `STORAGE_ERROR` | 500 | A Supabase Storage call failed; the resource was left unmodified and retrying is safe |
+| `DELETE_FAILED` | 500 | `DELETE /account` cleaned Storage but the final auth-user deletion failed; DB rows are untouched and retrying is safe |
+| `RETRIEVE_FAILED` / `VERIFY_FAILED` / `PERSIST_FAILED` | — | Only sent as SSE `error` events on `/query/stream` (the HTTP status is already 200 by then) |
+
+Ingest failures (parse, OCR, embedding) happen in a background task after `202` has been returned, so they never surface as HTTP errors: the document moves to `status: "failed"` with a human-readable `error` string.
 
 ---
 
 ## Endpoints
 
 ### `GET /health`
-No auth. Returns service liveness for uptime monitors.
+No auth, not rate-limited. Liveness for uptime monitors, plus the commit the container is running.
 
 **Response 200:**
 ```json
-{ "status": "ok", "version": "0.1.0", "timestamp": "2026-07-22T14:30:00Z" }
+{ "status": "ok", "version": "0.1.0", "timestamp": "2026-07-22T14:30:00Z", "commit": "91436d1..." }
 ```
+
+`commit` is Render's `RENDER_GIT_COMMIT`, or `"unknown"` outside Render. Compare it against the expected SHA before assuming a fix is deployed.
 
 ---
 
 ### `POST /ingest`
-Kicks off document parsing + embedding for a file already uploaded to Supabase Storage.
+Starts parsing + embedding for a file the client has already uploaded to Supabase Storage.
 
 **Request:**
 ```json
@@ -83,6 +88,8 @@ Kicks off document parsing + embedding for a file already uploaded to Supabase S
 }
 ```
 
+Supported `mime_type`s: PDF, DOCX, PPTX, HTML.
+
 **Response 202 (accepted, processing async):**
 ```json
 {
@@ -93,26 +100,29 @@ Kicks off document parsing + embedding for a file already uploaded to Supabase S
 ```
 
 **Behaviour:**
-- Creates `documents` row with `status='uploaded'`, returns `202` immediately — the response's `status` field reflects that literal, just-inserted DB value (**corrected 2026-07-23, FEAT-007**: an earlier draft of this example showed `"status": "parsing"`, which the endpoint never actually returns synchronously — `parsing` is set moments later, inside the background task, after the response has already gone out)
-- Downloads file, parses with Docling, chunks, embeds, uploads figures to Storage, inserts chunks — this happens in a background task (FastAPI BackgroundTasks for v1; queue system if scale demands). Status progresses `uploaded` → `parsing` → `embedded` → `ready` (or `failed` at any stage, with `documents.error` populated). `parsed_at`/`embedded_at` are stamped as milestones inside the `parsing` phase — there's no dedicated status value for "parsed, not yet embedded"
-- **Embedding fallback (added 2026-07-31):** a batch that exhausts Voyage's own retries (its real, shared 3 RPM free-tier ceiling — see the rate-limit reasoning below) falls back to Gemini (`gemini-embedding-2`) for that batch specifically, not the whole document — `chunks.embedding_provider` records which provider actually embedded each chunk, so a single document can legitimately end up with a mix. This is transparent to the client: `status` still just progresses to `ready` normally. `EMBED_FAILED`/`failed` status now only happens if BOTH Voyage and the Gemini fallback fail for the same batch.
-- Client polls `GET /documents/{id}` or subscribes via Supabase Realtime to observe status transitions
+- Creates the `documents` row with `status='uploaded'` and returns `202` immediately.
+- A background task then downloads, parses (with the OCR fallback for low-yield PDF pages), chunks, embeds, uploads figures, and inserts chunks. Status moves `uploaded` → `parsing` → `embedded` → `ready`, or `failed` at any stage with `documents.error` set. `parsed_at`/`embedded_at` are milestone timestamps.
+- **Embedding fallback:** a batch whose Voyage retries are exhausted is embedded with Gemini `gemini-embedding-2` instead; `chunks.embedding_provider` records which. This is invisible to the client. A document only fails at this stage if both providers fail for the same batch.
+- Clients poll `GET /documents` (or `GET /documents/{id}`) to observe status.
 
 **Errors:**
-- `403 FORBIDDEN` if `storage_path` does not start with `uploads/{jwt.user_id}/`
-- `422 VALIDATION_ERROR` if mime_type unsupported
-- `429 RATE_LIMITED` (added 2026-07-28, FEAT-024) — **2 requests/minute** and **10 requests/day**, per user (`request.state.user_id`, never IP). Real vendor-quota-derived, not round numbers: each ingest makes ~1 Voyage embed call against Voyage's real, shared 3 RPM free-tier ceiling (`.agent/MEMORY.md`); a scanned document's OCR fallback can make several `gemini-2.5-flash` calls against that model's real, shared 20/day ceiling (also `.agent/MEMORY.md`) — both budgets are shared across every user of this app, not per-user, so per-user limits are deliberately tight. Full reasoning in `apps/api/routes/ingest.py`'s own comment.
-  - **Added 2026-08-02 (FEAT-024 follow-up) — a second, GLOBAL per-minute limit, `3/minute`, checked alongside (not instead of) the per-user one above.** Keyed by a fixed value, not `user_id` — one counter shared across every user of this app. Closes a real, structural gap the per-user limit alone can't: N different users, each individually within their own 2/minute cap, can still collectively exceed the true account-level Voyage 3 RPM ceiling (e.g. 2 users × 2/minute = 4/minute against a real 3/minute shared budget). Shared with `POST /reindex/{document_id}` below under the same scope — both draw on the identical real vendor call.
-  - **Daily limit mechanism changed 2026-08-02 (FEAT-024 follow-up):** the 10/day figure is unchanged, but it's now enforced via a Postgres-backed counter (`usage_counters` table, migration `20260802_001_usage_counters.sql`), not slowapi's in-memory storage — Render's free tier loses all in-memory state on every ~15-minute idle spin-down, which would otherwise let a user ride out a restart and get a fresh daily budget mid-day. The per-minute limits (both the per-user one above and the new global one) deliberately stay in-memory — a 15-minute gap already exceeds any per-minute window, so a restart-induced reset there is indistinguishable from a legitimate one.
+- `403 FORBIDDEN` — `storage_path` is not under `uploads/{jwt.user_id}/`
+- `422 VALIDATION_ERROR` — unsupported `mime_type`
+- `429 RATE_LIMITED` — any of:
+  - **2/minute per user** (in memory)
+  - **3/minute globally**, across all users (in memory) — keeps the whole app under Voyage's shared 3 RPM free-tier ceiling
+  - **10/day per user** (Postgres `usage_counters`, so it survives Render restarts)
+
+  `/ingest` and `/reindex` share all three counters. Limits derive from shared vendor quotas (Voyage 3 RPM; Gemini 2.5 Flash OCR 20/day) — reasoning in `routes/ingest.py`.
 
 ---
 
 ### `POST /reindex/{document_id}`
-Re-runs the full ingest pipeline for a document already in the system — re-downloads the file from Storage (no new upload), re-parses, re-chunks, re-embeds, replacing its chunks entirely. Added 2026-08-02 (FEAT-024 follow-up); this section replaces the "not-yet-defined" stub this endpoint had carried since the contract was first written.
+Re-runs the full ingest pipeline for an existing document: re-downloads the stored file, re-parses, re-chunks, re-embeds, and replaces its chunks.
 
-**Request:** no body — `document_id` is a path parameter, `user_id` comes from the JWT.
+**Request:** no body.
 
-**Response 202 (accepted, processing async):**
+**Response 202:**
 ```json
 {
   "document_id": "3f9e...",
@@ -120,22 +130,21 @@ Re-runs the full ingest pipeline for a document already in the system — re-dow
   "created_at": "2026-07-22T14:30:00Z"
 }
 ```
-Unlike `POST /ingest`'s response (which reports the just-inserted `'uploaded'` status), this reports `'parsing'` — the route synchronously resets the document to that status before returning, since (unlike a fresh ingest) there's an existing status this call is actively moving the document away from.
+Reports `parsing` (not `uploaded`) because the route resets the document to `parsing` before returning.
 
-**Real use cases this unlocks:**
-1. **Recovering a document the lazy stuck-document reaper marked `'failed'`** (see `GET /documents` below) after its background task was interrupted (a crashed process, an OOM-kill, a redeploy mid-flight) — this is the durability recovery mechanism `.agent/SCOPE.md`/`.agent/GAPS.md` have tracked as an open gap since FEAT-024.
-2. **Re-embedding a document with one or more Gemini-fallback chunks** (`chunks.embedding_provider = 'gemini'`, see the embedding-fallback note above) once Voyage's quota has recovered. Real, honestly-stated behavior: this does NOT force a Voyage-only result — it re-runs the same `Embedder.embed()` logic, which falls back to Gemini again under the identical real conditions if they're still true. What it guarantees is a fresh attempt against Voyage first, not a forced provider.
-3. **Retrying FEAT-017's OCR fallback chain** on a document that predates it, or that failed OCR the first time — a fresh parse re-runs the current parser, OCR chain included.
+**Use cases:**
+1. Recovering a document the stuck-document reaper marked `failed` (see `GET /documents`).
+2. Retrying Voyage for a document with Gemini-fallback chunks. This is a fresh attempt, not a forced provider — it can fall back again if Voyage is still limited.
+3. Re-running the current parser (including OCR) on an older or previously failed document.
 
 **Behaviour:**
-- Existing `chunks` rows for this document are deleted before the pipeline re-runs (`chunks.(document_id, chunk_index)` is unique — a fresh bulk insert would otherwise fail on the first overlapping index). Old figure Storage objects are not explicitly deleted — in the common case a re-parse reuses the same `{user_id}/{document_id}/{chunk_index}.png` path convention and simply overwrites them; a re-parse producing fewer figures than before can leave a stale, unreferenced object at a higher index (a storage-bytes gap, not a correctness bug — nothing in `chunks` points at it after reindex). Known, accepted tradeoff, same class as the existing figure-upload-before-later-failure gap.
-- `documents.error` is cleared as part of the reset to `'parsing'`, even if the prior attempt left one.
-- Status progresses `parsing` → `embedded` → `ready` (or `failed`) exactly like `POST /ingest` — same background task, same `run_ingest_pipeline()`.
+- Deletes the document's existing chunks, clears `documents.error`, then runs the same background pipeline as `/ingest` (`parsing` → `embedded` → `ready` | `failed`).
+- Old figure objects are overwritten at the same paths; if the new parse produces fewer figures, higher-index objects are left orphaned in Storage (unreferenced, a storage-bytes cost only).
 
 **Errors:**
-- `404 NOT_FOUND` if `document_id` doesn't exist or belongs to another user (same non-distinguishing response as every other document route)
-- `409 CONFLICT` if the document currently has a real in-flight background task — `status in ('parsing', 'embedded')` (same discipline as `DELETE /documents/{document_id}` below)
-- `429 RATE_LIMITED` — shares `POST /ingest`'s rate-limit infrastructure entirely: the same per-user `2/minute` counter, the same global `3/minute` counter, and the same Postgres-backed `10/day` counter (one shared daily total across `/ingest` and `/reindex` combined, not two separate 10/day budgets) — it triggers the identical real Voyage/Gemini calls `/ingest` does, so it draws on the same real vendor budgets rather than a separate, looser set.
+- `404 NOT_FOUND`
+- `409 CONFLICT` — the document is still processing (`status in ('parsing', 'embedded')`)
+- `429 RATE_LIMITED` — shares all of `/ingest`'s counters (one combined 10/day budget)
 
 ---
 
@@ -177,18 +186,19 @@ Lists the user's documents.
 }
 ```
 
-**Behaviour — lazy stuck-document reaper (added 2026-08-02, FEAT-024 follow-up):** before the list above is built, any of this user's documents still sitting in `'parsing'` or `'embedded'` past a 30-minute threshold are flipped to `'failed'` with `error: "processing timed out, possibly interrupted by a service restart"`. No scheduler or cron job — this runs opportunistically, exactly when a user's own document list is requested, scoped to that user's own rows only. Real failure mode this recovers from: a background task that dies mid-flight (a crashed process, an OOM-kill, a redeploy) previously left its document stuck forever with nothing to ever move it out of that state — this is what closes that gap. A reaped document shows up as `'failed'` in the SAME response that reaped it, not one request later. Recover a reaped document via `POST /reindex/{document_id}` above. 30-minute threshold reasoning: `apps/api/routes/ingest.py`'s `STUCK_DOCUMENT_THRESHOLD_SECONDS`.
+**Behaviour — stuck-document reaper:** before building the list, any of this user's documents that have been in `parsing` or `embedded` for more than 30 minutes (`STUCK_DOCUMENT_THRESHOLD_SECONDS`) are set to `failed` with `error: "processing timed out, possibly interrupted by a service restart"`. This catches background tasks killed by a crash, OOM, or redeploy. The reaped document appears as `failed` in the same response. Recover it with `POST /reindex/{document_id}`.
 
 ---
 
 ### `DELETE /documents/{document_id}`
-Deletes the document, its chunks, its figures in storage, and all references from conversations. Cascade is handled by the schema.
+Deletes the document's Storage objects (`uploads` file + `figures`), then the row. Chunks and citations cascade via FKs; the id is removed from any `conversations.document_ids` array in application code (arrays have no FK).
 
 **Response 204:** empty body
 
 **Errors:**
 - `404 NOT_FOUND`
-- `409 CONFLICT` if document is currently being processed — `status in ('parsing', 'embedded')` (**corrected 2026-07-25**: originally only checked `'parsing'`; `'embedded'` still has a real in-flight background task too — figure upload, chunk insert, and `mark_ready()` all happen strictly after `mark_embedded()` — found via FEAT-014's live UI testing, see `.agent/GAPS.md`)
+- `409 CONFLICT` — the document is still processing (`status in ('parsing', 'embedded')`; both phases still have background work in flight)
+- `500 STORAGE_ERROR` — Storage removal failed; nothing was deleted, retrying is safe
 
 ---
 
@@ -206,7 +216,8 @@ Ask a question over one or more documents.
 }
 ```
 
-- **`rerank`** (added Settings batch 2, 2026-08-04) — optional, default `false`. Wires the retrieval layer's already-existing opt-in Voyage `rerank-2.5` reranking (`services/retriever.py`'s `Retriever.retrieve(rerank=...)`, shipped FEAT-009 follow-up but never reachable from a route until now) through to the request. **Real cost, not just a flag flip:** adds a measured ~380ms to retrieval latency (`.agent/MEMORY.md`'s 2026-07-27 decision — pushes `/query`'s worst-case total from ~8.3s to ~8.68s) via one additional real Voyage API call per request. Any client surfacing this as a user-facing toggle should default it off and disclose the latency cost, not present it as a free quality knob.
+- **`k`** — number of chunks retrieved, default 8, range 1–50.
+- **`rerank`** — optional, default `false`. Enables Voyage `rerank-2.5` on the retrieved candidates. Adds one Voyage call and ~380ms; clients exposing it should default it off and disclose the cost.
 
 **Response 200:**
 ```json
@@ -267,33 +278,34 @@ Ask a question over one or more documents.
 - If `conversation_id` omitted, creates a new conversation
 - If `conversation_id` provided, appends to it (must belong to user)
 - Runs hybrid retrieval → generation → verification pipeline (see ARCHITECTURE.md)
-- `verdict` is one of `supported` | `partial` | `unsupported` | `unverified` (see ARCHITECTURE.md's verify flow), and each is treated differently in this response:
-  - `supported` — citation is kept in the `citations` array as-is; the answer text keeps its `[N]` marker
-  - `partial` — citation is **kept** in the `citations` array (same as `supported`, never dropped); the client renders it with a warning indicator, since the source only partially backs the claim (e.g. the marker-3 example above: the source confirms broad-based growth but not specifically "international demand" — kept so the reader can judge the source themselves, not silently hidden)
-  - `unsupported` — citation is **dropped** from the `citations` array; the corresponding `[N]` marker is stripped from `answer`
-  - `unverified` (added 2026-08-03) — citation is **kept** in the `citations` array, never silently dropped, `supporting_quote` is always `null`. Used only when the verification call itself genuinely could not run or produce a trustworthy result — a Gemini API/transport error, or a malformed/non-schema response — never as a substitute for a real `unsupported` verdict (a model that ran and judged the claim false), and never for a citation the recovery cascade correctly dropped before verification was ever attempted. This is deliberately distinct from `unsupported`: conflating "checked and found false" with "never actually checked" would hide the second case behind an answer that looks fully verified when part of it silently wasn't. The client must render this with its own visual treatment distinct from both `supported` (confident) and `partial` (checked, partially confirmed) — see `apps/web/components/chat/citation-marker.tsx`.
-- **`figure_url`** (added FEAT-026): present only on a citation with `element_type: "figure"` — a signed, time-limited Storage URL (600s) for that figure's image. **Omitted entirely** (not sent as `null`) on `text`/`table` citations, and on a `figure` citation whose image fetch itself failed server-side (that citation's `element_type` degrades to `"text"` in that case — see `services/figure_fetcher.py` — so `figure_url` never appears alongside a lie about what the citation actually is). Not persisted anywhere — built fresh from the citation's `chunk_id` → `figure_path` on every read, live or historical (`GET /conversations/{id}/messages` below produces byte-identical citation shapes from stored data, including a freshly-signed `figure_url` each time it's read, not a cached/expired one).
-- **`page_number`** (FEAT-020, extended 2026-07-27 to cover DOCX/PPTX/HTML): the example above is from a PDF source, where this is a real PDF page number. For a **PPTX**-sourced citation it's the real slide index instead (same field, same 1-indexed meaning of "position within the source"). For a **DOCX/HTML**-sourced citation it is always `1` — Docling provides no page/location concept for these two formats at all (confirmed empirically, `.agent/SCHEMA.md`'s `chunks.page_number` note has the full investigation), so every citation from the same DOCX/HTML document reports the same value.
-- **`document_mime_type`** (added 2026-07-27, closing the gap the note above used to describe): the citation's source document's real mime type (`documents.mime_type`) — this is what the client actually uses to know whether `page_number` means a real page, a slide index, or a meaningless sentinel. Required a migration (`match_chunks_by_vector`/`match_chunks_by_fts` gained this as a new output column — Postgres does not allow `CREATE OR REPLACE FUNCTION` to change `RETURNS TABLE` columns, confirmed live, so this needed a real `DROP FUNCTION` + `CREATE FUNCTION`). The frontend's `citationLocation()` (`lib/chat/parse-message.ts`) is the one place this becomes display text: "Page N" for PDF/unrecognized mime types, "Slide N" for PPTX, omitted entirely for DOCX/HTML rather than showing a false "Page 1". Verified in a real browser against all 4 formats.
-- **`association_method`** (added 2026-08-02) — present, non-null, only on a `table`/`figure` citation whose caption was matched by the parser/chunker: `"explicit"` (the parser's own Tier-1 heuristic — pdfplumber text-prefix + bbox proximity, FEAT-027 — linked this table/figure's caption directly), `"heuristic"` (chunker.py's own Tier-2 proximity fallback matched it instead, a weaker signal), or `"unmatched"` (a caption chunker.py could not plausibly place with any table/figure — genuinely uncertain). **Omitted entirely** (not sent as `null`) whenever not applicable — a `text`/`heading`/`list` citation, or a `table`/`figure` citation with no caption at all involved. This was already being computed and stored in every chunk row (`chunks.metadata->>'association_method'`) but never selected by `match_chunks_by_vector`/`match_chunks_by_fts` — real, free citation-confidence information that was being silently discarded at the retrieval boundary for no reason; this closes that gap. Same real constraint as `document_mime_type` below required the identical fix: a new migration (`20260802_002_citation_association_method.sql`), `DROP FUNCTION` + `CREATE FUNCTION` on both RPCs since `CREATE OR REPLACE FUNCTION` cannot change `RETURNS TABLE` columns. **Deliberately not yet surfaced in the frontend UI as of this pass** — this is a backend/API-boundary change only; presenting it visually (a badge? a tooltip? filtering low-confidence citations?) is a real design decision that deserves its own scoped UI pass rather than a rushed addition here. Available in the API response now for whenever that pass happens.
-- **`chunks.embedding_provider` (added 2026-07-31) is deliberately NOT exposed on citations.** It's an internal retrieval-correctness concern (which embedding space found this chunk), not something meaningful to a reader of an answer — a citation's trustworthiness is governed by `verdict`/`supporting_quote` (the verifier's real read of the source text), not by which vendor's embedding model happened to locate it. Surfacing it would invite a false "Gemini-found citations are somehow less trustworthy than Voyage-found ones" reading with no factual basis — both providers are held to the identical downstream verify step. Revisit only if a real, concrete client need for it ever shows up.
+- `verdict` is one of `supported` | `partial` | `unsupported` | `unverified` (see ARCHITECTURE.md §Verify flow):
+  - `supported` — kept; the answer keeps its `[N]` marker.
+  - `partial` — kept; the source backs only part of the claim (marker 3 above confirms broad growth but not "international demand"). Clients render it with a warning style.
+  - `unsupported` — **dropped** from `citations`, and its `[N]` marker is stripped from `answer`. Still persisted for audit.
+  - `unverified` — kept, `supporting_quote` is always `null`. Verification itself could not run (Gemini error/timeout/malformed response) — never used as a substitute for `unsupported`. Clients must style it distinctly from both `supported` and `partial` (`components/chat/citation-marker.tsx`).
+- **`figure_url`** — only on `element_type: "figure"` citations: a signed Storage URL valid for 600s, generated fresh on every read (live or historical). Omitted (not `null`) otherwise. If the figure fetch fails server-side the citation is downgraded to `element_type: "text"` with no `figure_url`.
+- **`page_number`** — depends on the source format: a real page for PDF, a slide number for PPTX, and always `1` (no location available) for DOCX/HTML. Use `document_mime_type` to interpret it; `lib/chat/parse-message.ts`'s `citationLocation()` renders "Page N", "Slide N", or nothing.
+- **`document_mime_type`** — the source document's `mime_type`.
+- **`association_method`** — only on `table`/`figure` citations whose caption was linked by the parser: `"explicit"` (parser's direct caption match), `"heuristic"` (chunker's weaker proximity match), or `"unmatched"`. Omitted otherwise. Not yet displayed by the frontend.
+- `chunks.embedding_provider` is deliberately **not** exposed: which vendor located a chunk says nothing about whether the claim is supported — every citation goes through the same verifier.
 
 **Errors:**
 - `403 FORBIDDEN` if any `document_ids` don't belong to user
 - `422 VALIDATION_ERROR` if `document_ids` empty or `question` empty
-- `502 GENERATE_FAILED` if Gemini call fails after retries
-- `429 RATE_LIMITED` (added 2026-07-28, FEAT-024) — **3 requests/minute** and **40 requests/day**, per user. Each real call makes one Voyage `embed_query` call (same shared 3 RPM ceiling `/ingest` draws on) plus one `gemini-3.6-flash` generation call and one `gemini-3.5-flash-lite` verification call per cited claim — a separate quota bucket from `/ingest`'s OCR ceiling, whose exact daily limit is unconfirmed (`.agent/MEMORY.md`), so 40/day is a deliberately generous-but-real bound rather than a derived vendor number. **Shares one combined counter with `POST /query/stream` below** — they're the same underlying action with two response-delivery mechanisms, not two independent budgets. Full reasoning in `apps/api/routes/query.py`'s own comment.
+- `502 GENERATE_FAILED` if the Gemini generation call fails
+- `404 NOT_FOUND` if `conversation_id` doesn't exist or isn't the caller's
+- `429 RATE_LIMITED` — **3/minute** and **40/day** per user, one combined counter shared with `POST /query/stream`. Each call uses one Voyage query embedding (shared 3 RPM ceiling), one Gemini 3.6 Flash call, and Gemini 3.5 Flash-Lite verification calls. Reasoning in `routes/query.py`.
 
 ---
 
-### `POST /query/stream` (FEAT-016, 2026-07-27)
+### `POST /query/stream`
 SSE streaming variant of `POST /query` — same request body, same auth/ownership/history validation (run to completion **before** the stream opens, so an invalid `document_id`/JWT/conversation always comes back as a normal JSON error response with the codes above, never as a stream that starts and then errors out). A separate route rather than a mode flag on `/query`: `response_model=QueryResponse` validation and a `StreamingResponse` are mutually exclusive in FastAPI, and `/query`'s synchronous contract stays untouched for any caller that doesn't want SSE.
 
 Browsers' `EventSource` can't send a POST body or an `Authorization` header — clients must use `fetch()` with a manually-read stream (see `apps/web/lib/api/query.ts`'s `askQuestionStream()`), not `EventSource`.
 
-**Rate limiting (added 2026-07-28, FEAT-024):** shares `POST /query`'s combined 3/minute + 40/day per-user counter (see that endpoint's entry) — a rate-limited request returns a normal `429 RATE_LIMITED` JSON response (the standard error envelope, `Content-Type: application/json`) **before the stream ever opens**, never an SSE connection that starts and then errors. Confirmed live, not assumed from decorator-ordering alone: `apps/api/tests/test_rate_limit.py`.
+**Rate limiting:** shares `POST /query`'s counters. A limited request gets a normal JSON `429` before the stream opens.
 
-**Response:** `Content-Type: text/event-stream`, one `event: <type>\ndata: <json>\n\n` frame per event. Real, fixed event sequence — no event is ever skipped or reordered:
+**Response:** `Content-Type: text/event-stream`, one `event: <type>\ndata: <json>\n\n` frame per event, in this fixed order:
 
 ```
 retrieving -> token* (zero or more) -> verifying -> citations-resolved -> done
@@ -308,11 +320,15 @@ retrieving -> token* (zero or more) -> verifying -> citations-resolved -> done
 | `verifying` | `{}` | Generation is complete; citation verification has started. Claim-span extraction needs the full answer text, so this can never start earlier — there is no way to verify progressively. |
 | `citations-resolved` | `{"conversation_id", "message_id", "answer", "citations"}` | Same `citations` shape as `POST /query`'s response (including the `supported`/`partial`/`unverified`-kept, `unsupported`-dropped-and-marker-stripped rule). `answer` is the **final**, marker-stripped text — clients should replace whatever raw text they'd accumulated from `token` events with this value, then re-parse citation markers against `citations` (see `buildAssistantMessage()`, reused for both the streaming and historical-message paths). |
 | `done` | `{"metadata"}` | Same `metadata` shape as `POST /query`'s response. Terminal — the connection closes after this. |
-| `error` | `{"code", "message"}` | Same error codes as the table above (`GENERATE_FAILED`, `VERIFY_FAILED`, `RETRIEVE_FAILED`, `PERSIST_FAILED`) — surfaced mid-stream instead of as an HTTP status, since the stream may already be open. Terminal. |
+| `error` | `{"code", "message"}` | One of `RETRIEVE_FAILED`, `GENERATE_FAILED`, `VERIFY_FAILED`, `PERSIST_FAILED`. Terminal; nothing is persisted. |
 
 **UI contract for the gap between `token` and `citations-resolved`:** the client must show a distinct "verifying" indicator during this window — never let the fully-streamed-but-unverified text just sit there with no sign anything is still happening (`apps/web/components/chat/loading-stages.tsx`).
 
-**Implementation note (real bug found and fixed during this feature, 2026-07-27):** every downstream call in the SSE generator (`Retriever.retrieve`, `Verifier.verify_batch`, `fetch_generator_chunks`, `signed_figure_url`, `create_query_turn`) is synchronous/blocking Python, run via `asyncio.to_thread(...)`. Calling `verify_batch()` directly (no `await`) was confirmed live to freeze the event loop for its entire real ~8s Gemini-verification duration, which meant uvicorn never got a chance to flush the already-yielded `verifying` frame to the socket until the *next* yield — the client received `verifying` and `citations-resolved` at the identical timestamp instead of with the real gap between them. Caught via real browser testing (DOM sampling + a temporary client-side event-arrival log), not from protocol-level tests alone, which happened to mask it. Only Gemini's own token-generation stream (`generate_content_stream`, genuinely async via `client.aio`) does not need this.
+**Keepalive:** during any gap (retrieval, waiting for the first token, verification) the server sends `: keepalive` SSE comment frames every 12s. Clients should ignore them.
+
+**Disconnect / stop:** if the client closes the connection (tab closed, or `AbortController.abort()` for a user "stop"), the server detects it and aborts the turn — no messages or citations are persisted.
+
+**Implementation note:** every blocking call in the SSE generator (`Retriever.retrieve`, `Verifier.verify_batch`, `fetch_generator_chunks`, `signed_figure_url`, `create_query_turn`) must run via `asyncio.to_thread(...)`. Calling one directly freezes the event loop, so already-yielded frames don't flush until the next yield.
 
 ---
 
@@ -366,11 +382,8 @@ Full message history for a conversation, including citations.
 
 ---
 
-### `POST /conversations/{conversation_id}/rename` (batch 3, 2026-08-04)
-Renames a conversation. POST, not PATCH — a rename is a real, singular
-action on a resource, matching this API's existing action-route
-precedent (`POST /reindex/{document_id}`) rather than introducing this
-API's first PATCH verb for one endpoint.
+### `POST /conversations/{conversation_id}/rename`
+Renames a conversation. (POST, matching the action-route style of `/reindex`.)
 
 **Request:**
 ```json
@@ -393,11 +406,7 @@ API's first PATCH verb for one endpoint.
 - `title` is trimmed; empty (after trim) or over 200 chars (matching
   `create_query_turn`'s own auto-generated-title truncation) is a `422
   VALIDATION_ERROR`.
-- Deliberately does **not** bump `updated_at` — a rename is a metadata
-  edit, not new conversation activity. `GET /conversations` sorts by
-  `updated_at desc`; bumping it here would jump a renamed-but-otherwise-
-  untouched conversation to the top of "Recent," which nothing about a
-  rename implies the caller wants.
+- Does **not** bump `updated_at` — a rename is not new activity, so it shouldn't reorder the "Recent" list.
 
 **Errors:**
 - `404 NOT_FOUND` if the conversation doesn't exist or belongs to another
@@ -407,13 +416,7 @@ API's first PATCH verb for one endpoint.
 ---
 
 ### `DELETE /conversations/{conversation_id}`
-Deletes the conversation and its messages + citations. `messages.conversation_id`
-and `citations.message_id` both cascade at the DB level (`on delete
-cascade` FKs, SCHEMA.md) — unlike `DELETE /documents/{id}`, there is no
-Storage cleanup and no array-reference cleanup needed, since a
-conversation owns no Storage objects and nothing else references a
-conversation's id the way `conversations.document_ids` references a
-document's id.
+Deletes the conversation; its messages and citations cascade via FKs. No Storage cleanup is needed.
 
 **Response 204**
 
@@ -423,27 +426,11 @@ document's id.
 
 ---
 
-### `GET /export/conversations` (batch 3, 2026-08-06)
-Exports every conversation, message, and citation belonging to the
-authenticated user, in one file. **Scope is deliberate and stated
-explicitly: this covers conversational data only — source documents
-themselves are NOT included.** Documents are large binary files with
-their own existing lifecycle (upload, re-index, delete); a user who
-wants their originals back already has them, and what genuinely can't
-be reconstructed by the user is the conversation history and citation
-verification audit trail this endpoint exports. This replaces the
-`GET /conversations/{id}/export` stub previously listed under
-"Not-yet-defined endpoints" — that stub anticipated a narrower,
-single-conversation, Markdown-only shape; this implements a broader,
-whole-account, both-formats export instead, matching this feature's
-real purpose (giving a user confidence in their data before batch 3's
-account-deletion half makes losing it permanent).
+### `GET /export/conversations`
+Exports every conversation, message, and citation belonging to the caller in one file. **Source documents are not included** — users already have their originals; what can't be reconstructed is the conversation history and verification audit trail.
 
 **Query params:**
-- `format` — `json` (default) or `markdown`. Any other value is a `422`
-  (FastAPI's own default validation-error shape, same as every other
-  `Query(...)`-validated param in this API, e.g. `GET /conversations`'s
-  `limit`).
+- `format` — `json` (default) or `markdown`. Any other value returns FastAPI's default `422`.
 
 **Response 200:** the raw file body (not JSON-enveloped, even for
 `format=json` — the whole response body IS the export), with:
@@ -490,115 +477,35 @@ JSON shape:
 }
 ```
 
-**Completeness — the load-bearing property of this endpoint:**
-`citations` is **unfiltered**, unlike every other citation-returning
-route in this API — `POST /query`, `POST /query/stream`, and
-`GET /conversations/{id}/messages` all drop `unsupported`-verdict
-citations before responding (they were never meant to be user-facing
-live). This endpoint deliberately includes them: an `unsupported`
-citation is still part of the user's real, persisted audit trail
-(`create_query_turn`'s own full-audit-trail behavior), and an export
-whose whole purpose is completeness before a possible account deletion
-must not silently reproduce that same filtering.
+**Completeness:** unlike every other citation-returning route, `citations` here is **unfiltered** — it includes `unsupported` citations, because an export exists to be the complete audit trail.
 
-Markdown shape: one file, one `##` section per conversation, in the
-app's own citation footnote motif (`components/chat/citation-marker.tsx`) —
-a message's text (using `raw_content`, not the UI-facing `content`, so
-every citation marker — including `unsupported` ones stripped from
-`content`, see `POST /query`'s `_strip_dropped_markers` — is still
-visible in context) followed by a `> **Sources**` block listing every
-citation with its real verdict, quote, and source location.
+Markdown format: one file, one `##` section per conversation. Each message uses `raw_content` (so every marker, including stripped `unsupported` ones, stays visible) followed by a `> **Sources**` block listing each citation's verdict, quote, and location.
 
 **Behaviour:**
-- No pagination — every conversation, oldest first, in one response.
-  Deliberately unbounded (unlike `GET /conversations`'s keyset
-  pagination): an export exists to be complete, and this project's real
-  scale (portfolio/demo, not thousands of conversations per user —
-  `.agent/SCOPE.md`) doesn't justify the complexity of a paginated or
-  streamed export.
-- Synchronous — not an async job + download-when-ready pattern. Same
-  real-scale reasoning: a single user's full conversation history is a
-  handful of indexed queries, not a bulk/warehouse-scale operation.
-  Revisit only with real evidence this stops being fast enough.
-- **Not rate-limited** — read-only, makes zero calls to Voyage/Gemini or
-  any other paid vendor API, the same real-cost profile `GET /documents`
-  and `GET /conversations` (both already unrated-limited) already rest
-  on. Only `/ingest` and `/query`+`/query/stream` carry rate limits in
-  this API, specifically because those draw on real, metered vendor
-  quota.
+- No pagination and no async job — a single user's history is a handful of indexed queries at this project's scale.
+- Not rate-limited: read-only, no vendor API calls.
 
 **Errors:**
-- `422 VALIDATION_ERROR` — invalid `format` value
+- `422` — invalid `format` value (FastAPI default shape)
 
 ---
 
-### `DELETE /account` (batch 3, part 2, 2026-08-06)
-**Permanently and irreversibly deletes the authenticated user's entire
-account** — every document, chunk, conversation, message, and citation,
-every Storage object in `uploads`/`figures`/`avatars` for this user, and
-the `auth.users` row itself. HIGH-scrutiny feature, same standard as
-FEAT-007/008's original delete audits — see `routes/account.py`'s
-module docstring for the full enumeration (every `user_id`-scoped table
-and Storage bucket, confirmed by grepping every migration, not assumed)
-and ordering justification.
+### `DELETE /account`
+**Permanently deletes the caller's entire account** — every document, chunk, conversation, message, citation, and usage counter; every Storage object under `{user_id}/` in `uploads`, `figures`, and `avatars`; and the `auth.users` row. See `routes/account.py`'s module docstring for the full enumeration.
 
-**Request:** no body. Reauthentication (current password) is enforced
-**client-side**, before this is ever called — the exact same real
-`signInWithPassword()` check already required for email-change
-(`lib/supabase/profile.ts`'s `requestEmailChange`), reused here for
-consistency. This route has no more server-side way to verify "was this
-session recently reauthenticated" than email-change's own flow already
-does; it trusts the same JWT-scoped `user_id` every other route in this
-API already rests on.
+**Request:** no body. The client must reauthenticate first (current password via `signInWithPassword()`, plus a typed-email confirmation) — the same check email change uses. The server trusts the JWT like every other route.
 
 **Response 204** — no body.
 
-**Ordering (irreversible only at the very last step):**
-1. Remove every Storage object under `{user_id}/` in `uploads`,
-   `figures`, and `avatars`, in that fixed order — listed directly via
-   Storage's own `list()`, not reconstructed from DB rows, so a stray
-   object with no matching row still gets caught.
-2. **Only once all three buckets are confirmed clean:** delete the
-   `auth.users` row via the admin API. This cascades all 6 user-scoped
-   tables automatically (`documents`, `chunks`, `conversations`,
-   `messages`, `citations`, `usage_counters` — every one already has an
-   `on delete cascade` FK to `auth.users`, confirmed by grepping every
-   migration; no explicit per-table DELETE is needed or issued).
+**Ordering:**
+1. Remove every Storage object under `{user_id}/` in `uploads`, then `figures`, then `avatars`, listed via Storage's own `list()` (so objects with no matching row are still caught). Stops at the first failing bucket.
+2. Only once all three are clean, delete the auth user via the admin API. All 6 user-scoped tables cascade.
 
-Deleting the auth user first would be actively dangerous, not just out
-of order: every Storage RLS policy in this project checks
-`auth.uid()` against a *live* session — once the user is gone, no
-future request (a retry included) could ever re-authenticate as that
-user to finish an interrupted cleanup, permanently orphaning whatever
-Storage objects were left.
+Deleting the auth user first would make an interrupted cleanup unrecoverable — no one could authenticate as that user again to finish it. A failure in step 1 leaves the account fully intact and retry-safe.
 
-**Partial-failure end state:** Storage cleanup fails fast on the first
-bucket that errors; later buckets in the fixed order are never
-attempted. Nothing about this is "half deleted" in the DB sense — the
-`auth.users` row (and therefore all 6 cascading tables) is only ever
-touched after every bucket succeeds, so a failure anywhere in Storage
-leaves the account fully intact and safe to retry. An already-empty
-bucket prefix on retry is a harmless no-op (Storage's `remove()` on a
-nonexistent object doesn't itself error — the same fact
-`DELETE /documents/{id}` already established).
+**Already-issued tokens:** JWT verification is stateless, so an unexpired access token still verifies until it expires; every query it makes simply matches no rows. Refresh tokens are revoked immediately by the admin delete.
 
-**Stale sessions after deletion:** `middleware/auth.py` does pure
-cryptographic JWT verification with no live session/DB lookup, so an
-already-issued, not-yet-expired access token remains valid until its
-own natural expiry — every request through it still runs its normal
-`user_id`-scoped query, which now simply matches nothing (a clean,
-empty response, e.g. `GET /conversations` returns `{"conversations":
-[], "next_cursor": null}`, never a crash or a leak). The refresh path is
-closed immediately: `auth.admin.delete_user()` invalidates the user's
-sessions/refresh tokens as part of removing the row, confirmed live —
-so nothing can ever renew past the already-issued token's own expiry.
-This is a pre-existing, general property of this app's stateless-JWT
-auth design (true for every route), not a gap account deletion
-introduces or could itself close.
-
-**Not rate-limited** — same reasoning as `GET /export/conversations`:
-read/delete-only against this user's own already-stored rows and
-Storage objects, zero Voyage/Gemini calls.
+**Not rate-limited** — no vendor API calls.
 
 **Errors:**
 - `401 UNAUTHORIZED` — missing/invalid JWT (standard middleware behavior)
@@ -610,13 +517,13 @@ Storage objects, zero Voyage/Gemini calls.
 
 ---
 
-## Not-yet-defined endpoints (Phase 4+)
+## Not-yet-defined endpoints
 
-- `PATCH /documents/{id}` — rename
+- `PATCH /documents/{id}` — rename a document
+- An endpoint to delete or replace a message (needed for an in-place "regenerate"; today regenerate appends a new turn)
 
 ---
 
 ## Contract version
 
-- Current: `v0.1` (unstable, breaking changes allowed before Phase 3 ships)
-- After Phase 3 (frontend deployed): bump to `v1.0`, breaking changes require version bump
+- Current: `v0.1`. The original plan was to freeze at `v1.0` once the frontend shipped; that milestone has passed (frontend deployed 2026-08-09) but the version has not been bumped. Until it is, breaking changes are still allowed but must update `apps/web/lib/types/` in the same PR and get a CHANGELOG entry.

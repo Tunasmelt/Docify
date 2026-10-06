@@ -2,7 +2,7 @@
 
 | Command          | What it does                                    | Run when                                      |
 |------------------|-------------------------------------------------|-----------------------------------------------|
-| /ctx-audit       | Context health check                            | Session start — mandatory                     |
+| /ctx-audit       | Context health check                            | Session start — mandatory (run /ctx-map first on a fresh clone) |
 | /ctx-load        | Read HANDOFF.md and resume                      | Starting any session mid-task                 |
 | /ctx-search      | Semantic symbol/function search via index       | Need to find where something lives            |
 | /ctx-map         | Rebuild .agent/index.json symbol index          | Files added/deleted, index stale              |
@@ -16,13 +16,13 @@
 | /memory-sync     | Sync session decisions → MEMORY.md              | End of session, after ctx-dump                |
 | /ralph-loop      | Autonomous build loop over FEATURES.md          | Run features unattended with real verifier    |
 
-> **RULE 1:** Never read a file to find a symbol — run /ctx-search first.
+> **RULE 1:** Never read a file to find a symbol — run /ctx-search first. `.agent/index.json` is gitignored, so on a fresh clone run /ctx-map once to build it.
 > **RULE 2:** Read HANDOFF.md + MEMORY.md §Anti-patterns before starting any work.
 > **RULE 3:** Never let context exceed 60% before running /ctx-dump.
 > **RULE 4:** Never mark a feature complete without passing tests and /gap-check.
 > **RULE 5:** Before writing code against any external API, run /api-check for that API.
-> **RULE 6:** Never touch a file outside your agent's lane — write a HANDOFF suggestion instead.
-> **RULE 7:** Every commit message ends with the agent tag: `[claude-code]`, `[claude-design]`, `[gemini]`, `[codex]`.
+> **RULE 6:** Stay inside the current task's scope — out-of-scope ideas go to HANDOFF.md `## Agent Suggestions`, not silent expansion.
+> **RULE 7:** Every commit message ends with the agent tag of the committing agent (in practice `[claude-code]`).
 
 ---
 
@@ -42,12 +42,12 @@ api-contract:.agent/API_CONTRACT.md
 ```
 
 ## Stack
-- Next.js 14 App Router + TypeScript + Tailwind + shadcn/ui (frontend)
-- FastAPI + Python 3.12 (backend)
-- Docling (layout-aware parsing, self-hosted)
-- Voyage multimodal-3.5 (embeddings)
+- Next.js 14 App Router + TypeScript + Tailwind + shadcn/ui (frontend, Vercel)
+- FastAPI + Python 3.12 (backend, Render via Docker)
+- pdfplumber / python-docx / python-pptx / selectolax (layout-aware parsing, self-hosted — replaced Docling in FEAT-027)
+- OCR fallback for scanned PDF pages: Gemini 2.5 Flash → OCR.space → Tesseract
+- Voyage multimodal-3.5 (embeddings) with Gemini embedding-2 fallback; Voyage rerank-2.5 (opt-in)
 - Gemini 3.6 Flash / 3.5 Flash-Lite (generation + citation verification)
-- Gemini Flash (OCR fallback only)
 - Supabase — Postgres + pgvector + Auth + Storage
 
 ## Architecture pointers
@@ -58,19 +58,21 @@ Read only the file relevant to your current task.
 | Architecture        | .agent/ARCHITECTURE.md                 |
 | Database schema     | .agent/SCHEMA.md                       |
 | Internal API        | .agent/API_CONTRACT.md                 |
-| External APIs       | .agent/api-docs/{voyage,claude,...}.md |
+| External APIs       | .agent/api-docs/{voyage,gemini,supabase,supabase-storage-py,ocrspace,parser-libs}.md |
 | Coding standards    | .agent/STANDARDS.md                    |
 | Feature registry    | .agent/FEATURES.md                     |
 | Scope + phases      | .agent/SCOPE.md                        |
 | Agent memory        | .agent/MEMORY.md                       |
+| Local dev setup     | docs/DEVELOPMENT.md                    |
+| Deploying           | docs/DEPLOYMENT.md                     |
 
 ## Open decisions
 - [ ] Strategy selector as v2 feature or later
 
 ## Locked decisions
 - [x] Project name: Docify
-- [x] Layout-aware structured parsing as v1 strategy (Docling)
-- [x] Multi-tenant from day one — RLS at schema level
+- [x] Layout-aware structured parsing as v1 strategy (pdfplumber-based parser, FEAT-027; originally Docling)
+- [x] Multi-tenant from day one — RLS for direct client access, explicit `user_id` scoping on every service-role query
 - [x] Monorepo — apps/web + apps/api
 - [x] Deploy Vercel (web) + Render (api)
 - [x] Voyage multimodal-3.5 for embeddings (unified encoder, generous free tier)
@@ -80,25 +82,26 @@ Read only the file relevant to your current task.
 
 # §AGENT ROLES
 
-| Agent          | Owns                                                                    | Never touches                                    |
-|----------------|-------------------------------------------------------------------------|--------------------------------------------------|
-| claude-code    | API design, schema, ingestion, retrieval, verification prompts, ARCH/SCHEMA/API_CONTRACT | Frontend visuals                                |
-| claude-design  | Frontend UI, components, styling, page layouts                          | Business logic, DB queries                       |
-| codex          | Bug hunting, test coverage audits, refactor suggestions, pre-merge review| Feature implementation outside bug-fix scope    |
+One implementing agent does all work; other agents are used only for one-off reviews.
 
-Cross-lane work → write suggestion to HANDOFF.md `## Agent Suggestions` section, not silent expansion.
+| Agent       | Role                                                                                     |
+|-------------|------------------------------------------------------------------------------------------|
+| claude-code | All implementation: API, schema, ingestion, retrieval, verification, frontend, docs      |
+| codex (or any reviewer) | Independent review passes — findings go in `.agent/reviews/YYYY-MM-DD*.md` and are fixed by claude-code |
+
+The original four-agent lane model (claude-code / claude-design / gemini / codex) was retired; see MEMORY.md §Decision log 2026-10-06. Design references (e.g. Claude Design mockups) are inputs, not a separate lane.
 
 ---
 
 # §RULES
 
 ## Structural (enforced by hooks + scripts)
-- Never commit directly to `main`
-- Never read more than 3 files without /ctx-search first
+- Never commit directly to `master` (the default branch)
+- Never read more than 3 files without /ctx-search first (build the index with /ctx-map if it's missing)
 - Never mark a feature complete without: tests passing + /gap-check clean + CHANGELOG entry
 - Never write code against an external API without a fresh .agent/api-docs/<api>.md entry — run /api-check first
 - Never change ARCHITECTURE.md locked decisions or SCHEMA.md without human confirmation
-- Never bypass RLS in queries (multi-tenant guarantee)
+- Every service-role query in FastAPI must be scoped by the JWT-derived `user_id` — the service role bypasses RLS, so this filter is the tenant boundary
 
 ## Behavioural
 - Output diffs not full files for targeted edits
@@ -126,7 +129,7 @@ Cross-lane work → write suggestion to HANDOFF.md `## Agent Suggestions` sectio
 1. Run /gap-check — document any new gaps in .agent/GAPS.md
 2. Run /ctx-dump — write HANDOFF.md
 3. Run /memory-sync — extract decisions → MEMORY.md
-4. git add .agent/ HANDOFF.md CHANGELOG.md
+4. git add .agent/ CHANGELOG.md        # HANDOFF.md is gitignored — it stays local
 5. git commit -m "<type>(<scope>): <summary> [<agent-tag>]"
 ```
 

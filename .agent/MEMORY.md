@@ -26,6 +26,7 @@ Things tried and failed, or explicitly rejected during design. Do not retry with
 ### 2026-07-22 [claude-code] — Application-level tenant filtering as primary defense
 **Context:** Considered relying on app-level `WHERE user_id = ?` alone for multi-tenancy.
 **Why rejected:** Every route becomes a potential leak surface. RLS at Postgres is the primary defense. App-level user_id filters remain for clarity/testability but the DB is the enforcement point. Never bypass RLS with service-role for a user-facing read path.
+**Update 2026-10-06 [claude-code]:** This is not how the system was built. FastAPI uses the service-role client for every user-facing read and write (`db/client.py`), so RLS does not apply on that path and the explicit `user_id` filter in each query/RPC *is* the tenant boundary there. RLS protects only direct browser→Supabase access. Docs were corrected to say so (ARCHITECTURE.md §Multi-tenancy, SCHEMA.md). Moving FastAPI's user-facing reads onto a per-request, JWT-scoped client so RLS applies again is a possible future hardening, not current behavior.
 
 ### 2026-07-22 [claude-code] — Building all four multimodal-RAG strategies simultaneously
 **Context:** User initially proposed offering all four strategies (extract-to-text, unified multimodal embeddings, layout-aware, page-as-image) as user-selectable in v1.
@@ -113,16 +114,6 @@ Things tried and failed, or explicitly rejected during design. Do not retry with
 
 Things that need human input before proceeding. Do not assume answers.
 
-### 2026-07-22 [claude-code] — Chunking granularity
-**Context:** ~500-token target chosen. Could be smaller (finer citations) or larger (more context per chunk).
-**Leaning:** Start at 500 tokens with element-boundary respect. Revisit after real documents are ingested.
-**Blocking:** Not blocking; FEAT-005 encodes 500-token default.
-
-### 2026-07-22 [claude-code] — Document status update mechanism
-**Context:** Polling vs Supabase Realtime subscription for parsing progress.
-**Leaning:** Polling (simpler, works everywhere, no websocket setup).
-**Blocking:** Not blocking; FEAT-014 defaults to polling.
-
 ### 2026-07-24 [claude-code] — Google OAuth sign-in completion has never been verified end-to-end
 **Context:** FEAT-013 self-audit found the OAuth callback was entirely missing (fixed same day —
 `app/auth/callback/route.ts`, shares its PKCE code-exchange mechanism with password recovery,
@@ -140,7 +131,7 @@ real Google OAuth client (likely at deploy time) and one manual click-through be
 OAuth sign-in done, not just "the code looks right."
 
 ### 2026-08-02 [claude-code] — FEAT-027 parser: multi-page table handling and multi-column reading order are untested, not confirmed-safe
-**Context:** Independent audit (`.agent/reviews/2026-08-02-parser-rewrite-audit.md`) of the Docling→pdfplumber parser rewrite explicitly checked for two known risk areas and could not verify either, because no current test fixture exercises them: (1) a table whose rows split across a page break — `table_heavy.pdf`'s 29 tables all have bboxes within a single page's height, no continuation case exists; (2) genuine multi-column page layout — checked real word `x0` clustering across every page of `table_heavy.pdf` and `clean_digital.pdf`, both are single-column throughout. The vertical-position interleave fix (2026-08-01, this same feature) targets exactly the multi-column case and is plausible by inspection, but has never been exercised against real side-by-side-column content.
+**Context:** Independent audit (summarized in CHANGELOG.md's 2026-08-02 FEAT-027 fix entry; the standalone audit file was never committed) of the Docling→pdfplumber parser rewrite explicitly checked for two known risk areas and could not verify either, because no current test fixture exercises them: (1) a table whose rows split across a page break — `table_heavy.pdf`'s 29 tables all have bboxes within a single page's height, no continuation case exists; (2) genuine multi-column page layout — checked real word `x0` clustering across every page of `table_heavy.pdf` and `clean_digital.pdf`, both are single-column throughout. The vertical-position interleave fix (2026-08-01, this same feature) targets exactly the multi-column case and is plausible by inspection, but has never been exercised against real side-by-side-column content.
 **Leaning:** Not assumed broken, not assumed correct — genuinely unknown. `_extract_pdf_tables` uses `page.find_tables()` per-page with no cross-page continuation logic at all, so a split table would almost certainly be extracted as two separate, incomplete tables rather than one — but this has not been confirmed against a real fixture.
 **Blocking:** Not blocking for the current fixture set or the OOM fix this rewrite was for. Would become relevant if a real user document with a multi-page table or multi-column layout (e.g. a two-column academic paper, a magazine-style report) is ingested — retrieval quality for that specific document could silently degrade (a split table's rows would land in two disconnected chunks instead of one). Needs either a constructed fixture exercising both cases, or real production ingestion logs showing whether user documents actually hit this shape, before calling it resolved either way.
 
@@ -149,6 +140,13 @@ OAuth sign-in done, not just "the code looks right."
 **Why this matters beyond the one flaky test:** this is a genuine, real production behavior, not just a test artifact — any real scope where two different providers' chunks are each the ONLY representative of their own provider partition (e.g. a document mostly Voyage-embedded with exactly one Gemini-fallback chunk) could have its RRF ranking between those two chunks decided by hash-randomization-driven ordering rather than any real relevance signal, on whichever real request happens to hit that exact scope.
 **Leaning:** Real bug, not a test-only artifact — but not characterized enough to fix blindly. A fix would need a genuine design decision (e.g., blend within-list normalized score into the tie-break, seed a deterministic provider iteration order, or accept ties are only cosmetically consequential when providers' actual relevance is otherwise similar) that's out of scope for whatever task next touches `services/retriever.py`.
 **Blocking:** Not blocking anything today — flagged here specifically so it isn't silently rediscovered as "flaky test, just re-run it." Needs a deliberate fix in `services/retriever.py`'s `retrieve()`/`_reciprocal_rank_fusion()`, not a re-run, next time `services/retriever.py` is the actual subject of work.
+
+### Resolved
+
+Moved here from the list above once decided; kept for the record.
+
+- **2026-07-22 — Chunking granularity.** Resolved by FEAT-005: element-boundary grouping toward ~500 tokens (`TOKEN_BUDGET`), with a 4000-token backstop split (`MAX_CHUNK_TOKENS`). Now a Locked decision in ARCHITECTURE.md.
+- **2026-07-22 — Document status update mechanism.** Resolved by FEAT-014: polling `GET /documents`, not Supabase Realtime. Now a Locked decision in ARCHITECTURE.md.
 
 ---
 
@@ -160,7 +158,7 @@ Every fork, what was chosen, why. Append-only.
 **Alternatives considered:** Extract-to-text (simpler but lossy), unified multimodal embeddings (heavier compute, less deterministic chunks), page-as-image ColPali-style (highest fidelity but heaviest compute per page).
 **Chosen:** Layout-aware parsing via Docling.
 **Reasoning:** Widest applicability across document types, best portfolio depth, fully free at portfolio scale, preserves table structure and element relationships better than plain text extraction.
-**Superseded 2026-08-01 [claude-code] — see FEAT-027:** Docling's implementation (441MB import cost, 1144.6MB peak parse memory) OOM-crashed `/ingest` on Render's 512MB free tier in production. The *strategy* (layout-aware parsing) is unchanged and still correct; only the implementation swapped, to a heuristic-based pdfplumber/python-docx/python-pptx/selectolax parser preserving the exact same element/contract shape. See `.agent/reviews/2026-08-01-parser-research.md` for the investigation and `.agent/FEATURES.md`'s FEAT-027 entry for the real before/after numbers.
+**Superseded 2026-08-01 [claude-code] — see FEAT-027:** Docling's implementation (441MB import cost, 1144.6MB peak parse memory) OOM-crashed `/ingest` on Render's 512MB free tier in production. The *strategy* (layout-aware parsing) is unchanged and still correct; only the implementation swapped, to a heuristic-based pdfplumber/python-docx/python-pptx/selectolax parser preserving the exact same element/contract shape. See CHANGELOG.md's 2026-08-01 FEAT-027 entry for the investigation (the standalone `.agent/reviews/2026-08-01-parser-research.md` was never committed) and `.agent/FEATURES.md`'s FEAT-027 entry for the real before/after numbers.
 
 ### 2026-07-22 [claude-code] — Embeddings: Voyage multimodal-3.5
 **Alternatives considered:** OpenAI text-embedding-3, Cohere embed-4, Jina v4, self-hosted nomic-embed.
@@ -226,6 +224,12 @@ Every fork, what was chosen, why. Append-only.
 **Reasoning:** Simplified to two agents based on how the project actually developed — claude-code absorbed everything gemini was scoped to own (frontend↔backend wiring, auth flows, integration glue).
 **Changed:** `AGENT.md` (§AGENT ROLES table), `.agent/FEATURES.md` (FEAT-013 owner), `.agent/MEMORY.md` (this entry).
 
+### 2026-10-06 [claude-code] — Retire the four-agent lane model; record the single-agent workflow
+**Alternatives considered:** Keep AGENT.md's lane table as an aspiration; restore a real multi-agent rotation.
+**Chosen:** Document what actually happened. After gemini was dropped (2026-07-24), every commit was made by claude-code; claude-design and codex only appeared as one-off design references and external review passes. AGENT.md and ARCHITECTURE.md's Locked decisions now describe a single implementing agent plus optional external reviews.
+**Reasoning:** The lane rules (cross-lane HANDOFF suggestions, per-agent commit tags) were never exercised and made the process docs describe a workflow that doesn't exist. Confirmed by the project owner as part of the 2026-10-06 documentation review.
+**Changed:** `AGENT.md`, `.agent/ARCHITECTURE.md`, `.agent/MEMORY.md` (this entry).
+
 ---
 
 ## §Assumptions
@@ -251,6 +255,4 @@ Explicit assumptions made without confirmation. Flag before acting on them.
 
 ## §Agent identity log
 
-Who wrote what, when. Populated as agents work.
-
-*(empty — populated during real work)*
+Not maintained separately — authorship is recorded by the `[agent-tag]` at the end of every commit message (`git log --format='%h %s'`).
