@@ -93,6 +93,14 @@ cd apps/web && pnpm build               # production build — runs ESLint as a 
 - Backend integration tests talk to the local Supabase stack, and conftest points the app at it automatically. If the stack isn't running they **skip** rather than fail, so a green run without `supabase start` is not full coverage.
 - E2E tests need local Supabase **and** the API running (terminal 1 above), with migrations applied. They create and delete their own throwaway users.
 - Backend tests fake Voyage/Gemini by default. A few live-API tests are opt-in via `RUN_REAL_*=1` env vars (see the `skipif` markers in `tests/`). Tests that need the public internet (e.g. the Voyage tokenizer download) carry the `network` marker and are deselected by default; run them with `uv run pytest -m network`. E2E chat and upload tests go through the real running API, so they **do** use Voyage/Gemini free-tier quota (Voyage allows ~3 requests/minute).
+- Retrieval benchmark (`apps/api/eval/`): 29 questions over the fixture documents, each with the strings an answering chunk must contain.
+  ```bash
+  cd apps/api
+  uv run python -m eval.run                    # answerability: does some chunk answer each question? (no services; also a pytest gate)
+  uv run python -m eval.run --retrieval fts    # + full-text ranking against local Supabase, no API keys
+  uv run python -m eval.run --retrieval full --sleep 21 --json run.json   # + real hybrid retrieval (Voyage/Gemini quota; --rerank optional)
+  ```
+  Run it before and after a parser, chunker or retrieval change and compare recall@k/MRR. A new failure mode gets a new question (and fixture, if needed).
 - Before calling a multi-file change done, verify from a fresh clone (`git stash -u` or a new `git clone`). The working tree can hide files you never committed (STANDARDS.md §Testing).
 
 ## Contributing

@@ -70,3 +70,33 @@ def test_empty_or_runaway_output_falls_back_to_the_original_question():
 
     assert empty.rewrite("And for Q2?", HISTORY) == "And for Q2?"
     assert runaway.rewrite("And for Q2?", HISTORY) == "And for Q2?"
+
+
+# A rewrite costs a Flash-Lite round trip before retrieval can start, so it is
+# skipped when the follow-up has nothing to resolve. Getting this wrong in the
+# "skip" direction only means searching with the user's own words, which is
+# what happened before rewriting existed.
+
+
+def test_self_contained_follow_up_skips_the_gemini_call():
+    rewriter, models = _rewriter([])
+
+    question = "What was the total operating expense in fiscal year 2025?"
+    assert rewriter.rewrite(question, HISTORY) == question
+    assert models.calls == []
+
+
+def test_follow_ups_that_refer_back_are_still_rewritten():
+    for question in [
+        "How does that compare to 2024?",
+        "What were its main drivers?",
+        "And for Q2?",
+        "What about the European segment instead?",
+        "Why did they cut the dividend?",
+        "Same table but for 2009",
+        "Explain the previous answer in more detail please",
+        "Why?",
+    ]:
+        rewriter, models = _rewriter(["standalone"])
+        assert rewriter.rewrite(question, HISTORY) == "standalone", question
+        assert len(models.calls) == 1, question

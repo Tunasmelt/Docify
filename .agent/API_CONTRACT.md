@@ -291,7 +291,7 @@ Ask a question over one or more documents.
 **Behaviour:**
 - If `conversation_id` omitted, creates a new conversation
 - If `conversation_id` provided, appends to it (must belong to user)
-- Runs hybrid retrieval → generation → verification pipeline (see ARCHITECTURE.md). In a continuing conversation, retrieval searches with the question rewritten into a standalone query (one extra Gemini Flash-Lite call); generation answers the original question
+- Runs hybrid retrieval → generation → verification pipeline (see ARCHITECTURE.md). In a continuing conversation, retrieval searches with the question rewritten into a standalone query (one extra Gemini Flash-Lite call, skipped when the question doesn't refer back to the conversation); generation answers the original question
 - `verdict` is one of `supported` | `partial` | `unsupported` | `unverified` (see ARCHITECTURE.md §Verify flow):
   - `supported` — kept; the answer keeps its `[N]` marker.
   - `partial` — kept; the source backs only part of the claim (marker 3 above confirms broad growth but not "international demand"). Clients render it with a warning style.

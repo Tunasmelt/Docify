@@ -6,6 +6,22 @@ Entry types: `feature` · `fix` · `decision` · `refactor` · `test` · `infra`
 
 ---
 
+## 2026-10-06 — feature: cross-page tables, retrieval benchmark, fewer query rewrites
+
+**Phase:** 5
+**Feature:** n/a (2026-10-06 follow-up list, "parsing and retrieval quality")
+**Changed:**
+- **Tables split by a page break** (`services/parser.py`). pdfplumber finds tables one page at a time, so the second half of a split table was its own table with no header row: a chunk of bare numbers. A table that is the first thing on a page, starts near the top, and has the same column boundaries as a table that ran to the bottom of the previous page is now treated as its continuation. It keeps its own page and bbox, so citations and highlights still point at the right page, but its content gets the original header row (a repeated header isn't duplicated) and a "(Table continued from page N: caption)" line. Tables with different columns, or with body text before them, are left alone. Known gap: a one-row continuation is still dropped by the existing 1-row false-positive filter.
+- **Retrieval benchmark** (`apps/api/eval/`). `questions.json` has 29 questions over the 6 fixture documents (including a new generated `split_table.pdf`), each with the strings an answering chunk must contain: the value plus the labels that make it interpretable. `eval/run.py` reports answerability (parse + chunk only) and, with `--retrieval fts|full`, recall@1/3/k and MRR with every document in scope. `tests/test_eval.py` runs the answerability half in CI.
+- **Query rewriting is skipped for self-contained follow-ups** (`services/query_rewriter.py`). The Flash-Lite call now runs only when the follow-up refers back to the conversation (a word like "it", "that", "previous", "same"; an opener like "and", "what about"; or fewer than 4 words). Other follow-ups are searched as typed, saving a round trip before retrieval.
+**Verified:**
+- Cross-page tables: 5 new tests on generated PDFs (header added, repeated header not duplicated, different columns not joined, body text before the table not joined, continuation chunk self-contained on page 2) fail or are meaningless on the old code and pass on the new. No real fixture table is joined (table_heavy.pdf: 29 tables, 0 continuations).
+- Benchmark: 29/29 answerable on the new parser; on the old parser it reports exactly the two split-table questions as unanswerable. FTS-only baseline against local Supabase: recall@1 0.90, recall@3 0.97, recall@5 0.97, MRR 0.93. The one miss (`tables-12`) shares no words with its answer, which is what vector search is for; no real-key run was possible here.
+- Rewriter: 2 new tests (self-contained follow-up makes no call; 8 referring follow-ups still rewrite). Existing `/query` and conversation tests pass.
+**Deploy:** no migrations. Existing documents keep their old chunks until re-indexed.
+
+---
+
 ## 2026-10-06 — infra: CI on every PR, deterministic RRF ties, network-only test marker
 
 **Phase:** 5
