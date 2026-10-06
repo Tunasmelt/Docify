@@ -410,3 +410,59 @@ def test_delete_retry_after_partial_storage_failure_succeeds(app_client, admin, 
     assert admin.table("chunks").select("id").eq("document_id", document_id).execute().data == []
     with pytest.raises(Exception):
         admin.storage.from_("figures").download(figure_path)
+
+
+# ── Rename (PATCH /documents/{id}, 2026-10-06) ───────────────────────────────
+# The name is display-only: parsing picks the format from storage_path, so a
+# rename never affects processing, and citations join documents.filename
+# live, so history shows the new name too.
+
+
+def _rename(app_client, token, document_id, filename):
+    return app_client.patch(
+        f"/documents/{document_id}", json={"filename": filename}, headers={"Authorization": f"Bearer {token}"}
+    )
+
+
+def test_rename_document_returns_and_persists_the_new_name(app_client, user_a):
+    user_id, token = user_a
+    document_id = ingest_real_document(app_client, user_id, token, filename="scan_0042.pdf")
+
+    response = _rename(app_client, token, document_id, "  Q3 board report.pdf  ")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == document_id and body["filename"] == "Q3 board report.pdf"  # trimmed
+    fetched = app_client.get(f"/documents/{document_id}", headers={"Authorization": f"Bearer {token}"}).json()
+    assert fetched["filename"] == "Q3 board report.pdf"
+
+
+@pytest.mark.parametrize(
+    "filename, reason",
+    [("   ", "empty"), ("x" * 256, "too long"), ("bad\nname.pdf", "control character")],
+)
+def test_rename_rejects_invalid_names(app_client, user_a, filename, reason):
+    user_id, token = user_a
+    document_id = ingest_real_document(app_client, user_id, token, filename="keep.pdf")
+
+    response = _rename(app_client, token, document_id, filename)
+
+    assert response.status_code == 422, reason
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+    fetched = app_client.get(f"/documents/{document_id}", headers={"Authorization": f"Bearer {token}"}).json()
+    assert fetched["filename"] == "keep.pdf"
+
+
+def test_rename_of_another_users_or_a_missing_document_is_404(app_client, user_a, user_b):
+    user_id_a, token_a = user_a
+    _, token_b = user_b
+    document_id = ingest_real_document(app_client, user_id_a, token_a, filename="mine.pdf")
+
+    assert _rename(app_client, token_b, document_id, "stolen.pdf").status_code == 404
+    assert _rename(app_client, token_a, "00000000-0000-0000-0000-000000000000", "x.pdf").status_code == 404
+    fetched = app_client.get(f"/documents/{document_id}", headers={"Authorization": f"Bearer {token_a}"}).json()
+    assert fetched["filename"] == "mine.pdf"
+
+
+def test_rename_requires_auth(app_client):
+    assert app_client.patch("/documents/whatever", json={"filename": "x.pdf"}).status_code == 401

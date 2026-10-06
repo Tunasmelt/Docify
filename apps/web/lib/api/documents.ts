@@ -35,6 +35,15 @@ export async function getDocument(id: string): Promise<ApiDocument> {
   return apiFetch<ApiDocument>(`/documents/${id}`);
 }
 
+/** Changes the document's display name (PATCH /documents/{id}). */
+export async function renameDocument(id: string, filename: string): Promise<ApiDocument> {
+  return apiFetch<ApiDocument>(`/documents/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ filename }),
+  });
+}
+
 export async function deleteDocument(id: string): Promise<void> {
   await apiFetch<void>(`/documents/${id}`, { method: "DELETE" });
 }
@@ -123,4 +132,25 @@ export async function fetchPageImage(
     );
   }
   return URL.createObjectURL(await res.blob());
+}
+
+export interface SourceContextBlock {
+  chunk_id: string;
+  element_type: string;
+  /** Chunk text; tables are markdown. */
+  content: string;
+  cited: boolean;
+  figure_url: string | null;
+}
+
+export interface SourceContext {
+  kind: "slide" | "section";
+  /** "Slide N", the section heading, or null for text outside any section. */
+  label: string | null;
+  blocks: SourceContextBlock[];
+}
+
+/** The cited chunk with its surroundings, for DOCX/PPTX/HTML sources. */
+export async function fetchSourceContext(documentId: string, chunkId: string): Promise<SourceContext> {
+  return apiFetch<SourceContext>(`/documents/${documentId}/chunks/${chunkId}/context`);
 }

@@ -220,3 +220,38 @@ export async function seedPdfWithChunk(
   });
   return { documentId: doc.id, chunkId: chunk.id };
 }
+
+/** A ready document of any format with the given chunks, in order — for the
+ * DOCX/PPTX/HTML source preview, which reads chunk text and section
+ * metadata rather than a stored file. */
+export async function seedDocumentWithChunks(
+  userId: string,
+  filename: string,
+  mimeType: string,
+  chunks: { content: string; page?: number; section?: string | null; elementType?: string }[]
+): Promise<{ documentId: string; chunkIds: string[] }> {
+  const doc = await restInsert<{ id: string }>("documents", {
+    user_id: userId,
+    filename,
+    storage_path: `uploads/${userId}/${filename}`,
+    mime_type: mimeType,
+    size_bytes: 1,
+    status: "ready",
+  });
+  const chunkIds: string[] = [];
+  for (let index = 0; index < chunks.length; index++) {
+    const chunk = chunks[index];
+    const row = await restInsert<{ id: string }>("chunks", {
+      document_id: doc.id,
+      user_id: userId,
+      chunk_index: index,
+      element_type: chunk.elementType ?? "text",
+      page_number: chunk.page ?? 1,
+      content: chunk.content,
+      embedding: DUMMY_EMBEDDING,
+      metadata: { section_heading: chunk.section ?? null },
+    });
+    chunkIds.push(row.id);
+  }
+  return { documentId: doc.id, chunkIds };
+}

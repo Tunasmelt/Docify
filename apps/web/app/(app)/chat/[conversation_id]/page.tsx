@@ -10,7 +10,7 @@ import { ThemeToggle } from "@/components/theme-toggle";
 import { UserMessageBubble, AssistantMessageBubble } from "@/components/chat/message-bubble";
 import { LoadingStages, type StreamingStage } from "@/components/chat/loading-stages";
 import { QuestionInput } from "@/components/chat/question-input";
-import { PagePreviewDialog } from "@/components/chat/page-preview-dialog";
+import { SourcePreviewDialog } from "@/components/chat/source-preview-dialog";
 import { SourcePanel } from "@/components/chat/source-panel";
 import { ScrollToBottomPill } from "@/components/chat/scroll-to-bottom-pill";
 import { DocumentScopeChips } from "@/components/chat/document-scope-chips";
@@ -646,7 +646,7 @@ export default function ChatPage({ params }: { params: { conversation_id: string
           onClose={() => setActiveCitation(null)}
           onOpenInDocument={setPreviewCitation}
         />
-        <PagePreviewDialog citation={previewCitation} onClose={() => setPreviewCitation(null)} />
+        <SourcePreviewDialog citation={previewCitation} onClose={() => setPreviewCitation(null)} />
       </div>
       <RenameConversationDialog
         target={renameOpen && conversationId ? { id: conversationId, currentTitle: title ?? "" } : null}

@@ -201,6 +201,58 @@ def get_document(client, *, document_id: str, user_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
+def rename_document(client, *, document_id: str, user_id: str, filename: str) -> dict | None:
+    """Scoped to user_id in the update itself, so "doesn't exist" and "not
+    yours" both return None. Only the display name changes: parsing picks the
+    format from storage_path, which a rename leaves alone."""
+    updated = (
+        client.table("documents")
+        .update({"filename": filename})
+        .eq("id", document_id)
+        .eq("user_id", user_id)
+        .execute()
+        .data
+    )
+    if not updated:
+        return None
+    return get_document(client, document_id=document_id, user_id=user_id)
+
+
+_CONTEXT_CHUNK_COLUMNS = "id,chunk_index,element_type,page_number,content,figure_path,metadata"
+
+
+def get_document_chunk(client, *, document_id: str, chunk_id: str, user_id: str) -> dict | None:
+    rows = (
+        client.table("chunks")
+        .select(_CONTEXT_CHUNK_COLUMNS)
+        .eq("id", chunk_id)
+        .eq("document_id", document_id)
+        .eq("user_id", user_id)
+        .execute()
+        .data
+    )
+    return rows[0] if rows else None
+
+
+def list_document_chunks(
+    client,
+    *,
+    document_id: str,
+    user_id: str,
+    page_number: int | None = None,
+    index_range: tuple[int, int] | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    """A document's chunks in reading order, filtered to one page/slide or a
+    chunk_index range (inclusive)."""
+    query = client.table("chunks").select(_CONTEXT_CHUNK_COLUMNS).eq("document_id", document_id).eq("user_id", user_id)
+    if page_number is not None:
+        query = query.eq("page_number", page_number)
+    if index_range is not None:
+        query = query.gte("chunk_index", index_range[0]).lte("chunk_index", index_range[1])
+    return query.order("chunk_index").limit(limit).execute().data
+
+
 def get_document_file(client, *, document_id: str, user_id: str) -> dict | None:
     """storage_path + mime_type for serving the original file's pages.
     Scoped to user_id in the query itself (same 404-for-both discipline as

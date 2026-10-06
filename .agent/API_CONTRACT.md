@@ -207,6 +207,45 @@ Renders one page of a PDF as a PNG, for the citation page preview. With all four
 
 ---
 
+### `PATCH /documents/{document_id}`
+Renames a document. Only the display name changes: parsing picks the format from `storage_path`, which stays as it was, and citations read the name live, so conversation history shows the new name too. Allowed in any status.
+
+**Request:**
+```json
+{ "filename": "Q3 board report.pdf" }
+```
+
+**Response 200:** the updated document (same shape as `GET /documents/{document_id}`).
+
+**Errors:**
+- `422 VALIDATION_ERROR` — empty after trimming, longer than 255 characters, or contains control characters
+- `404 NOT_FOUND` — doesn't exist or isn't the caller's
+
+---
+
+### `GET /documents/{document_id}/chunks/{chunk_id}/context`
+"Show in document" for DOCX, PPTX and HTML citations, which have no page image. Returns the cited chunk with its surroundings, built from stored chunk text (the original file isn't rendered).
+
+**Response 200:**
+```json
+{
+  "kind": "slide",
+  "label": "Slide 2",
+  "blocks": [
+    { "chunk_id": "…", "element_type": "text", "content": "Revenue reached $1,410,000", "cited": true, "figure_url": null }
+  ]
+}
+```
+- PPTX: `kind: "slide"`, every chunk on the cited slide in reading order, `label` "Slide N".
+- DOCX/HTML: `kind: "section"`, the unbroken run of chunks sharing the cited chunk's section heading, at most 3 on each side. `label` is that heading (`null` for text outside any section), and the heading prefix the chunker adds to each chunk is removed from `content`.
+- `content` is markdown for tables. `figure_url` is a 10-minute signed URL for figure chunks, else `null`.
+
+**Errors:**
+- `404 NOT_FOUND` — the document or chunk doesn't exist, isn't the caller's, or the chunk belongs to another document
+- `422 VALIDATION_ERROR` — the document is a PDF (use the page image endpoint)
+
+---
+
 ### `DELETE /documents/{document_id}`
 Deletes the document's Storage objects (`uploads` file + `figures`), then the row. Chunks and citations cascade via FKs; the id is removed from any `conversations.document_ids` array in application code (arrays have no FK).
 

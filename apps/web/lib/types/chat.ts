@@ -32,6 +32,9 @@ export interface Citation {
    * render the highlighted page preview ("Open page N in document"). */
   documentId: string;
   bbox?: CitationBBox;
+  /** The cited chunk — used by "Show in document" for DOCX/PPTX/HTML, which
+   * loads the surrounding slide or section (no page image exists). */
+  chunkId: string;
 }
 
 export type MessageSegment =

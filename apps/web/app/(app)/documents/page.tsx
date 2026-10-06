@@ -10,11 +10,13 @@ import { Button } from "@/components/ui/button";
 import { UploadZone, type UploadedDocument } from "@/components/documents/upload-zone";
 import { DocumentCard, type DocumentCardData } from "@/components/documents/document-card";
 import { DeleteConfirmDialog } from "@/components/documents/delete-confirm-dialog";
+import { RenameDocumentDialog, type RenameDocumentTarget } from "@/components/documents/rename-document-dialog";
 import { createClient } from "@/lib/supabase/browser";
 import { useCurrentUser } from "@/hooks/use-current-user";
 import {
   ApiError,
   deleteDocument,
+  renameDocument,
   listDocuments,
   reindexDocument,
   type ApiDocument,
@@ -64,6 +66,9 @@ export default function DocumentsPage() {
   const [deleting, setDeleting] = React.useState(false);
   const [retryingId, setRetryingId] = React.useState<string | null>(null);
   const [retryError, setRetryError] = React.useState<string | null>(null);
+  const [renameTarget, setRenameTarget] = React.useState<RenameDocumentTarget | null>(null);
+  const [renameError, setRenameError] = React.useState<string | null>(null);
+  const [renaming, setRenaming] = React.useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = React.useState(false);
   const [selectedIds, setSelectedIds] = React.useState<string[]>([]);
 
@@ -212,6 +217,28 @@ export default function DocumentsPage() {
       }
     } finally {
       setDeleting(false);
+    }
+  }
+
+  function openRenameDialog(id: string) {
+    const doc = docs.find((d) => d.id === id);
+    if (!doc) return;
+    setRenameError(null);
+    setRenameTarget({ id, currentName: doc.filename });
+  }
+
+  async function handleRenameConfirm(filename: string) {
+    if (!renameTarget) return;
+    setRenameError(null);
+    setRenaming(true);
+    try {
+      const updated = await renameDocument(renameTarget.id, filename);
+      commitDocs(docs.map((d) => (d.id === updated.id ? { ...d, filename: updated.filename } : d)));
+      setRenameTarget(null);
+    } catch (err) {
+      setRenameError(err instanceof ApiError ? err.message : "Couldn't rename this document.");
+    } finally {
+      setRenaming(false);
     }
   }
 
@@ -378,6 +405,7 @@ export default function DocumentsPage() {
                       key={doc.id}
                       doc={doc}
                       onDelete={setDeleteId}
+                      onRename={openRenameDialog}
                       selected={selectedIds.includes(doc.id)}
                       onToggleSelect={toggleSelect}
                       onRetry={handleRetryDocument}
@@ -395,6 +423,14 @@ export default function DocumentsPage() {
           </div>
         </main>
       </div>
+
+      <RenameDocumentDialog
+        target={renameTarget}
+        error={renameError}
+        saving={renaming}
+        onConfirm={handleRenameConfirm}
+        onCancel={() => setRenameTarget(null)}
+      />
 
       <DeleteConfirmDialog
         filename={deleteTarget?.filename ?? null}

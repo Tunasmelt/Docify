@@ -73,8 +73,8 @@ Source of truth for what is and is not in scope, per phase. Check here before de
 - [x] Protected-route middleware
 - [x] Upload page with drag-drop, progress state, document list
 - [x] Chat page: question input, streaming answers, inline citation chips, copy, timestamps, stop/regenerate
-- [x] Citation chip → source panel with chunk text and figure image; for PDFs, "Open page N" shows the page with the cited area highlighted
-- [x] Document list: filter and delete. **Document rename is not built** (`PATCH /documents/{id}` not yet defined)
+- [x] Citation chip → source panel with chunk text and figure image; "Open page N" shows a PDF page with the cited area highlighted, and DOCX/PPTX/HTML open the cited slide or section as text with the cited passage highlighted
+- [x] Document list: filter, rename (`PATCH /documents/{id}`, 2026-10-06) and delete
 - [x] Conversation rename + delete
 - [x] Empty states, loading skeletons, error boundaries
 - [x] Mobile-responsive layout

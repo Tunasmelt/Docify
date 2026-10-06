@@ -1,5 +1,6 @@
 import logging
 import threading
+import uuid
 from collections import OrderedDict
 from io import BytesIO
 
@@ -9,7 +10,14 @@ from fastapi.responses import JSONResponse, Response
 from db import queries
 from db.client import get_service_role_client
 from errors import error_envelope
-from models.documents import DocumentListResponse, DocumentResponse
+from models.documents import (
+    DocumentListResponse,
+    DocumentResponse,
+    RenameDocumentRequest,
+    SourceContextBlock,
+    SourceContextResponse,
+)
+from services.figure_fetcher import signed_figure_url
 from routes._pagination import decode_cursor, encode_cursor
 from routes.ingest import STUCK_DOCUMENT_THRESHOLD_SECONDS
 
@@ -86,6 +94,33 @@ def get_document(document_id: str, request: Request):
         # (API_CONTRACT.md; same discipline as FEAT-007's storage_path fix).
         return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "document not found"))
 
+    return DocumentResponse(**row)
+
+
+# Same bound as the filenames real file systems allow.
+FILENAME_MAX_LENGTH = 255
+
+
+@router.patch("/documents/{document_id}", response_model=DocumentResponse)
+def rename_document(document_id: str, payload: RenameDocumentRequest, request: Request):
+    filename = payload.filename.strip()
+    if not filename:
+        return JSONResponse(status_code=422, content=error_envelope("VALIDATION_ERROR", "filename must not be empty"))
+    if len(filename) > FILENAME_MAX_LENGTH:
+        return JSONResponse(
+            status_code=422,
+            content=error_envelope("VALIDATION_ERROR", f"filename must be at most {FILENAME_MAX_LENGTH} characters"),
+        )
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in filename):
+        return JSONResponse(
+            status_code=422, content=error_envelope("VALIDATION_ERROR", "filename must not contain control characters")
+        )
+
+    row = queries.rename_document(
+        get_service_role_client(), document_id=document_id, user_id=request.state.user_id, filename=filename
+    )
+    if row is None:
+        return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "document not found"))
     return DocumentResponse(**row)
 
 
@@ -336,3 +371,95 @@ def _draw_highlight(page_png: bytes, highlight: tuple) -> bytes:
     # roughly doubles encode time for a few percent smaller output.
     Image.alpha_composite(image, overlay).convert("RGB").save(out, format="PNG")
     return out.getvalue()
+
+
+# ── Source context for non-PDF citations ───────────────────────────────────
+# DOCX/PPTX/HTML have no page image, so "show in document" returns the cited
+# chunk with its surroundings instead: the whole slide for PPTX, or up to
+# SECTION_CONTEXT_RADIUS chunks either side within the same section for
+# DOCX/HTML. Chunk text is all the API has: the original file isn't rendered.
+PPTX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+SECTION_CONTEXT_RADIUS = 3
+MAX_SLIDE_BLOCKS = 50
+
+
+def _is_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _section_of(chunk: dict) -> str | None:
+    return (chunk.get("metadata") or {}).get("section_heading")
+
+
+def _without_heading_prefix(content: str, heading: str | None) -> str:
+    """The chunker prefixes each chunk with its section heading; the dialog
+    shows the heading once as its title instead."""
+    if heading and content.startswith(heading):
+        return content[len(heading) :].lstrip("\n")
+    return content
+
+
+@router.get("/documents/{document_id}/chunks/{chunk_id}/context", response_model=SourceContextResponse)
+def get_source_context(document_id: str, chunk_id: str, request: Request):
+    user_id = request.state.user_id
+    client = get_service_role_client()
+    not_found = JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "source not found"))
+
+    if not (_is_uuid(document_id) and _is_uuid(chunk_id)):
+        return not_found
+    document = queries.get_document_file(client, document_id=document_id, user_id=user_id)
+    if document is None:
+        return not_found
+    if document["mime_type"] == "application/pdf":
+        return JSONResponse(
+            status_code=422,
+            content=error_envelope("VALIDATION_ERROR", "PDF sources use the page image endpoint"),
+        )
+    cited = queries.get_document_chunk(client, document_id=document_id, chunk_id=chunk_id, user_id=user_id)
+    if cited is None:
+        return not_found
+
+    if document["mime_type"] == PPTX_MIME_TYPE:
+        kind, label = "slide", f"Slide {cited['page_number']}"
+        chunks = queries.list_document_chunks(
+            client, document_id=document_id, user_id=user_id, page_number=cited["page_number"], limit=MAX_SLIDE_BLOCKS
+        )
+    else:
+        kind, label = "section", _section_of(cited)
+        index = cited["chunk_index"]
+        window = queries.list_document_chunks(
+            client,
+            document_id=document_id,
+            user_id=user_id,
+            index_range=(index - SECTION_CONTEXT_RADIUS, index + SECTION_CONTEXT_RADIUS),
+        )
+        # Keep only the unbroken run of same-section chunks around the cited one.
+        position = next(i for i, c in enumerate(window) if c["id"] == chunk_id)
+        start = position
+        while start > 0 and _section_of(window[start - 1]) == label:
+            start -= 1
+        end = position
+        while end + 1 < len(window) and _section_of(window[end + 1]) == label:
+            end += 1
+        chunks = window[start : end + 1]
+
+    blocks = []
+    for chunk in chunks:
+        is_cited = chunk["id"] == chunk_id
+        content = chunk["content"] if kind == "slide" else _without_heading_prefix(chunk["content"], label)
+        if not content.strip() and not is_cited and not chunk.get("figure_path"):
+            continue  # a heading-only chunk, already shown as the title
+        blocks.append(
+            SourceContextBlock(
+                chunk_id=chunk["id"],
+                element_type=chunk["element_type"],
+                content=content,
+                cited=is_cited,
+                figure_url=signed_figure_url(client, chunk["figure_path"]) if chunk.get("figure_path") else None,
+            )
+        )
+    return SourceContextResponse(kind=kind, label=label, blocks=blocks)

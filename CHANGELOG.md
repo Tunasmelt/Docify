@@ -6,6 +6,20 @@ Entry types: `feature` · `fix` · `decision` · `refactor` · `test` · `infra`
 
 ---
 
+## 2026-10-06 — feature: document rename, source preview for DOCX/PPTX/HTML
+
+**Phase:** 3
+**Feature:** n/a (SCOPE.md Phase 3 gaps)
+**Changed:**
+- **Rename documents.** New `PATCH /documents/{id}` (`{ "filename": … }`): trimmed, 1-255 characters, no control characters, owner only. Display name only: the parser reads the format from `storage_path`, and citations join `documents.filename` live, so history shows the new name. The library has a pencil button per document opening a rename dialog (same pattern as conversation rename).
+- **"Show in document" for non-PDF citations.** These had no button at all. New `GET /documents/{id}/chunks/{chunk_id}/context` returns the cited chunk with its surroundings: the whole slide for PPTX, or up to 3 chunks either side within the same section for DOCX/HTML (heading prefix stripped, heading returned as the label, figures with signed URLs). The PDF page dialog became `SourcePreviewDialog`, which shows the page image for PDFs and the slide/section as text for the rest, with the cited block highlighted in the same amber as the PDF highlight and scrolled into view; tables render as tables. The button reads "Open page N", "Open slide N" or "Show in document". Client citations now carry `chunkId` (the API already sent `chunk_id`).
+**Verified:**
+- API: 6 rename tests (persisted and trimmed; empty, too long, control characters rejected with the name unchanged; other user's and missing document 404; auth) and 7 context tests (PPTX slide order and cited flag, DOCX section bounded by headings with prefixes stripped, window cap, figure URL, PDF rejected, other user / other document 404). Checked against the real `slides.pptx`, `table.docx` and `page.html` fixtures through the real parser and chunker.
+- Playwright: new `document-rename.e2e.ts` and `source-context.e2e.ts` (PPTX slide, DOCX section with a rendered table) pass, as do `page-preview`, `document-retry`, `conversation-management`, `export` and 4 of 6 `upload` tests. The other 2 `upload` tests wait for a document to reach Ready, which needs a real Voyage tokenizer download this environment's proxy blocks; `/ingest` itself returned 202.
+**Deploy:** no migrations.
+
+---
+
 ## 2026-10-06 — infra: error tracking, per-user ingest cap, page-preview cache
 
 **Phase:** 5

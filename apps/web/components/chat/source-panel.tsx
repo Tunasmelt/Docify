@@ -96,16 +96,15 @@ export function SourcePanel({ citation, onClose, onOpenInDocument }: SourcePanel
         <blockquote className="m-0 mt-5 border-l-2 border-border pl-4 font-serif text-[15px] leading-[1.7] text-muted">
           {citation.excerpt}
         </blockquote>
-        {location?.kind === "page" ? (
-          // Page previews exist for PDFs only (rendered server-side).
-          <button
-            type="button"
-            onClick={() => onOpenInDocument(citation)}
-            className="mt-6 w-full rounded-md border border-border py-2.5 text-sm font-medium text-muted hover:bg-panel hover:text-ink"
-          >
-            Open page {location.number} in document
-          </button>
-        ) : null}
+        {/* PDFs open the rendered page; other formats open the cited slide or
+         * section as text (components/chat/source-preview-dialog.tsx). */}
+        <button
+          type="button"
+          onClick={() => onOpenInDocument(citation)}
+          className="mt-6 w-full rounded-md border border-border py-2.5 text-sm font-medium text-muted hover:bg-panel hover:text-ink"
+        >
+          {location ? `Open ${location.kind} ${location.number} in document` : "Show in document"}
+        </button>
       </div>
     </aside>
   );
