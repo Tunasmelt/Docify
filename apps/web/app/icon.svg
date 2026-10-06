@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="14" fill="#2f6c4f"/>
+  <!-- D: the document -->
+  <path fill="#f6f2e8" fill-rule="evenodd" d="M16 18h16c11 0 18 7 18 18s-7 18-18 18H16zm9 8v20h7c6 0 10-4 10-10s-4-10-10-10z"/>
+  <!-- footnote marker: the citation -->
+  <circle cx="51" cy="14" r="5" fill="#e0a43a"/>
+</svg>
