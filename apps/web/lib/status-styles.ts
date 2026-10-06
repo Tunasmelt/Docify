@@ -15,7 +15,8 @@ export interface StatusStyle {
  * branch (the prototype computed light/dark hex pairs by hand; the real
  * token system makes that redundant). */
 export const DOCUMENT_STATUS_STYLES: Record<DocumentStatus, StatusStyle> = {
-  uploaded: { label: "Uploaded", fg: "var(--muted)", bg: "var(--muted-bg)", live: false },
+  // Waiting in the ingest queue (one document is processed at a time).
+  uploaded: { label: "Queued", fg: "var(--muted)", bg: "var(--muted-bg)", live: true },
   parsing: { label: "Parsing", fg: "var(--amber)", bg: "var(--amber-bg)", live: true },
   embedded: { label: "Embedding", fg: "var(--amber)", bg: "var(--amber-bg)", live: true },
   ready: { label: "Ready", fg: "var(--accent)", bg: "var(--green-bg)", live: false },

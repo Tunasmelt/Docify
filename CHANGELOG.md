@@ -6,6 +6,28 @@ Entry types: `feature` · `fix` · `decision` · `refactor` · `test` · `infra`
 
 ---
 
+## 2026-10-06 — feature: ingest job queue, atomic reindex, document limits
+
+**Phase:** 5
+**Feature:** n/a (SCOPE.md Phase 5 "Production job execution")
+**Changed:**
+- **Postgres job queue** (migration `20261006_003`, `services/ingest_queue.py`). `/ingest` and `/reindex` insert an `ingest_jobs` row instead of running the pipeline as a FastAPI BackgroundTask. A worker thread started with the app claims jobs through `claim_ingest_job()`:
+  - **Global cap:** at most `INGEST_MAX_CONCURRENT_JOBS` (default 1) jobs run at once, across all users and instances, enforced in the database.
+  - **Crash recovery:** running jobs heartbeat every 30s; a job whose 2-minute lease lapses (the worker died or the instance restarted) is claimed again and resumes. A document that kills the process 3 times is failed with a clear message.
+  - **Retries:** transient failures (rate limits, network, storage errors) put the document back to `uploaded` and retry after 60s, then 300s, up to 3 attempts. Parse errors, limit violations, a missing upload and timeouts fail at once.
+  - **Time limit:** 20 minutes per attempt, checked between stages and between OCR'd pages.
+- **Reindex keeps the old chunks.** New chunks go to `chunks_staging` and `swap_document_chunks()` replaces the live set in one transaction, so a reindexed document keeps answering while it runs and keeps its old chunks if reprocessing fails (it used to be left with none). Failures no longer delete live chunks. Figures go under a per-run folder and the old ones are removed after the swap.
+- **Limits, checked before the expensive work:** 50 MB (declared size at `/ingest` and real size after download), 300 pages/slides, and 30 pages needing OCR (counted before any OCR call). Each fails the document with a message saying which limit.
+- **Fixes found on the way:** the stuck-document reaper measured `parsing` from `created_at`, so it could reap a reindex of an old document mid-run; it now uses `updated_at` (set when an attempt starts). Account deletion walked only one folder level of Storage and would have missed the new figure paths; it now walks recursively.
+- **Web:** `uploaded` is shown as "Queued", Retry uses the status the API returns, and files over 50 MB are refused before upload.
+**Verified:**
+- New tests: 10 queue tests against local Supabase (FIFO claim, global cap, lease expiry and reclaim, retry with backoff then success, last-attempt failure, permanent failure not retried, repeated-crash cutoff, heartbeat, the real worker thread, reindex 409 while queued), 5 swap tests (old chunks live mid-reindex, failed reindex keeps them, figures replaced and old objects removed, first ingest via staging, a failure after the swap keeps the new figures), 10 limit tests (declared and real size, PDF pages, PPTX slides, OCR budget fails before any OCR call, OCR and pipeline deadlines, missing upload fails at once).
+- Existing tests updated for intended changes: figure paths include the run folder, failure cleanup removes staged (not live) chunks, the reaper test backdates `updated_at`, reindex reports `uploaded`. Tests drain the queue synchronously through the real claim/finish path via an autouse fixture.
+- Full backend suite: 519 passed, 18 skipped, 1 deselected. Playwright: upload (Queued label), document-retry, document-rename and page-preview pass; the 2 upload tests that need a real Voyage tokenizer still can't reach Ready here. The live API log showed the worker claiming jobs and retrying the blocked tokenizer download after 60s and 300s.
+**Deploy:** apply migration `20261006_003_ingest_job_queue.sql` to production **before** deploying: `/ingest` writes to `ingest_jobs` immediately. Optional env vars: `INGEST_MAX_CONCURRENT_JOBS`, `INGEST_WORKER_ENABLED`.
+
+---
+
 ## 2026-10-06 — feature: document rename, source preview for DOCX/PPTX/HTML
 
 **Phase:** 3

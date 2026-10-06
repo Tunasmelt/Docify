@@ -178,6 +178,26 @@ The composite primary key covers every lookup; incremented atomically by `increm
 
 ---
 
+### `ingest_jobs`
+
+The ingest queue (services/ingest_queue.py). Service role only: RLS on, no policies.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | uuid PK | |
+| `document_id` | uuid → documents, cascade | at most one `queued`/`running` job per document (partial unique index) |
+| `user_id` | uuid → auth.users, cascade | |
+| `storage_path` | text | |
+| `status` | text | `queued` → `running` → `succeeded` \| `failed`; back to `queued` for a retry |
+| `attempts` / `max_attempts` | int | incremented on each claim; default max 3 |
+| `run_after` | timestamptz | earliest claim time (retry backoff) |
+| `locked_at` / `locked_by` | timestamptz / text | heartbeat and worker id of a running job; a lapsed lease means the worker died |
+| `last_error` | text | last transient error, or the final failure |
+
+### `chunks_staging`
+
+Same columns as `chunks` minus the generated `ts`, with no unique constraint or vector index. New chunks wait here until `swap_document_chunks()`. Service role only.
+
 ## Row-Level Security policies
 
 RLS is enabled on every user-owned table. The policy is uniform: `auth.uid() = user_id`. It is the tenant boundary for every request made with the anon key and a user JWT (the browser's direct Supabase access).
@@ -229,6 +249,8 @@ PostgREST cannot express vector/FTS ranking or multi-table transactions, so thes
 | `match_chunks_by_fts(query_text, match_user_id, match_document_ids, match_limit)` | Postgres FTS search; **any** question term matches, chunks matching more terms rank higher | `20260724_001`, `20260727_001`, `20260802_002`, `20261006_001` |
 | `fts_any_term_query(query_text)` | Builds an OR `tsquery` from the question's english-normalized lexemes; NULL (matches nothing) if the question is all stopwords | `20261006_001` |
 | `distinct_embedding_providers(match_user_id, match_document_ids)` | Which providers have chunks in a document scope | `20260731_001` |
+| `claim_ingest_job(p_worker_id, p_lease_seconds, p_max_running)` | Claims the oldest runnable ingest job (queued and due, or running with an expired lease), unless `p_max_running` jobs already hold live leases; increments `attempts` | `20261006_003` |
+| `swap_document_chunks(p_document_id, p_user_id)` | In one transaction: deletes the document's live chunks, moves its `chunks_staging` rows into `chunks`, returns the new count | `20261006_003` |
 | `create_query_turn(p_user_id, ...)` | Atomically writes conversation (if new) + 2 messages + citations; a malformed citation is skipped with a warning rather than rolling back the turn | `20260724_002`, `20260725_002`, `20260731_002` |
 | `increment_usage_counter(p_user_id, p_route, p_day)` | Atomic upsert-and-increment for daily rate limits; executable by `service_role` only | `20260802_001` |
 
@@ -326,6 +348,7 @@ Migrations up to `20260804_001` are applied to the production project; later one
 | `20260803_001_citation_verdict_unverified.sql` | FEAT-028 | Adds `'unverified'` to the `verdict` enum |
 | `20260804_001_avatars_bucket.sql` | FEAT-032 | Public-read `avatars` bucket with owner-scoped write policies |
 | `20261006_001_fts_any_term_matching.sql` | Fix | `match_chunks_by_fts` matches any question term instead of requiring all of them (`websearch_to_tsquery` ANDed every term, so natural-language questions rarely matched); adds `fts_any_term_query` |
+| `20261006_003_ingest_job_queue.sql` | Feature | `ingest_jobs` table + `claim_ingest_job()` (queue with global concurrency cap, heartbeat leases, retries); `chunks_staging` + `swap_document_chunks()` (atomic chunk replacement on (re)index). **Apply before deploying the code that ships with it:** `/ingest` and the pipeline use these immediately |
 | `20261006_002_vector_search_iterative_scan.sql` | Fix | `match_chunks_by_vector` runs with `hnsw.iterative_scan = strict_order` so the tenant/document/provider filters can't leave a user with fewer results than exist (the HNSW index returned ~40 nearest chunks across all tenants before filtering) |
 
 Account deletion (FEAT-035) needed no migration: all 6 user-scoped tables already cascade on `auth.users` deletion, and Storage cleanup is done in application code.

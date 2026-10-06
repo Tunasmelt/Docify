@@ -38,7 +38,7 @@ async function loginAsNewUser(page: import("@playwright/test").Page, emailPrefix
 }
 
 test.describe("[FEAT-014] Upload UI + document list", () => {
-  test("click-to-select uploads a real PDF; appears immediately with the real 'Uploaded' status", async ({
+  test("click-to-select uploads a real PDF; appears immediately as 'Queued'", async ({
     page,
   }) => {
     const email = await loginAsNewUser(page, "e2e-upload");
@@ -58,7 +58,7 @@ test.describe("[FEAT-014] Upload UI + document list", () => {
       // the real contract, not the scaffold's stale acceptance-criterion
       // wording.
       await expect(main.getByText("clean_digital.pdf")).toBeVisible({ timeout: 15000 });
-      await expect(main.getByText("Uploaded", { exact: true })).toBeVisible();
+      await expect(main.getByText("Queued", { exact: true })).toBeVisible();
     } finally {
       await deleteTestUserByEmail(email);
     }

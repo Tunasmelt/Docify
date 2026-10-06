@@ -49,7 +49,8 @@ def _backdate_created_at(admin, document_id: str, *, seconds_ago: int) -> None:
     simulate 30 real minutes passing in a test that needs to run in
     milliseconds."""
     backdated = (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    admin.table("documents").update({"created_at": backdated}).eq("id", document_id).execute()
+    # updated_at is what the reaper measures 'parsing' from (when the attempt started).
+    admin.table("documents").update({"created_at": backdated, "updated_at": backdated}).eq("id", document_id).execute()
 
 
 # Acceptance criterion (Part 3, item 3): force a document into a stuck
@@ -132,7 +133,7 @@ def test_reaper_and_reindex_recover_a_document_whose_pipeline_was_really_killed(
     assert reindex_response.status_code == 202, f"{reindex_response.status_code} {reindex_response.text}"
     body = reindex_response.json()
     assert body["document_id"] == document_id
-    assert body["status"] == "parsing"
+    assert body["status"] == "uploaded"  # queued for the ingest worker
 
     # BackgroundTasks runs synchronously under TestClient (conftest.py's
     # own established assumption, see ingest_real_document's docstring) —

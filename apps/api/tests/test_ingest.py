@@ -14,6 +14,7 @@
 # .agent/MEMORY.md's anti-pattern entry on circular JWT verification from
 # FEAT-003). app_client/user_a/user_b/admin fixtures come from conftest.py.
 
+import re
 from io import BytesIO
 from unittest.mock import patch
 
@@ -166,8 +167,10 @@ def test_background_task_download_parse_chunk_embed_insert_update_sta(admin, use
     assert chunk_rows[0]["element_type"] == "text"
     assert chunk_rows[0]["figure_path"] is None
     assert chunk_rows[1]["element_type"] == "figure"
-    expected_figure_path = f"{user_id}/{document_id}/1.png"
-    assert chunk_rows[1]["figure_path"] == expected_figure_path
+    # {user}/{document}/{run id}/{chunk_index}.png — a fresh run prefix per
+    # (re)index, so the old chunks' figures stay valid until the swap.
+    expected_figure_path = chunk_rows[1]["figure_path"]
+    assert re.fullmatch(rf"{user_id}/{document_id}/[0-9a-f]{{12}}/1\.png", expected_figure_path)
 
     # Figure was actually uploaded to storage, not just recorded as a path.
     figure_bytes = admin.storage.from_("figures").download(expected_figure_path)
@@ -443,7 +446,7 @@ def test_cleanup_failure_is_logged_and_does_not_crash_pipeline(admin, user_a, ca
         )
 
     error_messages = [r.message for r in caplog.records if r.levelname == "ERROR"]
-    assert any("delete_chunks_for_document itself failed" in m for m in error_messages)
+    assert any("delete_staged_chunks itself failed" in m for m in error_messages)
     assert any("mark_failed itself failed" in m for m in error_messages)
     assert any(document_id in m for m in error_messages)
 

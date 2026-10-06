@@ -39,6 +39,29 @@ class ParseError(Exception):
         self.page_number = page_number
 
 
+class DocumentLimitError(ParseError):
+    """The document is too big to process (size, pages, or pages needing
+    OCR). Permanent: retrying can't help. The message is shown to the user."""
+
+
+class MissingSourceFileError(Exception):
+    """The uploaded file isn't in Storage. Permanent: it won't reappear."""
+
+
+class IngestTimeoutError(Exception):
+    """Processing ran past its time limit. Permanent: the next attempt would
+    take just as long."""
+
+
+def check_deadline(deadline: float | None, limit_minutes: float | None = None) -> None:
+    """Raises IngestTimeoutError once time.monotonic() passes `deadline`."""
+    import time
+
+    if deadline is not None and time.monotonic() > deadline:
+        suffix = f" ({limit_minutes:g} minutes)" if limit_minutes else ""
+        raise IngestTimeoutError(f"Processing took longer than the time limit{suffix} and was stopped.")
+
+
 @dataclass
 class BBox:
     x0: float

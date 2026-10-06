@@ -6,6 +6,10 @@ import { Button } from "@/components/ui/button";
 import { ApiError, uploadDocument } from "@/lib/api/documents";
 import type { DocumentStatus } from "@/lib/status-styles";
 
+// Matches the API (routes/ingest.py MAX_UPLOAD_BYTES): checked here so an
+// oversized file isn't uploaded to Storage only to be refused.
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+
 export interface UploadedDocument {
   id: string;
   filename: string;
@@ -49,6 +53,10 @@ export function UploadZone({ onUploadComplete }: UploadZoneProps) {
     if (!file) return;
     if (file.type !== "application/pdf") {
       setError("Only PDF files are supported.");
+      return;
+    }
+    if (file.size > MAX_UPLOAD_BYTES) {
+      setError("This file is larger than the 50 MB limit.");
       return;
     }
     startUpload(file);

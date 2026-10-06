@@ -1,4 +1,5 @@
 import os
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 
@@ -12,12 +13,26 @@ from slowapi.middleware import SlowAPIMiddleware
 from middleware.auth import JWTAuthMiddleware
 from rate_limit import limiter, rate_limit_exceeded_handler
 from routes import account, conversations, documents, export, health, ingest, query
+from services import ingest_queue
 from services.observability import init_sentry
 
 # Before the app is created, so the FastAPI integration hooks in. No-op without SENTRY_DSN.
 init_sentry()
 
-app = FastAPI(title="docify-api")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # The ingest worker (services/ingest_queue.py) runs in this process.
+    # INGEST_WORKER_ENABLED=0 leaves jobs queued for a worker elsewhere.
+    # Tests use TestClient without `with`, which skips lifespan, and drain
+    # the queue themselves (tests/conftest.py).
+    if os.environ.get("INGEST_WORKER_ENABLED", "1") != "0":
+        ingest_queue.start_worker(ingest.run_ingest_pipeline)
+    yield
+    ingest_queue.stop_worker()
+
+
+app = FastAPI(title="docify-api", lifespan=lifespan)
 
 app.add_middleware(JWTAuthMiddleware)
 
