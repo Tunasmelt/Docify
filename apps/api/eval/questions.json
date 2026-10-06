@@ -1,0 +1,39 @@
+{
+  "_comment": "Retrieval benchmark questions. A chunk answers a question when it contains every `expect` string (case-insensitive, whitespace-normalized): the fact plus the labels that make it interpretable, e.g. a table's column header and row name, not just a bare number. Documents live in tests/fixtures/.",
+  "questions": [
+    {"id": "clean-01", "doc": "clean_digital.pdf", "question": "What is strikethrough text used for?", "expect": ["Strikethrough", "deleted text"]},
+    {"id": "clean-02", "doc": "clean_digital.pdf", "question": "What is in row 2, column 3 of the table?", "expect": ["Header 3", "Row 2, Col 3"]},
+    {"id": "clean-03", "doc": "clean_digital.pdf", "question": "What can a block quote be used for?", "expect": ["block quote", "highlight important information"]},
+
+    {"id": "docx-01", "doc": "table.docx", "question": "What was revenue in Q2 2026?", "expect": ["Revenue (USD)", "Q2 2026", "1,350,000"]},
+    {"id": "docx-02", "doc": "table.docx", "question": "How much did revenue grow in Q1 2026?", "expect": ["Growth", "Q1 2026", "5%"]},
+
+    {"id": "pptx-01", "doc": "slides.pptx", "question": "How many customers were there by Q3 2026?", "expect": ["Customer count", "5,200"]},
+    {"id": "pptx-02", "doc": "slides.pptx", "question": "What were the Q3 2026 highlights for revenue?", "expect": ["Q3 2026 Highlights", "$1,410,000"]},
+
+    {"id": "html-01", "doc": "page.html", "question": "By how much did Q3 revenue increase over Q2?", "expect": ["Q3 revenue", "4.4% increase"]},
+    {"id": "html-02", "doc": "page.html", "question": "What was Q3 2026 revenue in the quarterly results table?", "expect": ["Revenue (USD)", "Q3 2026", "1,410,000"]},
+
+    {"id": "tables-01", "doc": "table_heavy.pdf", "question": "What is Angola's Human Development Index value in 2010?", "expect": ["Human Development Index", "Angola", "4.42"]},
+    {"id": "tables-02", "doc": "table_heavy.pdf", "question": "Does Respondent C have a driving licence?", "expect": ["symbols replaced by real text", "driving licence", "Respondent C"]},
+    {"id": "tables-03", "doc": "table_heavy.pdf", "question": "What was the balance in the 2011 accounts?", "expect": ["accounts, 2011", "Balance", "30,000"]},
+    {"id": "tables-04", "doc": "table_heavy.pdf", "question": "Which Masters courses did Institution X offer in 2006?", "expect": ["Masters courses offered by Institution X", "Mathematics", "English"]},
+    {"id": "tables-05", "doc": "table_heavy.pdf", "question": "Who plays the Professor?", "expect": ["Professor", "Maggie Smith"]},
+    {"id": "tables-06", "doc": "table_heavy.pdf", "question": "Which actor plays Sidekick 2?", "expect": ["Role", "Sidekick 2", "Emma Watson"]},
+    {"id": "tables-07", "doc": "table_heavy.pdf", "question": "What was the value of non-current property assets in 2010?", "expect": ["non-current assets", "Property", "345"]},
+    {"id": "tables-08", "doc": "table_heavy.pdf", "question": "What was the average rainfall in Asia in 2009?", "expect": ["rainfall by continent, 2009", "Asia", "244"]},
+    {"id": "tables-09", "doc": "table_heavy.pdf", "question": "What were staff costs in 2011 in the self-contained year-end statement?", "expect": ["self-contained year-end statement", "Staff costs", "(200,000)"]},
+    {"id": "tables-10", "doc": "table_heavy.pdf", "question": "What was the surplus for 2010 restated?", "expect": ["2010 restated", "Surplus", "30,000"]},
+    {"id": "tables-11", "doc": "table_heavy.pdf", "question": "How many apples does Bob Scott have?", "expect": ["Apples", "Bob Scott", "20"]},
+    {"id": "tables-12", "doc": "table_heavy.pdf", "question": "What does the footnote say the agency services figure comes from?", "expect": ["management accounts", "net of recoveries"]},
+    {"id": "tables-13", "doc": "table_heavy.pdf", "question": "What was the highest average rainfall in South America in 2010?", "expect": ["South America", "Highest average", "523.6"]},
+    {"id": "tables-14", "doc": "table_heavy.pdf", "question": "How much financial debt was there in 2009?", "expect": ["Current liabilities", "Financial debt", "474"]},
+    {"id": "tables-15", "doc": "table_heavy.pdf", "question": "What was spent on banking services in 2011?", "expect": ["Banking services", "44.23"]},
+    {"id": "tables-16", "doc": "table_heavy.pdf", "question": "How much were dividends in 2011?", "expect": ["Dividends", "3.68"]},
+    {"id": "tables-17", "doc": "table_heavy.pdf", "question": "How many did Sam win in 2009?", "expect": ["Won", "Sam", "45 | 30"]},
+
+    {"id": "split-01", "doc": "split_table.pdf", "question": "How many units did South 3 sell?", "expect": ["Units", "South 3", "203"]},
+    {"id": "split-02", "doc": "split_table.pdf", "question": "What revenue did the South 5 region have?", "expect": ["Revenue", "South 5", "5,500"]},
+    {"id": "split-03", "doc": "split_table.pdf", "question": "How many units did North 10 sell?", "expect": ["Units", "North 10", "110"]}
+  ]
+}

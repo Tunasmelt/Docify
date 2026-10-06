@@ -66,6 +66,7 @@ function apiCitationToClientCitation(id: string, c: ApiCitation): Citation {
     figureUrl: c.figure_url,
     documentId: c.document_id,
     bbox: c.bbox,
+    chunkId: c.chunk_id,
   };
 }
 

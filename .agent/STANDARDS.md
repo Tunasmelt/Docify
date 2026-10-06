@@ -188,7 +188,7 @@ docs(schema): add rls policy for figures storage bucket [claude-code]
 - Every PR that changes behavior updates CHANGELOG.md
 - Every PR that changes SCHEMA.md or ARCHITECTURE.md locked decisions has human sign-off in the description
 - No PR merges without `/gap-check` clean
-- There is no CI yet (SCOPE.md Phase 5), so run `uv run pytest` and `pnpm build` locally before opening a PR
+- CI (`.github/workflows/ci.yml`) must be green: backend `pytest` against local Supabase, web lint, `tsc` and build. Run `uv run pytest` and `pnpm build` locally before opening a PR
 
 ### Never do
 - Commit directly to `master`
@@ -226,4 +226,4 @@ Explicit forbidden patterns. `/gap-check` looks for these:
 ## Tooling gaps
 
 - Python has no linter/formatter configured (`ruff` is only in `.gitignore`). Until one is added, match the surrounding style.
-- No CI pipeline exists (tracked in SCOPE.md Phase 5).
+- CI does not run the Playwright e2e suite (it needs the API running and uses real Voyage/Gemini quota).

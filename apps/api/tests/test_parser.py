@@ -1220,3 +1220,134 @@ def test_single_column_page_with_short_lines_is_unaffected():
     text = "\n".join(e.content for e in doc.elements if isinstance(e.content, str))
 
     assert [ln for ln in text.split("\n") if ln] == [f"Short line {i}" for i in range(10)]
+
+
+# ── Tables that continue across a page break (2026-10-06) ─────────────────────
+# pdfplumber finds tables one page at a time, so a table split by a page break
+# came out as two tables, and the second half had no header row: its chunk was
+# bare numbers that retrieval and the model couldn't interpret.
+
+
+def _pdf(pages: list[str]) -> bytes:
+    """A multi-page US Letter PDF; each entry is one page's raw content stream."""
+    n = len(pages)
+    font_obj = 3 + 2 * n
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [" + " ".join(f"{3 + 2 * i} 0 R" for i in range(n)).encode() + b"] /Count "
+        + str(n).encode() + b" >>",
+    ]
+    for i, stream in enumerate(pages):
+        data = stream.encode()
+        objects.append(
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {4 + 2 * i} 0 R "
+            f"/Resources << /Font << /F1 {font_obj} 0 R >> >> >>".encode()
+        )
+        objects.append(b"<< /Length " + str(len(data)).encode() + b" >>\nstream\n" + data + b"\nendstream")
+    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for i, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj\n".encode() + body + b"\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode()
+    for off in offsets:
+        out += f"{off:010d} 00000 n \n".encode()
+    out += f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    return bytes(out)
+
+
+def _text_ops(lines: list[tuple[float, float, str]], size: float = 10) -> str:
+    return "\n".join(f"BT /F1 {size} Tf {x} {y} Td ({t}) Tj ET" for x, y, t in lines)
+
+
+def _ruled_table_ops(rows: list[list[str]], top: float, col_xs: list[float], row_h: float = 18) -> str:
+    """A fully ruled grid (what pdfplumber's default line strategy detects),
+    `top` in PDF coordinates, one text cell per column."""
+    bottom = top - row_h * len(rows)
+    ops = ["0.5 w"]
+    for k in range(len(rows) + 1):
+        y = top - row_h * k
+        ops.append(f"{col_xs[0]} {y} m {col_xs[-1]} {y} l S")
+    for x in col_xs:
+        ops.append(f"{x} {top} m {x} {bottom} l S")
+    cells = []
+    for r, row in enumerate(rows):
+        y = top - row_h * (r + 1) + 5
+        cells += [(col_xs[c] + 4, y, text) for c, text in enumerate(row)]
+    return "\n".join(ops) + "\n" + _text_ops(cells)
+
+
+_COLS = [72, 222, 372, 522]
+_HEADER = ["Region", "Units", "Revenue"]
+
+
+def _split_table_pdf(*, repeat_header: bool = False, second_cols: list[float] | None = None) -> bytes:
+    first_rows = [_HEADER] + [[f"North {i}", str(100 + i), f"{i},000"] for i in range(1, 37)]
+    second_rows = ([_HEADER] if repeat_header else []) + [[f"South {i}", str(200 + i), f"{i},500"] for i in range(1, 6)]
+    page_1 = _text_ops([(72, 740, "Sales by region")]) + "\n" + _ruled_table_ops(first_rows, 720, _COLS)
+    page_2 = (
+        _ruled_table_ops(second_rows, 740, second_cols or _COLS)
+        + "\n"
+        + _text_ops([(72, 600, "The totals above are provisional and subject to audit.")])
+    )
+    return _pdf([page_1, page_2])
+
+
+def _tables(doc):
+    return [e for e in doc.elements if e.element_type == ElementType.TABLE]
+
+
+def test_table_continuing_on_the_next_page_gets_the_header_row():
+    doc = Parser(ocr_tiers=[]).parse(_split_table_pdf(), filename="split.pdf")
+    first, second = _tables(doc)
+
+    assert (first.page_number, second.page_number) == (1, 2)
+    header_line = "| Region | Units | Revenue |"
+    assert first.content.splitlines()[0] == header_line
+    assert header_line in second.content.splitlines()
+    assert "South 1" in second.content and "continued from page 1" in second.content
+
+
+def test_repeated_header_on_the_continuation_page_is_not_duplicated():
+    doc = Parser(ocr_tiers=[]).parse(_split_table_pdf(repeat_header=True), filename="split.pdf")
+    second = _tables(doc)[1]
+
+    assert second.content.count("| Region | Units | Revenue |") == 1
+    assert "continued from page 1" in second.content
+
+
+def test_tables_with_different_columns_on_consecutive_pages_are_not_joined():
+    # Same width, different column split: a different table, not a continuation.
+    doc = Parser(ocr_tiers=[]).parse(_split_table_pdf(second_cols=[72, 300, 522]), filename="split.pdf")
+    second = _tables(doc)[1]
+
+    assert "Region" not in second.content
+    assert "continued" not in second.content
+
+
+def test_table_not_at_the_top_of_the_next_page_is_not_a_continuation():
+    first_rows = [_HEADER] + [[f"North {i}", "1", "2"] for i in range(1, 37)]
+    page_1 = _ruled_table_ops(first_rows, 720, _COLS)
+    # Body text (below the running-header band) comes before the table, which
+    # itself still starts within the top fifth of the page.
+    page_2 = (
+        _text_ops([(72, 700, "A new section starts here with ordinary body text before the next table.")])
+        + "\n"
+        + _ruled_table_ops([["East 1", "3", "4"], ["East 2", "5", "6"]], 670, _COLS)
+    )
+    doc = Parser(ocr_tiers=[]).parse(_pdf([page_1, page_2]), filename="split.pdf")
+
+    assert "Region" not in _tables(doc)[1].content
+
+
+def test_continuation_chunk_is_a_self_contained_table_on_its_own_page():
+    from services.chunker import Chunker
+
+    chunks = Chunker().chunk(Parser(ocr_tiers=[]).parse(_split_table_pdf(), filename="split.pdf"))
+    continuation = next(c for c in chunks if "South 1" in c.content)
+
+    assert continuation.page_numbers == [2]  # citations still point at the page it's on
+    assert "| Region | Units | Revenue |" in continuation.content
+    assert "North 1" not in continuation.content

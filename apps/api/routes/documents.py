@@ -1,4 +1,8 @@
 import logging
+import threading
+import uuid
+from collections import OrderedDict
+from io import BytesIO
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, Response
@@ -6,7 +10,14 @@ from fastapi.responses import JSONResponse, Response
 from db import queries
 from db.client import get_service_role_client
 from errors import error_envelope
-from models.documents import DocumentListResponse, DocumentResponse
+from models.documents import (
+    DocumentListResponse,
+    DocumentResponse,
+    RenameDocumentRequest,
+    SourceContextBlock,
+    SourceContextResponse,
+)
+from services.figure_fetcher import signed_figure_url
 from routes._pagination import decode_cursor, encode_cursor
 from routes.ingest import STUCK_DOCUMENT_THRESHOLD_SECONDS
 
@@ -83,6 +94,33 @@ def get_document(document_id: str, request: Request):
         # (API_CONTRACT.md; same discipline as FEAT-007's storage_path fix).
         return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "document not found"))
 
+    return DocumentResponse(**row)
+
+
+# Same bound as the filenames real file systems allow.
+FILENAME_MAX_LENGTH = 255
+
+
+@router.patch("/documents/{document_id}", response_model=DocumentResponse)
+def rename_document(document_id: str, payload: RenameDocumentRequest, request: Request):
+    filename = payload.filename.strip()
+    if not filename:
+        return JSONResponse(status_code=422, content=error_envelope("VALIDATION_ERROR", "filename must not be empty"))
+    if len(filename) > FILENAME_MAX_LENGTH:
+        return JSONResponse(
+            status_code=422,
+            content=error_envelope("VALIDATION_ERROR", f"filename must be at most {FILENAME_MAX_LENGTH} characters"),
+        )
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in filename):
+        return JSONResponse(
+            status_code=422, content=error_envelope("VALIDATION_ERROR", "filename must not contain control characters")
+        )
+
+    row = queries.rename_document(
+        get_service_role_client(), document_id=document_id, user_id=request.state.user_id, filename=filename
+    )
+    if row is None:
+        return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "document not found"))
     return DocumentResponse(**row)
 
 
@@ -194,6 +232,53 @@ PAGE_IMAGE_RESOLUTION = 110
 _HIGHLIGHT_FILL = (255, 196, 0, 70)
 _HIGHLIGHT_OUTLINE = (214, 140, 0, 255)
 
+# Rendering means downloading the whole PDF from Storage and rasterizing a
+# page, so rendered pages (without highlight) are cached in memory per
+# (document, page) and the highlight is drawn per request. A document's file
+# never changes under the same id (reindex re-reads the same object), so
+# entries can't go stale. ~32MB is roughly 100-300 pages on the 512MB instance.
+PAGE_CACHE_MAX_BYTES = 32 * 1024 * 1024
+PAGE_IMAGE_CACHE_CONTROL = "private, max-age=86400"
+
+
+class _ByteLRU:
+    """Thread-safe LRU of bytes values with a total size budget (sync routes
+    run in FastAPI's threadpool)."""
+
+    def __init__(self, max_bytes: int):
+        self._max_bytes = max_bytes
+        self._items: OrderedDict[object, bytes] = OrderedDict()
+        self._size = 0
+        self._lock = threading.Lock()
+
+    def get(self, key) -> bytes | None:
+        with self._lock:
+            value = self._items.get(key)
+            if value is not None:
+                self._items.move_to_end(key)
+            return value
+
+    def put(self, key, value: bytes) -> None:
+        if len(value) > self._max_bytes:
+            return
+        with self._lock:
+            old = self._items.pop(key, None)
+            if old is not None:
+                self._size -= len(old)
+            self._items[key] = value
+            self._size += len(value)
+            while self._size > self._max_bytes:
+                _, evicted = self._items.popitem(last=False)
+                self._size -= len(evicted)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+            self._size = 0
+
+
+_page_cache = _ByteLRU(PAGE_CACHE_MAX_BYTES)
+
 
 @router.get("/documents/{document_id}/pages/{page_number}/image")
 def get_page_image(
@@ -219,48 +304,162 @@ def get_page_image(
     if page_number < 1:
         return JSONResponse(status_code=422, content=error_envelope("VALIDATION_ERROR", "page_number must be >= 1"))
 
-    try:
-        file_bytes = client.storage.from_("uploads").download(row["storage_path"].removeprefix("uploads/"))
-    except Exception:
-        logger.warning("get_page_image: storage download failed for document %s", document_id)
-        return JSONResponse(
-            status_code=500, content=error_envelope("STORAGE_ERROR", "couldn't load this document's file")
-        )
+    # Ownership was checked above; the cache is only consulted after that.
+    cache_key = (document_id, page_number)
+    page_png = _page_cache.get(cache_key)
+    if page_png is None:
+        try:
+            file_bytes = client.storage.from_("uploads").download(row["storage_path"].removeprefix("uploads/"))
+        except Exception:
+            logger.warning("get_page_image: storage download failed for document %s", document_id)
+            return JSONResponse(
+                status_code=500, content=error_envelope("STORAGE_ERROR", "couldn't load this document's file")
+            )
 
-    try:
-        png = _render_page_png(file_bytes, page_number, (x0, y0, x1, y1))
-    except Exception:
-        logger.warning("get_page_image: failed to render page %s of document %s", page_number, document_id, exc_info=True)
-        return JSONResponse(status_code=422, content=error_envelope("VALIDATION_ERROR", "couldn't render this page"))
-    if png is None:
-        return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "page not found"))
+        try:
+            page_png = _render_page_png(file_bytes, page_number)
+        except Exception:
+            logger.warning(
+                "get_page_image: failed to render page %s of document %s", page_number, document_id, exc_info=True
+            )
+            return JSONResponse(
+                status_code=422, content=error_envelope("VALIDATION_ERROR", "couldn't render this page")
+            )
+        if page_png is None:
+            return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "page not found"))
+        _page_cache.put(cache_key, page_png)
 
-    return Response(content=png, media_type="image/png", headers={"Cache-Control": "private, max-age=300"})
+    png = _draw_highlight(page_png, (x0, y0, x1, y1))
+    return Response(content=png, media_type="image/png", headers={"Cache-Control": PAGE_IMAGE_CACHE_CONTROL})
 
 
-def _render_page_png(file_bytes: bytes, page_number: int, highlight: tuple) -> bytes | None:
+def _render_page_png(file_bytes: bytes, page_number: int) -> bytes | None:
     # Imported here, not at module level: keeps pdfplumber out of the app's
     # import graph for every other route (see tests/test_parser_rewrite.py).
-    from io import BytesIO
-
     import pdfplumber
-    from PIL import Image, ImageDraw
 
     with pdfplumber.open(BytesIO(file_bytes)) as pdf:
         if page_number > len(pdf.pages):
             return None
-        image = pdf.pages[page_number - 1].to_image(resolution=PAGE_IMAGE_RESOLUTION).original.convert("RGBA")
-
-    if all(v is not None for v in highlight):
-        scale = PAGE_IMAGE_RESOLUTION / 72.0
-        hx0, hy0, hx1, hy1 = (v * scale for v in highlight)
-        if hx1 > hx0 and hy1 > hy0:
-            overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
-            ImageDraw.Draw(overlay).rectangle(
-                (hx0 - 4, hy0 - 4, hx1 + 4, hy1 + 4), fill=_HIGHLIGHT_FILL, outline=_HIGHLIGHT_OUTLINE, width=3
-            )
-            image = Image.alpha_composite(image, overlay)
+        image = pdf.pages[page_number - 1].to_image(resolution=PAGE_IMAGE_RESOLUTION).original.convert("RGB")
 
     out = BytesIO()
-    image.convert("RGB").save(out, format="PNG", optimize=True)
+    image.save(out, format="PNG", optimize=True)
     return out.getvalue()
+
+
+def _draw_highlight(page_png: bytes, highlight: tuple) -> bytes:
+    """The page with `highlight` (PDF points, top-left origin) drawn on it,
+    or the page unchanged when there's no usable box."""
+    from PIL import Image, ImageDraw
+
+    if not all(v is not None for v in highlight):
+        return page_png
+    scale = PAGE_IMAGE_RESOLUTION / 72.0
+    hx0, hy0, hx1, hy1 = (v * scale for v in highlight)
+    if not (hx1 > hx0 and hy1 > hy0):
+        return page_png
+
+    with Image.open(BytesIO(page_png)) as page:
+        image = page.convert("RGBA")
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    ImageDraw.Draw(overlay).rectangle(
+        (hx0 - 4, hy0 - 4, hx1 + 4, hy1 + 4), fill=_HIGHLIGHT_FILL, outline=_HIGHLIGHT_OUTLINE, width=3
+    )
+    out = BytesIO()
+    # No `optimize`: this runs on every highlighted request, and optimize
+    # roughly doubles encode time for a few percent smaller output.
+    Image.alpha_composite(image, overlay).convert("RGB").save(out, format="PNG")
+    return out.getvalue()
+
+
+# ── Source context for non-PDF citations ───────────────────────────────────
+# DOCX/PPTX/HTML have no page image, so "show in document" returns the cited
+# chunk with its surroundings instead: the whole slide for PPTX, or up to
+# SECTION_CONTEXT_RADIUS chunks either side within the same section for
+# DOCX/HTML. Chunk text is all the API has: the original file isn't rendered.
+PPTX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+SECTION_CONTEXT_RADIUS = 3
+MAX_SLIDE_BLOCKS = 50
+
+
+def _is_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _section_of(chunk: dict) -> str | None:
+    return (chunk.get("metadata") or {}).get("section_heading")
+
+
+def _without_heading_prefix(content: str, heading: str | None) -> str:
+    """The chunker prefixes each chunk with its section heading; the dialog
+    shows the heading once as its title instead."""
+    if heading and content.startswith(heading):
+        return content[len(heading) :].lstrip("\n")
+    return content
+
+
+@router.get("/documents/{document_id}/chunks/{chunk_id}/context", response_model=SourceContextResponse)
+def get_source_context(document_id: str, chunk_id: str, request: Request):
+    user_id = request.state.user_id
+    client = get_service_role_client()
+    not_found = JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "source not found"))
+
+    if not (_is_uuid(document_id) and _is_uuid(chunk_id)):
+        return not_found
+    document = queries.get_document_file(client, document_id=document_id, user_id=user_id)
+    if document is None:
+        return not_found
+    if document["mime_type"] == "application/pdf":
+        return JSONResponse(
+            status_code=422,
+            content=error_envelope("VALIDATION_ERROR", "PDF sources use the page image endpoint"),
+        )
+    cited = queries.get_document_chunk(client, document_id=document_id, chunk_id=chunk_id, user_id=user_id)
+    if cited is None:
+        return not_found
+
+    if document["mime_type"] == PPTX_MIME_TYPE:
+        kind, label = "slide", f"Slide {cited['page_number']}"
+        chunks = queries.list_document_chunks(
+            client, document_id=document_id, user_id=user_id, page_number=cited["page_number"], limit=MAX_SLIDE_BLOCKS
+        )
+    else:
+        kind, label = "section", _section_of(cited)
+        index = cited["chunk_index"]
+        window = queries.list_document_chunks(
+            client,
+            document_id=document_id,
+            user_id=user_id,
+            index_range=(index - SECTION_CONTEXT_RADIUS, index + SECTION_CONTEXT_RADIUS),
+        )
+        # Keep only the unbroken run of same-section chunks around the cited one.
+        position = next(i for i, c in enumerate(window) if c["id"] == chunk_id)
+        start = position
+        while start > 0 and _section_of(window[start - 1]) == label:
+            start -= 1
+        end = position
+        while end + 1 < len(window) and _section_of(window[end + 1]) == label:
+            end += 1
+        chunks = window[start : end + 1]
+
+    blocks = []
+    for chunk in chunks:
+        is_cited = chunk["id"] == chunk_id
+        content = chunk["content"] if kind == "slide" else _without_heading_prefix(chunk["content"], label)
+        if not content.strip() and not is_cited and not chunk.get("figure_path"):
+            continue  # a heading-only chunk, already shown as the title
+        blocks.append(
+            SourceContextBlock(
+                chunk_id=chunk["id"],
+                element_type=chunk["element_type"],
+                content=content,
+                cited=is_cited,
+                figure_url=signed_figure_url(client, chunk["figure_path"]) if chunk.get("figure_path") else None,
+            )
+        )
+    return SourceContextResponse(kind=kind, label=label, blocks=blocks)

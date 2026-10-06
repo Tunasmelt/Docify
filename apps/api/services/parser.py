@@ -288,6 +288,16 @@ _FIGURE_MAX_PAGE_COVERAGE = 0.85
 # row.
 _MIN_TABLE_ROWS = 2
 
+# Cross-page table continuation. A table counts as continuing onto the next
+# page only when it is the last thing on its page (ignoring running footers)
+# and reaches near the bottom, the next page's first element is a table near
+# the top, and both have the same column boundaries. The continuation keeps
+# its own page and bbox (citations point at the right page) but gets the
+# original header row, so its chunk isn't bare numbers.
+_PAGE_MARGIN_FRACTION = 0.10  # top/bottom bands treated as running header/footer
+_CONTINUATION_EDGE_FRACTION = 0.20  # table must end/start within this band of the break
+_COLUMN_EDGE_TOLERANCE_PT = 3.0
+
 
 def _rows_to_markdown(rows: list[list[str | None]]) -> str:
     if not rows:
@@ -578,8 +588,71 @@ def _extract_pdf_tables(page) -> list[dict]:
         rows = table.extract()
         if len(rows) < _MIN_TABLE_ROWS:
             continue
-        results.append({"bbox": table.bbox, "markdown": _rows_to_markdown(rows)})
+        column_edges = [round(c.bbox[0], 1) for c in table.columns] + [round(table.columns[-1].bbox[2], 1)]
+        results.append(
+            {"bbox": table.bbox, "markdown": _rows_to_markdown(rows), "rows": rows, "column_edges": column_edges}
+        )
     return results
+
+
+def _same_columns(a: list[float], b: list[float]) -> bool:
+    return len(a) == len(b) and all(abs(x - y) <= _COLUMN_EDGE_TOLERANCE_PT for x, y in zip(a, b))
+
+
+def _normalized_row(row: list[str | None]) -> list[str]:
+    return [" ".join((cell or "").split()).lower() for cell in row]
+
+
+def _body_elements(elements: list[ParsedElement], page_height: float) -> list[ParsedElement]:
+    """Elements outside the running header/footer bands."""
+    top_band = page_height * _PAGE_MARGIN_FRACTION
+    bottom_band = page_height * (1 - _PAGE_MARGIN_FRACTION)
+    return [e for e in elements if not (e.bbox.y1 <= top_band or e.bbox.y0 >= bottom_band)]
+
+
+def _link_table_continuation(
+    page_elements: list[ParsedElement],
+    table_meta: dict[str, dict],
+    open_table: dict | None,
+    page_number: int,
+    page_height: float,
+) -> dict | None:
+    """Gives this page's first table the header (and caption) of `open_table`
+    when it continues it, rewriting the element's content in place. Returns
+    the table left open at the bottom of this page, for the next page."""
+    body = _body_elements(page_elements, page_height)
+    edge = page_height * _CONTINUATION_EDGE_FRACTION
+
+    first = body[0] if body else None
+    if (
+        open_table is not None
+        and first is not None
+        and first.element_type == ElementType.TABLE
+        and open_table["page"] == page_number - 1
+        and first.bbox.y0 <= edge
+        and _same_columns(table_meta[first.element_id]["column_edges"], open_table["column_edges"])
+    ):
+        meta = table_meta[first.element_id]
+        rows = meta["rows"]
+        if _normalized_row(rows[0]) == _normalized_row(open_table["header"]):
+            rows = rows[1:]  # header already repeated on this page
+        label = f"(Table continued from page {open_table['origin_page']}"
+        label += f": {' '.join(open_table['captions'])})" if open_table["captions"] else ")"
+        first.content = f"{label}\n{_rows_to_markdown([open_table['header'], *rows])}"
+        # A table spanning 3+ pages keeps the original header and caption.
+        meta.update(header=open_table["header"], origin_page=open_table["origin_page"], captions=open_table["captions"])
+
+    last = body[-1] if body else None
+    if last is not None and last.element_type == ElementType.TABLE and last.bbox.y1 >= page_height - edge:
+        meta = table_meta[last.element_id]
+        return {
+            "page": page_number,
+            "header": meta["header"],
+            "column_edges": meta["column_edges"],
+            "origin_page": meta["origin_page"],
+            "captions": meta["captions"],
+        }
+    return None
 
 
 def _extract_pdf_figures(page) -> list[dict]:
@@ -642,6 +715,8 @@ def _parse_pdf(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
             elements: list[ParsedElement] = []
             dropped = 0
             element_counter = 0
+            # The previous page's table that ran to the bottom of the page, if any.
+            open_table: dict | None = None
 
             for page in pdf.pages:
                 page_number = page.page_number
@@ -775,8 +850,16 @@ def _parse_pdf(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
                         caption_ids_by_target_index.setdefault(target_idx, []).append(cap_id)
 
                 positioned: list[tuple[tuple, ParsedElement]] = []
+                table_meta: dict[str, dict] = {}
                 for t_idx, table in enumerate(tables):
                     element_counter += 1
+                    table_meta[f"pdf-p{page_number}-table{element_counter}"] = {
+                        "header": table["rows"][0],
+                        "rows": table["rows"],
+                        "column_edges": table["column_edges"],
+                        "origin_page": page_number,
+                        "captions": [page_captions[c]["text"] for c, t in resolution.items() if t == t_idx],
+                    }
                     positioned.append(
                         (
                             _reading_order_key(layout, table["bbox"]),
@@ -837,7 +920,11 @@ def _parse_pdf(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
                     )
 
                 positioned.sort(key=lambda item: item[0])
-                elements.extend(el for _, el in positioned)
+                page_elements_in_order = [el for _, el in positioned]
+                open_table = _link_table_continuation(
+                    page_elements_in_order, table_meta, open_table, page_number, float(page.height)
+                )
+                elements.extend(page_elements_in_order)
 
             return elements, dropped
     except ParseError:

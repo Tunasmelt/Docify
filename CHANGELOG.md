@@ -6,6 +6,67 @@ Entry types: `feature` · `fix` · `decision` · `refactor` · `test` · `infra`
 
 ---
 
+## 2026-10-06 — feature: document rename, source preview for DOCX/PPTX/HTML
+
+**Phase:** 3
+**Feature:** n/a (SCOPE.md Phase 3 gaps)
+**Changed:**
+- **Rename documents.** New `PATCH /documents/{id}` (`{ "filename": … }`): trimmed, 1-255 characters, no control characters, owner only. Display name only: the parser reads the format from `storage_path`, and citations join `documents.filename` live, so history shows the new name. The library has a pencil button per document opening a rename dialog (same pattern as conversation rename).
+- **"Show in document" for non-PDF citations.** These had no button at all. New `GET /documents/{id}/chunks/{chunk_id}/context` returns the cited chunk with its surroundings: the whole slide for PPTX, or up to 3 chunks either side within the same section for DOCX/HTML (heading prefix stripped, heading returned as the label, figures with signed URLs). The PDF page dialog became `SourcePreviewDialog`, which shows the page image for PDFs and the slide/section as text for the rest, with the cited block highlighted in the same amber as the PDF highlight and scrolled into view; tables render as tables. The button reads "Open page N", "Open slide N" or "Show in document". Client citations now carry `chunkId` (the API already sent `chunk_id`).
+**Verified:**
+- API: 6 rename tests (persisted and trimmed; empty, too long, control characters rejected with the name unchanged; other user's and missing document 404; auth) and 7 context tests (PPTX slide order and cited flag, DOCX section bounded by headings with prefixes stripped, window cap, figure URL, PDF rejected, other user / other document 404). Checked against the real `slides.pptx`, `table.docx` and `page.html` fixtures through the real parser and chunker.
+- Playwright: new `document-rename.e2e.ts` and `source-context.e2e.ts` (PPTX slide, DOCX section with a rendered table) pass, as do `page-preview`, `document-retry`, `conversation-management`, `export` and 4 of 6 `upload` tests. The other 2 `upload` tests wait for a document to reach Ready, which needs a real Voyage tokenizer download this environment's proxy blocks; `/ingest` itself returned 202.
+**Deploy:** no migrations.
+
+---
+
+## 2026-10-06 — infra: error tracking, per-user ingest cap, page-preview cache
+
+**Phase:** 5
+**Feature:** FEAT-025 (error tracking); SCOPE.md Phase 5 "Production job execution"
+**Changed:**
+- **Sentry, both apps, off until a DSN is set.** API: `sentry-sdk[fastapi]` initialised in `services/observability.py` from `SENTRY_DSN`; every `logger.error`/`logger.exception` is reported, which covers caught route failures and background ingest failures, not just crashes. Web: `@sentry/nextjs` (`instrumentation.ts`, `instrumentation-client.ts`, `sentry.{server,edge}.config.ts`, shared options in `lib/sentry-options.ts`); route error boundaries (`ErrorFallback`) and a new `app/global-error.tsx` report what they catch. Privacy: no request bodies, no stack-frame locals, no default PII, no replay, no tracing. Source maps upload only when `SENTRY_AUTH_TOKEN` is set. Account setup and UptimeRobot steps: docs/DEPLOYMENT.md §Monitoring.
+- **At most 2 documents processing per user** (`routes/ingest.py`, `MAX_CONCURRENT_INGESTS_PER_USER`). `/ingest` and `/reindex` return `429 TOO_MANY_PROCESSING` beyond that, before the daily limit is touched. Counted from `documents` (statuses `uploaded`/`parsing`/`embedded`), so it survives restarts and works across instances; rows that started more than 30 minutes ago are presumed dead and don't count, so a crashed ingest can't lock a user out. `mark_parsing` now sets `updated_at`, giving a reindex a fresh start time. The documents page shows the message on Retry.
+- **Page-preview cache** (`routes/documents.py`). The rendered page (no highlight) is cached in memory per (document, page), 32 MB LRU; the highlight is drawn per request. Browser cache raised from 5 minutes to a day (`private`). Ownership is checked before the cache.
+**Verified:**
+- Ingest cap: 5 new tests (refused at the cap with nothing created, allowed below it, finished/stale/other users' documents don't count, reindex refused and restarts its clock). Existing ingest, reindex and documents tests pass.
+- Cache: 4 new tests (repeat views and a new highlight served with the file deleted from Storage, another user still gets 404, `Cache-Control`, LRU byte budget). Locally a cached page with a new highlight takes 160 ms vs 555 ms cold, with no Storage download.
+- Sentry: 3 new tests, one running the real SDK in a subprocess with a recording transport (a logged error and an exception are reported; a local variable holding document text is not, and the same check does leak it under Sentry's defaults). Web `lint`, `tsc` and `build` pass with no DSN; Sentry adds 35 kB to the shared first-load JS (87 → 122 kB) after tree-shaking tracing and debug logging.
+**Deploy:** no migrations. New optional env vars: `SENTRY_DSN`, `SENTRY_ENVIRONMENT` (Render); `NEXT_PUBLIC_SENTRY_DSN`, `SENTRY_ORG`, `SENTRY_PROJECT`, `SENTRY_AUTH_TOKEN` (Vercel).
+
+---
+
+## 2026-10-06 — feature: cross-page tables, retrieval benchmark, fewer query rewrites
+
+**Phase:** 5
+**Feature:** n/a (2026-10-06 follow-up list, "parsing and retrieval quality")
+**Changed:**
+- **Tables split by a page break** (`services/parser.py`). pdfplumber finds tables one page at a time, so the second half of a split table was its own table with no header row: a chunk of bare numbers. A table that is the first thing on a page, starts near the top, and has the same column boundaries as a table that ran to the bottom of the previous page is now treated as its continuation. It keeps its own page and bbox, so citations and highlights still point at the right page, but its content gets the original header row (a repeated header isn't duplicated) and a "(Table continued from page N: caption)" line. Tables with different columns, or with body text before them, are left alone. Known gap: a one-row continuation is still dropped by the existing 1-row false-positive filter.
+- **Retrieval benchmark** (`apps/api/eval/`). `questions.json` has 29 questions over the 6 fixture documents (including a new generated `split_table.pdf`), each with the strings an answering chunk must contain: the value plus the labels that make it interpretable. `eval/run.py` reports answerability (parse + chunk only) and, with `--retrieval fts|full`, recall@1/3/k and MRR with every document in scope. `tests/test_eval.py` runs the answerability half in CI.
+- **Query rewriting is skipped for self-contained follow-ups** (`services/query_rewriter.py`). The Flash-Lite call now runs only when the follow-up refers back to the conversation (a word like "it", "that", "previous", "same"; an opener like "and", "what about"; or fewer than 4 words). Other follow-ups are searched as typed, saving a round trip before retrieval.
+**Verified:**
+- Cross-page tables: 5 new tests on generated PDFs (header added, repeated header not duplicated, different columns not joined, body text before the table not joined, continuation chunk self-contained on page 2) fail or are meaningless on the old code and pass on the new. No real fixture table is joined (table_heavy.pdf: 29 tables, 0 continuations).
+- Benchmark: 29/29 answerable on the new parser; on the old parser it reports exactly the two split-table questions as unanswerable. FTS-only baseline against local Supabase: recall@1 0.90, recall@3 0.97, recall@5 0.97, MRR 0.93. The one miss (`tables-12`) shares no words with its answer, which is what vector search is for; no real-key run was possible here.
+- Rewriter: 2 new tests (self-contained follow-up makes no call; 8 referring follow-ups still rewrite). Existing `/query` and conversation tests pass.
+**Deploy:** no migrations. Existing documents keep their old chunks until re-indexed.
+
+---
+
+## 2026-10-06 — infra: CI on every PR, deterministic RRF ties, network-only test marker
+
+**Phase:** 5
+**Feature:** n/a
+**Changed:**
+- **CI** (`.github/workflows/ci.yml`). Runs on every PR and on pushes to `master`, as two jobs. `api`: `uv sync --locked`, `supabase start`, every migration in filename order plus the verify script, then the full `pytest` suite. The job fails if the integration tests were skipped for lack of Supabase, since they otherwise skip silently. `web`: `pnpm install --frozen-lockfile`, `pnpm lint`, `tsc --noEmit`, `pnpm build`, with placeholder `NEXT_PUBLIC_*` values.
+- **RRF ties** (`services/retriever.py`). Two chunks that are each rank 1 in a different provider's list tie exactly on score. Their order came from iterating a `set` of provider names, which is hash-randomized per process, so the same query could rank differently on each server restart and `test_mixed_provider_scope_…` failed about 3 runs in 10. Ties now break by chunk id, and providers are searched in sorted order. The test had relied on that tie, so it now checks what its docstring claims: the gemini partition's own ranking keeps the relevant gemini chunk and drops an irrelevant one. Resolves the 2026-08-02 MEMORY.md open question.
+- **`network` pytest marker** (`pyproject.toml`). `test_real_voyage_tokenizer_is_available_without_an_api_call` downloads from Hugging Face, so it is deselected by default and runs with `pytest -m network`.
+**Verified:**
+- On the old code the mixed-provider test failed under 3 of 10 `PYTHONHASHSEED` values; on the new code it passed under 20 of 20. A new unit test checks that tie order does not depend on list order.
+- The CI steps were run locally: fresh `supabase db reset`, all migrations, the verify script all OK; `pytest` 459 passed, 18 skipped (opt-in live-API tests), 1 deselected (`network`); `pnpm lint` (warnings only), `tsc`, `pnpm build` pass without `.env.local`.
+**Deploy:** no migrations.
+
+---
+
 ## 2026-10-06 — feature: two-column PDFs, highlighted page preview, follow-up query rewriting, batched verification
 
 **Phase:** 5

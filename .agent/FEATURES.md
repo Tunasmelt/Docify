@@ -38,7 +38,7 @@ One row per feature; details are in the sections below.
 | FEAT-022 | Render prod deploy | 5 | complete |
 | FEAT-023 | Landing page | 5 | complete |
 | FEAT-024 | Rate limiting on POST /ingest and POST /query (+ /query/stream) | 5 | tested |
-| FEAT-025 | Error tracking (Sentry free) | 5 | planned |
+| FEAT-025 | Error tracking (Sentry free) | 5 | in progress |
 | FEAT-026 | GET /conversations + GET /conversations/{id}/messages + citation fi… | 2 | tested |
 | FEAT-027 | Parser rewrite | 1 | complete |
 | FEAT-028 | UNVERIFIED citation state, distinct from UNSUPPORTED | 4 | complete |
@@ -1267,7 +1267,7 @@ This is a real EPA letter about lead service line compliance — confirms both t
 - [FEAT-021] Vercel prod deploy — **complete** 2026-08-09. Project `docify-web`, git-linked with auto-deploy on push; live at `https://docify-web-steel.vercel.app`. CHANGELOG.md 2026-08-09.
 - [FEAT-022] Render prod deploy — **complete** 2026-07-27 (Docker runtime). Live at `https://docify-api.onrender.com`. CHANGELOG.md 2026-07-27 and 2026-08-09 (Dockerfile COPY fix).
 - [FEAT-023] Landing page — **complete** 2026-08-08 (`ef70e5f`, `components/landing/`, public `/`). A demo video and "try with a sample document" flow are still open (SCOPE.md Phase 5).
-- [FEAT-025] Error tracking (Sentry free) — planned
+- [FEAT-025] Error tracking (Sentry free) — **code complete** 2026-10-06: `sentry-sdk[fastapi]` (API, `services/observability.py`) and `@sentry/nextjs` (web), both inactive until a DSN is set. Account setup (projects, DSNs) pending. CHANGELOG.md 2026-10-06.
 - FEAT-024 and FEAT-028–035 are filed under Phases 3/4 above, next to their code dependencies.
 
 ---

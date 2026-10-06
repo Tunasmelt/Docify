@@ -1,6 +1,6 @@
 "use client";
 
-import { RotateCcw, Trash2 } from "lucide-react";
+import { Pencil, RotateCcw, Trash2 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -19,6 +19,8 @@ export interface DocumentCardData {
 export interface DocumentCardProps {
   doc: DocumentCardData;
   onDelete: (id: string) => void;
+  /** Opens the rename dialog. No button is rendered when omitted. */
+  onRename?: (id: string) => void;
   /** Selection for scoping a new conversation — only offered for a
    * 'ready' document (a question can't run against one that isn't
    * embedded yet). Omitted entirely (no checkbox rendered) when the
@@ -32,7 +34,7 @@ export interface DocumentCardProps {
   retrying?: boolean;
 }
 
-export function DocumentCard({ doc, onDelete, selected, onToggleSelect, onRetry, retrying }: DocumentCardProps) {
+export function DocumentCard({ doc, onDelete, onRename, selected, onToggleSelect, onRetry, retrying }: DocumentCardProps) {
   const style = DOCUMENT_STATUS_STYLES[doc.status];
   const meta = `${doc.pages !== null ? `${doc.pages} PP` : "— PP"} · ${doc.date}`;
   const selectable = doc.status === "ready" && !!onToggleSelect;
@@ -88,6 +90,17 @@ export function DocumentCard({ doc, onDelete, selected, onToggleSelect, onRetry,
         >
           <RotateCcw size={14} strokeWidth={1.8} className={retrying ? "animate-spin" : undefined} />
           {retrying ? "Retrying…" : "Retry"}
+        </button>
+      ) : null}
+      {onRename ? (
+        <button
+          type="button"
+          title="Rename"
+          aria-label={`Rename ${doc.filename}`}
+          onClick={() => onRename(doc.id)}
+          className="flex h-[30px] w-[30px] flex-shrink-0 items-center justify-center rounded-md text-faint transition-colors hover:bg-panel-active hover:text-ink"
+        >
+          <Pencil size={15} strokeWidth={1.8} />
         </button>
       ) : null}
       <button

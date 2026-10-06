@@ -12,6 +12,10 @@ from slowapi.middleware import SlowAPIMiddleware
 from middleware.auth import JWTAuthMiddleware
 from rate_limit import limiter, rate_limit_exceeded_handler
 from routes import account, conversations, documents, export, health, ingest, query
+from services.observability import init_sentry
+
+# Before the app is created, so the FastAPI integration hooks in. No-op without SENTRY_DSN.
+init_sentry()
 
 app = FastAPI(title="docify-api")
 

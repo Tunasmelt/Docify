@@ -56,7 +56,31 @@ def mark_parsing(client, document_id: str) -> None:
     # a document that may be sitting at status='failed' with a real error
     # string from its last attempt, and that stale message must not
     # linger once a fresh attempt is genuinely underway.
-    client.table("documents").update({"status": "parsing", "error": None}).eq("id", document_id).execute()
+    # updated_at marks when this processing attempt started (nothing else
+    # writes it), which count_processing_documents() relies on for a reindex.
+    client.table("documents").update({"status": "parsing", "error": None, "updated_at": _now_iso()}).eq(
+        "id", document_id
+    ).execute()
+
+
+_PROCESSING_STATUSES = ["uploaded", "parsing", "embedded"]
+
+
+def count_processing_documents(client, *, user_id: str, started_within_seconds: int) -> int:
+    """This user's documents still being processed. Rows that started longer
+    ago than the stuck-document threshold are ignored: their background task
+    is presumed dead (the reaper will mark them failed) and must not block
+    new uploads."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=started_within_seconds)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    result = (
+        client.table("documents")
+        .select("id", count="exact")
+        .eq("user_id", user_id)
+        .in_("status", _PROCESSING_STATUSES)
+        .gt("updated_at", cutoff)
+        .execute()
+    )
+    return result.count or 0
 
 
 def mark_parsed(client, document_id: str, *, page_count: int | None) -> None:
@@ -175,6 +199,58 @@ def get_document(client, *, document_id: str, user_id: str) -> dict | None:
     response either way)."""
     rows = client.table("documents").select(DOCUMENT_RESPONSE_COLUMNS).eq("id", document_id).eq("user_id", user_id).execute().data
     return rows[0] if rows else None
+
+
+def rename_document(client, *, document_id: str, user_id: str, filename: str) -> dict | None:
+    """Scoped to user_id in the update itself, so "doesn't exist" and "not
+    yours" both return None. Only the display name changes: parsing picks the
+    format from storage_path, which a rename leaves alone."""
+    updated = (
+        client.table("documents")
+        .update({"filename": filename})
+        .eq("id", document_id)
+        .eq("user_id", user_id)
+        .execute()
+        .data
+    )
+    if not updated:
+        return None
+    return get_document(client, document_id=document_id, user_id=user_id)
+
+
+_CONTEXT_CHUNK_COLUMNS = "id,chunk_index,element_type,page_number,content,figure_path,metadata"
+
+
+def get_document_chunk(client, *, document_id: str, chunk_id: str, user_id: str) -> dict | None:
+    rows = (
+        client.table("chunks")
+        .select(_CONTEXT_CHUNK_COLUMNS)
+        .eq("id", chunk_id)
+        .eq("document_id", document_id)
+        .eq("user_id", user_id)
+        .execute()
+        .data
+    )
+    return rows[0] if rows else None
+
+
+def list_document_chunks(
+    client,
+    *,
+    document_id: str,
+    user_id: str,
+    page_number: int | None = None,
+    index_range: tuple[int, int] | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    """A document's chunks in reading order, filtered to one page/slide or a
+    chunk_index range (inclusive)."""
+    query = client.table("chunks").select(_CONTEXT_CHUNK_COLUMNS).eq("document_id", document_id).eq("user_id", user_id)
+    if page_number is not None:
+        query = query.eq("page_number", page_number)
+    if index_range is not None:
+        query = query.gte("chunk_index", index_range[0]).lte("chunk_index", index_range[1])
+    return query.order("chunk_index").limit(limit).execute().data
 
 
 def get_document_file(client, *, document_id: str, user_id: str) -> dict | None:

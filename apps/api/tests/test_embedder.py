@@ -410,6 +410,7 @@ def test_batching_uses_the_real_voyage_tokenizer_by_default():
     assert tokenizer_calls == ["voyage-multimodal-3.5"]
 
 
+@pytest.mark.network
 def test_real_voyage_tokenizer_is_available_without_an_api_call():
     # Confirms the premise the whole batching redesign rests on: the real
     # tokenizer for THIS exact model string loads without needing a valid

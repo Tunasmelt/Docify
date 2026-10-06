@@ -127,10 +127,12 @@ The browser talks to FastAPI directly (`NEXT_PUBLIC_API_URL`, `apps/web/lib/api/
 2. Browser POSTs to FastAPI POST /query or POST /query/stream { question, document_ids,
    conversation_id?, k?, rerank? } with Bearer <supabase_jwt>
 3. FastAPI (services/retriever.py):
-   0. If the conversation has earlier turns, Gemini 3.5 Flash-Lite rewrites the question
-      into a standalone search query (services/query_rewriter.py) — "and for Q2?" becomes
-      "What was Q2 revenue?". Used for retrieval only; generation gets the original
-      question. Any failure falls back to the original question
+   0. If the conversation has earlier turns and the question refers back to them (a word
+      like "it"/"that"/"previous", an opener like "and"/"what about", or under 4 words),
+      Gemini 3.5 Flash-Lite rewrites it into a standalone search query
+      (services/query_rewriter.py) — "and for Q2?" becomes "What was Q2 revenue?".
+      Self-contained follow-ups skip the call. Used for retrieval only; generation gets
+      the original question. Any failure falls back to the original question
    a. Finds which embedding provider(s) have chunks in the document_ids scope (almost
       always just "voyage")
    b. Embeds the (search) question once PER provider present and runs that provider's own vector
@@ -236,7 +238,7 @@ apps/
 │   │   └── health.py             /health
 │   ├── services/
 │   │   ├── document_model.py     ElementType/BBox/ParsedElement/ParsedDocument (no heavy deps)
-│   │   ├── parser.py             PDF/DOCX/PPTX/HTML parser (two-column aware) + OCR fallback chain
+│   │   ├── parser.py             PDF/DOCX/PPTX/HTML parser (two-column aware, cross-page tables) + OCR fallback chain
 │   │   ├── chunker.py            element → chunk grouping, caption association
 │   │   ├── embedder.py           Voyage client + Gemini embedding-2 fallback
 │   │   ├── retriever.py          provider-partitioned vector + FTS search, RRF, rerank
@@ -251,6 +253,7 @@ apps/
 │   ├── models/                   Pydantic request/response models
 │   ├── migrations/               timestamped SQL (see SCHEMA.md §Migration log)
 │   ├── tests/                    pytest (unit + local-Supabase integration)
+│   ├── eval/                     retrieval benchmark (questions.json + run.py), not in the image
 │   └── Dockerfile                production image (explicit COPY list — add new modules)
 │
 docs/                             screenshots used by the root README; developer guides
@@ -285,7 +288,7 @@ Changing any of these requires human confirmation.
 - [x] **Single-agent workflow.** The original four-agent lane model (claude-code / claude-design / gemini / codex) was retired in practice: gemini was dropped 2026-07-24 and every commit since has been made by claude-code. AGENT.md describes the current workflow; external review passes (e.g. Codex reviews under `.agent/reviews/`) are still welcome as one-off audits.
 - [x] **Chunking: element-boundary-respecting, not fixed-token.** `services/chunker.py` groups adjacent text/heading/list elements toward `TOKEN_BUDGET` (~500 tokens), keeps tables and figures as their own chunks, and only splits an element larger than `MAX_CHUNK_TOKENS` (4000) — by table row or by paragraph/sentence, never mid-row. Every heading starts a new chunk; a chunk that doesn't start with its heading (a continuation, a page break, a table or figure) gets the current section heading prefixed to its content, so it's findable by section name. Headings directly above a table or figure fold into that chunk.
 - [x] **Rerank: opt-in, default off.** RRF alone put the expected chunk in the top 5 on 4/4 fixture questions; rerank added ~380ms with no measured gain. Exposed as a user preference.
-- [x] **Follow-up questions are rewritten for retrieval only** (reversed 2026-10-06 from "no query rewriting"). When a conversation has history, a cheap Flash-Lite call turns the question into a standalone search query; generation still gets the user's own words plus the history. Costs one extra Flash-Lite call per follow-up; any failure searches with the original question.
+- [x] **Follow-up questions are rewritten for retrieval only** (reversed 2026-10-06 from "no query rewriting"). When a conversation has history, a cheap Flash-Lite call turns the question into a standalone search query; generation still gets the user's own words plus the history. Costs one extra Flash-Lite call per follow-up that refers back to the conversation (self-contained follow-ups skip it); any failure searches with the original question.
 - [x] **Document status: polling, not Supabase realtime.**
 
 ---

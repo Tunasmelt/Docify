@@ -52,6 +52,7 @@ Two exceptions, both from the framework rather than route code: a request body/q
 | `CONFLICT` | 409 | Not allowed in the resource's current state (e.g. deleting or re-indexing a document that is still processing) |
 | `VALIDATION_ERROR` | 422 | A route-level check failed (empty question, unsupported mime type, bad cursor, bad title) |
 | `RATE_LIMITED` | 429 | This API's per-user or global limit was hit (see `/ingest` and `/query`). Includes `Retry-After` (seconds) |
+| `TOO_MANY_PROCESSING` | 429 | `/ingest` or `/reindex` while the caller already has 2 documents processing. The message says so; retry once one finishes |
 | `GENERATE_FAILED` | 502 | The Gemini generation call failed |
 | `STORAGE_ERROR` | 500 | A Supabase Storage call failed; the resource was left unmodified and retrying is safe |
 | `DELETE_FAILED` | 500 | `DELETE /account` cleaned Storage but the final auth-user deletion failed; DB rows are untouched and retrying is safe |
@@ -114,6 +115,7 @@ Supported `mime_type`s: PDF, DOCX, PPTX, HTML.
   - **10/day per user** (Postgres `usage_counters`, so it survives Render restarts)
 
   `/ingest` and `/reindex` share all three counters. Limits derive from shared vendor quotas (Voyage 3 RPM; Gemini 2.5 Flash OCR 20/day) — reasoning in `routes/ingest.py`.
+- `429 TOO_MANY_PROCESSING` — the caller already has **2 documents processing** (`uploaded`/`parsing`/`embedded`, started within the last 30 minutes). Checked before the daily limit, so a refused request doesn't use a daily slot. Ingest runs in the API process with no queue; this keeps one user from filling the 512 MB instance.
 
 ---
 
@@ -145,6 +147,7 @@ Reports `parsing` (not `uploaded`) because the route resets the document to `par
 - `404 NOT_FOUND`
 - `409 CONFLICT` — the document is still processing (`status in ('parsing', 'embedded')`)
 - `429 RATE_LIMITED` — shares all of `/ingest`'s counters (one combined 10/day budget)
+- `429 TOO_MANY_PROCESSING` — same 2-document cap as `/ingest`
 
 ---
 
@@ -195,12 +198,51 @@ Renders one page of a PDF as a PNG, for the citation page preview. With all four
 
 **Query params:** `x0`, `y0`, `x1`, `y1` (optional, PDF points from the page's top-left).
 
-**Response 200:** `image/png` (110 dpi), `Cache-Control: private, max-age=300`. Not rate-limited (no vendor API calls).
+**Response 200:** `image/png` (110 dpi), `Cache-Control: private, max-age=86400`. Not rate-limited (no vendor API calls). The rendered page (without highlight) is cached in API memory per document and page (32 MB LRU), so repeat views skip the Storage download and render; ownership is checked before the cache.
 
 **Errors:**
 - `404 NOT_FOUND` — the document doesn't exist, isn't the caller's, or has no such page
 - `422 VALIDATION_ERROR` — not a PDF (DOCX/HTML have no pages; PPTX slides aren't rendered), page < 1, or the page couldn't be rendered
 - `500 STORAGE_ERROR` — the stored file couldn't be read
+
+---
+
+### `PATCH /documents/{document_id}`
+Renames a document. Only the display name changes: parsing picks the format from `storage_path`, which stays as it was, and citations read the name live, so conversation history shows the new name too. Allowed in any status.
+
+**Request:**
+```json
+{ "filename": "Q3 board report.pdf" }
+```
+
+**Response 200:** the updated document (same shape as `GET /documents/{document_id}`).
+
+**Errors:**
+- `422 VALIDATION_ERROR` — empty after trimming, longer than 255 characters, or contains control characters
+- `404 NOT_FOUND` — doesn't exist or isn't the caller's
+
+---
+
+### `GET /documents/{document_id}/chunks/{chunk_id}/context`
+"Show in document" for DOCX, PPTX and HTML citations, which have no page image. Returns the cited chunk with its surroundings, built from stored chunk text (the original file isn't rendered).
+
+**Response 200:**
+```json
+{
+  "kind": "slide",
+  "label": "Slide 2",
+  "blocks": [
+    { "chunk_id": "…", "element_type": "text", "content": "Revenue reached $1,410,000", "cited": true, "figure_url": null }
+  ]
+}
+```
+- PPTX: `kind: "slide"`, every chunk on the cited slide in reading order, `label` "Slide N".
+- DOCX/HTML: `kind: "section"`, the unbroken run of chunks sharing the cited chunk's section heading, at most 3 on each side. `label` is that heading (`null` for text outside any section), and the heading prefix the chunker adds to each chunk is removed from `content`.
+- `content` is markdown for tables. `figure_url` is a 10-minute signed URL for figure chunks, else `null`.
+
+**Errors:**
+- `404 NOT_FOUND` — the document or chunk doesn't exist, isn't the caller's, or the chunk belongs to another document
+- `422 VALIDATION_ERROR` — the document is a PDF (use the page image endpoint)
 
 ---
 
@@ -291,7 +333,7 @@ Ask a question over one or more documents.
 **Behaviour:**
 - If `conversation_id` omitted, creates a new conversation
 - If `conversation_id` provided, appends to it (must belong to user)
-- Runs hybrid retrieval → generation → verification pipeline (see ARCHITECTURE.md). In a continuing conversation, retrieval searches with the question rewritten into a standalone query (one extra Gemini Flash-Lite call); generation answers the original question
+- Runs hybrid retrieval → generation → verification pipeline (see ARCHITECTURE.md). In a continuing conversation, retrieval searches with the question rewritten into a standalone query (one extra Gemini Flash-Lite call, skipped when the question doesn't refer back to the conversation); generation answers the original question
 - `verdict` is one of `supported` | `partial` | `unsupported` | `unverified` (see ARCHITECTURE.md §Verify flow):
   - `supported` — kept; the answer keeps its `[N]` marker.
   - `partial` — kept; the source backs only part of the claim (marker 3 above confirms broad growth but not "international demand"). Clients render it with a warning style.

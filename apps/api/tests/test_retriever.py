@@ -235,6 +235,20 @@ def test_reciprocal_rank_fusion_handles_more_than_two_ranked_lists():
     assert fused[0][1] == pytest.approx(expected_in_two_score)
 
 
+def test_reciprocal_rank_fusion_breaks_ties_the_same_way_whatever_the_list_order():
+    # Two chunks that are each rank 1 in a different list tie exactly on
+    # score. Their order used to follow the order the lists were passed in,
+    # which came from iterating a set of provider names — random per
+    # process, so results (and a retriever test) flipped between runs.
+    voyage_results = [{"id": "b-chunk", "content": "b"}]
+    gemini_results = [{"id": "a-chunk", "content": "a"}]
+
+    forward = _reciprocal_rank_fusion([voyage_results, gemini_results], rrf_k=60)
+    backward = _reciprocal_rank_fusion([gemini_results, voyage_results], rrf_k=60)
+
+    assert [row["id"] for row, _ in forward] == [row["id"] for row, _ in backward] == ["a-chunk", "b-chunk"]
+
+
 # Acceptance criterion: `Retriever.retrieve(question, document_ids, user_id, k) -> list[Chunk]`
 def test_retriever_retrieve_question_document_ids_user_id_k_list_chun(admin, user_a):
     user_id, _token = user_a
@@ -578,11 +592,18 @@ def test_mixed_provider_scope_a_query_only_matching_the_gemini_chunk_still_surfa
     gemini space (highly relevant) — if cross-provider comparison were
     happening anywhere, or if the gemini partition were silently dropped,
     the gemini chunk would fail to rank well. It must still come back
-    top-ranked based purely on its own partition's real cosine distance."""
+    in the top results based purely on its own partition's real cosine
+    distance, ahead of an irrelevant chunk from the same partition.
+
+    The lone voyage chunk is rank 1 in its own partition no matter how
+    poor its distance, so it ties the relevant gemini chunk on RRF score
+    (1/61 each) — which of those two comes first is a tie-break, not
+    something this test can assert. The irrelevant gemini chunk (rank 2,
+    1/62) is what the partition's own ranking must push out of the top 2."""
     user_id, _token = user_a
     document_id = _create_document(admin, user_id, "mixed-provider-precision.pdf")
 
-    _insert_chunk(
+    voyage_chunk_id = _insert_chunk(
         admin,
         document_id=document_id,
         user_id=user_id,
@@ -600,6 +621,15 @@ def test_mixed_provider_scope_a_query_only_matching_the_gemini_chunk_still_surfa
         embedding=_vector_along_dimension(0),
         embedding_provider="gemini",
     )
+    irrelevant_gemini_chunk_id = _insert_chunk(
+        admin,
+        document_id=document_id,
+        user_id=user_id,
+        chunk_index=2,
+        content="unrelated gemini-embedded filler",
+        embedding=_vector_along_dimension(7),  # orthogonal to the gemini query vector below
+        embedding_provider="gemini",
+    )
 
     fake_embedder = FakeQueryEmbedder(
         vectors_by_provider={
@@ -608,10 +638,10 @@ def test_mixed_provider_scope_a_query_only_matching_the_gemini_chunk_still_surfa
         }
     )
     retriever = Retriever(client=admin, embedder=fake_embedder)
-    results = retriever.retrieve("question", [document_id], user_id, k=1)
+    results = retriever.retrieve("question", [document_id], user_id, k=2)
 
-    assert len(results) == 1
-    assert results[0].chunk_id == gemini_chunk_id
+    assert {r.chunk_id for r in results} == {voyage_chunk_id, gemini_chunk_id}
+    assert irrelevant_gemini_chunk_id not in {r.chunk_id for r in results}
 
 
 # --- Reranking (FEAT-009 follow-up): Reranker unit tests --------------------

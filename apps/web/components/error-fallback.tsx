@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import * as Sentry from "@sentry/nextjs";
 import Link from "next/link";
 
 import { Button } from "@/components/ui/button";
@@ -38,6 +39,7 @@ export function ErrorFallback({
     // STANDARDS.md requires console.error for logged technical detail,
     // never console.log.
     console.error(error);
+    Sentry.captureException(error); // no-op unless Sentry is configured
   }, [error]);
 
   return (

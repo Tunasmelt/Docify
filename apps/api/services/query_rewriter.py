@@ -33,6 +33,26 @@ SYSTEM_INSTRUCTION = (
 
 _CITATION_BRACKET = re.compile(r"\[[^\[\]]*\]")
 
+# A follow-up needs rewriting only if it leans on the conversation: a word that
+# points back ("it", "that", "the previous ..."), an elliptical opener ("And for
+# Q2?", "What about ..."), or too few words to stand alone. Anything else is
+# searched as typed, saving a Flash-Lite round trip before retrieval. Missing a
+# case only means searching with the user's own words, the pre-rewrite behavior.
+_REFERRING_WORDS = re.compile(
+    r"\b(it|its|it's|that|this|these|those|they|them|their|theirs|he|him|his|she|her|hers|"
+    r"there|here|above|below|previous|prior|earlier|last|same|former|latter|one|ones|"
+    r"else|other|others|also|too|instead|again|more|further)\b",
+    re.IGNORECASE,
+)
+_ELLIPTICAL_OPENER = re.compile(r"^\s*(and|or|but|so|then|what about|how about|ok|okay)\b", re.IGNORECASE)
+_MIN_STANDALONE_WORDS = 4
+
+
+def needs_rewrite(question: str) -> bool:
+    if len(question.split()) < _MIN_STANDALONE_WORDS:
+        return True
+    return bool(_ELLIPTICAL_OPENER.search(question) or _REFERRING_WORDS.search(question))
+
 
 def _default_client() -> genai.Client:
     return genai.Client(api_key=os.environ["GEMINI_API_KEY"])
@@ -44,7 +64,7 @@ class QueryRewriter:
         self._retry_sleep = retry_sleep
 
     def rewrite(self, question: str, history: list[dict] | None) -> str:
-        if not history:
+        if not history or not needs_rewrite(question):
             return question
         try:
             client = self._client or _default_client()
