@@ -6,6 +6,22 @@ Entry types: `feature` · `fix` · `decision` · `refactor` · `test` · `infra`
 
 ---
 
+## 2026-10-06 — infra: error tracking, per-user ingest cap, page-preview cache
+
+**Phase:** 5
+**Feature:** FEAT-025 (error tracking); SCOPE.md Phase 5 "Production job execution"
+**Changed:**
+- **Sentry, both apps, off until a DSN is set.** API: `sentry-sdk[fastapi]` initialised in `services/observability.py` from `SENTRY_DSN`; every `logger.error`/`logger.exception` is reported, which covers caught route failures and background ingest failures, not just crashes. Web: `@sentry/nextjs` (`instrumentation.ts`, `instrumentation-client.ts`, `sentry.{server,edge}.config.ts`, shared options in `lib/sentry-options.ts`); route error boundaries (`ErrorFallback`) and a new `app/global-error.tsx` report what they catch. Privacy: no request bodies, no stack-frame locals, no default PII, no replay, no tracing. Source maps upload only when `SENTRY_AUTH_TOKEN` is set. Account setup and UptimeRobot steps: docs/DEPLOYMENT.md §Monitoring.
+- **At most 2 documents processing per user** (`routes/ingest.py`, `MAX_CONCURRENT_INGESTS_PER_USER`). `/ingest` and `/reindex` return `429 TOO_MANY_PROCESSING` beyond that, before the daily limit is touched. Counted from `documents` (statuses `uploaded`/`parsing`/`embedded`), so it survives restarts and works across instances; rows that started more than 30 minutes ago are presumed dead and don't count, so a crashed ingest can't lock a user out. `mark_parsing` now sets `updated_at`, giving a reindex a fresh start time. The documents page shows the message on Retry.
+- **Page-preview cache** (`routes/documents.py`). The rendered page (no highlight) is cached in memory per (document, page), 32 MB LRU; the highlight is drawn per request. Browser cache raised from 5 minutes to a day (`private`). Ownership is checked before the cache.
+**Verified:**
+- Ingest cap: 5 new tests (refused at the cap with nothing created, allowed below it, finished/stale/other users' documents don't count, reindex refused and restarts its clock). Existing ingest, reindex and documents tests pass.
+- Cache: 4 new tests (repeat views and a new highlight served with the file deleted from Storage, another user still gets 404, `Cache-Control`, LRU byte budget). Locally a cached page with a new highlight takes 160 ms vs 555 ms cold, with no Storage download.
+- Sentry: 3 new tests, one running the real SDK in a subprocess with a recording transport (a logged error and an exception are reported; a local variable holding document text is not, and the same check does leak it under Sentry's defaults). Web `lint`, `tsc` and `build` pass with no DSN; Sentry adds 35 kB to the shared first-load JS (87 → 122 kB) after tree-shaking tracing and debug logging.
+**Deploy:** no migrations. New optional env vars: `SENTRY_DSN`, `SENTRY_ENVIRONMENT` (Render); `NEXT_PUBLIC_SENTRY_DSN`, `SENTRY_ORG`, `SENTRY_PROJECT`, `SENTRY_AUTH_TOKEN` (Vercel).
+
+---
+
 ## 2026-10-06 — feature: cross-page tables, retrieval benchmark, fewer query rewrites
 
 **Phase:** 5

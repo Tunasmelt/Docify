@@ -1,4 +1,7 @@
 import logging
+import threading
+from collections import OrderedDict
+from io import BytesIO
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, Response
@@ -194,6 +197,53 @@ PAGE_IMAGE_RESOLUTION = 110
 _HIGHLIGHT_FILL = (255, 196, 0, 70)
 _HIGHLIGHT_OUTLINE = (214, 140, 0, 255)
 
+# Rendering means downloading the whole PDF from Storage and rasterizing a
+# page, so rendered pages (without highlight) are cached in memory per
+# (document, page) and the highlight is drawn per request. A document's file
+# never changes under the same id (reindex re-reads the same object), so
+# entries can't go stale. ~32MB is roughly 100-300 pages on the 512MB instance.
+PAGE_CACHE_MAX_BYTES = 32 * 1024 * 1024
+PAGE_IMAGE_CACHE_CONTROL = "private, max-age=86400"
+
+
+class _ByteLRU:
+    """Thread-safe LRU of bytes values with a total size budget (sync routes
+    run in FastAPI's threadpool)."""
+
+    def __init__(self, max_bytes: int):
+        self._max_bytes = max_bytes
+        self._items: OrderedDict[object, bytes] = OrderedDict()
+        self._size = 0
+        self._lock = threading.Lock()
+
+    def get(self, key) -> bytes | None:
+        with self._lock:
+            value = self._items.get(key)
+            if value is not None:
+                self._items.move_to_end(key)
+            return value
+
+    def put(self, key, value: bytes) -> None:
+        if len(value) > self._max_bytes:
+            return
+        with self._lock:
+            old = self._items.pop(key, None)
+            if old is not None:
+                self._size -= len(old)
+            self._items[key] = value
+            self._size += len(value)
+            while self._size > self._max_bytes:
+                _, evicted = self._items.popitem(last=False)
+                self._size -= len(evicted)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+            self._size = 0
+
+
+_page_cache = _ByteLRU(PAGE_CACHE_MAX_BYTES)
+
 
 @router.get("/documents/{document_id}/pages/{page_number}/image")
 def get_page_image(
@@ -219,48 +269,70 @@ def get_page_image(
     if page_number < 1:
         return JSONResponse(status_code=422, content=error_envelope("VALIDATION_ERROR", "page_number must be >= 1"))
 
-    try:
-        file_bytes = client.storage.from_("uploads").download(row["storage_path"].removeprefix("uploads/"))
-    except Exception:
-        logger.warning("get_page_image: storage download failed for document %s", document_id)
-        return JSONResponse(
-            status_code=500, content=error_envelope("STORAGE_ERROR", "couldn't load this document's file")
-        )
+    # Ownership was checked above; the cache is only consulted after that.
+    cache_key = (document_id, page_number)
+    page_png = _page_cache.get(cache_key)
+    if page_png is None:
+        try:
+            file_bytes = client.storage.from_("uploads").download(row["storage_path"].removeprefix("uploads/"))
+        except Exception:
+            logger.warning("get_page_image: storage download failed for document %s", document_id)
+            return JSONResponse(
+                status_code=500, content=error_envelope("STORAGE_ERROR", "couldn't load this document's file")
+            )
 
-    try:
-        png = _render_page_png(file_bytes, page_number, (x0, y0, x1, y1))
-    except Exception:
-        logger.warning("get_page_image: failed to render page %s of document %s", page_number, document_id, exc_info=True)
-        return JSONResponse(status_code=422, content=error_envelope("VALIDATION_ERROR", "couldn't render this page"))
-    if png is None:
-        return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "page not found"))
+        try:
+            page_png = _render_page_png(file_bytes, page_number)
+        except Exception:
+            logger.warning(
+                "get_page_image: failed to render page %s of document %s", page_number, document_id, exc_info=True
+            )
+            return JSONResponse(
+                status_code=422, content=error_envelope("VALIDATION_ERROR", "couldn't render this page")
+            )
+        if page_png is None:
+            return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "page not found"))
+        _page_cache.put(cache_key, page_png)
 
-    return Response(content=png, media_type="image/png", headers={"Cache-Control": "private, max-age=300"})
+    png = _draw_highlight(page_png, (x0, y0, x1, y1))
+    return Response(content=png, media_type="image/png", headers={"Cache-Control": PAGE_IMAGE_CACHE_CONTROL})
 
 
-def _render_page_png(file_bytes: bytes, page_number: int, highlight: tuple) -> bytes | None:
+def _render_page_png(file_bytes: bytes, page_number: int) -> bytes | None:
     # Imported here, not at module level: keeps pdfplumber out of the app's
     # import graph for every other route (see tests/test_parser_rewrite.py).
-    from io import BytesIO
-
     import pdfplumber
-    from PIL import Image, ImageDraw
 
     with pdfplumber.open(BytesIO(file_bytes)) as pdf:
         if page_number > len(pdf.pages):
             return None
-        image = pdf.pages[page_number - 1].to_image(resolution=PAGE_IMAGE_RESOLUTION).original.convert("RGBA")
-
-    if all(v is not None for v in highlight):
-        scale = PAGE_IMAGE_RESOLUTION / 72.0
-        hx0, hy0, hx1, hy1 = (v * scale for v in highlight)
-        if hx1 > hx0 and hy1 > hy0:
-            overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
-            ImageDraw.Draw(overlay).rectangle(
-                (hx0 - 4, hy0 - 4, hx1 + 4, hy1 + 4), fill=_HIGHLIGHT_FILL, outline=_HIGHLIGHT_OUTLINE, width=3
-            )
-            image = Image.alpha_composite(image, overlay)
+        image = pdf.pages[page_number - 1].to_image(resolution=PAGE_IMAGE_RESOLUTION).original.convert("RGB")
 
     out = BytesIO()
-    image.convert("RGB").save(out, format="PNG", optimize=True)
+    image.save(out, format="PNG", optimize=True)
+    return out.getvalue()
+
+
+def _draw_highlight(page_png: bytes, highlight: tuple) -> bytes:
+    """The page with `highlight` (PDF points, top-left origin) drawn on it,
+    or the page unchanged when there's no usable box."""
+    from PIL import Image, ImageDraw
+
+    if not all(v is not None for v in highlight):
+        return page_png
+    scale = PAGE_IMAGE_RESOLUTION / 72.0
+    hx0, hy0, hx1, hy1 = (v * scale for v in highlight)
+    if not (hx1 > hx0 and hy1 > hy0):
+        return page_png
+
+    with Image.open(BytesIO(page_png)) as page:
+        image = page.convert("RGBA")
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    ImageDraw.Draw(overlay).rectangle(
+        (hx0 - 4, hy0 - 4, hx1 + 4, hy1 + 4), fill=_HIGHLIGHT_FILL, outline=_HIGHLIGHT_OUTLINE, width=3
+    )
+    out = BytesIO()
+    # No `optimize`: this runs on every highlighted request, and optimize
+    # roughly doubles encode time for a few percent smaller output.
+    Image.alpha_composite(image, overlay).convert("RGB").save(out, format="PNG")
     return out.getvalue()

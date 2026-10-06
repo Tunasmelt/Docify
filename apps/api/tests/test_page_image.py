@@ -118,3 +118,64 @@ def test_page_image_requires_auth(app_client, seeded):
     _user_id, _token, document_id = seeded
 
     assert app_client.get(f"/documents/{document_id}/pages/1/image").status_code == 401
+
+
+# ── Caching (2026-10-06) ──────────────────────────────────────────────────────
+# Every request used to download the whole PDF from Storage and re-render the
+# page. The rendered page (without highlight) is now cached in memory per
+# (document, page); the highlight is drawn per request. A document's file
+# never changes under the same id, so entries never go stale.
+
+
+@pytest.fixture
+def empty_page_cache():
+    from routes.documents import _page_cache
+
+    _page_cache.clear()
+    yield
+    _page_cache.clear()
+
+
+def test_repeat_views_of_a_page_are_served_without_storage(app_client, admin, seeded, empty_page_cache):
+    user_id, token, document_id = seeded
+    first = _get(app_client, token, document_id, 1)
+    assert first.status_code == 200
+
+    # With the file gone from Storage, only the cache can answer — for the
+    # same view and for a different highlight on the same page.
+    admin.storage.from_("uploads").remove([f"{user_id}/preview.pdf"])
+    again = _get(app_client, token, document_id, 1)
+    highlighted = _get(app_client, token, document_id, 1, x0=72, y0=72, x1=300, y1=120)
+
+    assert again.status_code == 200 and again.content == first.content
+    assert highlighted.status_code == 200 and highlighted.content != first.content
+
+
+def test_cached_page_is_still_not_served_to_another_user(app_client, seeded, user_b, empty_page_cache):
+    _user_id, token, document_id = seeded
+    assert _get(app_client, token, document_id, 1).status_code == 200
+
+    _other_id, other_token = user_b
+    assert _get(app_client, other_token, document_id, 1).status_code == 404
+
+
+def test_page_image_may_be_cached_by_the_browser_for_a_day(app_client, seeded, empty_page_cache):
+    _user_id, token, document_id = seeded
+    response = _get(app_client, token, document_id, 1)
+
+    assert response.headers["cache-control"] == "private, max-age=86400"
+
+
+def test_page_cache_evicts_least_recently_used_entries_past_its_byte_budget():
+    from routes.documents import _ByteLRU
+
+    cache = _ByteLRU(max_bytes=10)
+    cache.put("a", b"1234")
+    cache.put("b", b"1234")
+    assert cache.get("a") == b"1234"  # "a" is now most recently used
+    cache.put("c", b"1234")  # 12 bytes > 10: evicts "b", the least recently used
+
+    assert cache.get("b") is None
+    assert cache.get("a") == b"1234" and cache.get("c") == b"1234"
+    cache.put("huge", b"x" * 11)  # larger than the whole budget: not cached at all
+    assert cache.get("huge") is None and cache.get("a") is not None

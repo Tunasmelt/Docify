@@ -39,6 +39,8 @@ dependencies = [
     # installed separately (the Dockerfile does this; see docs/DEVELOPMENT.md).
     "pytesseract>=0.3.13,<0.4",
     "slowapi>=0.1.10",
+    # Error tracking (services/observability.py). Inactive unless SENTRY_DSN is set.
+    "sentry-sdk[fastapi]>=2.71,<3",
 ]
 
 [dependency-groups]

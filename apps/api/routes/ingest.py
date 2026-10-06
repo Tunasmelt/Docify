@@ -95,6 +95,34 @@ INGEST_GLOBAL_RATE_LIMIT_SCOPE = "ingest_global"
 # recovers it immediately if so.
 STUCK_DOCUMENT_THRESHOLD_SECONDS = 30 * 60
 
+# 2026-10-06 — ingest runs as a background task in the request-serving
+# process (no queue). One document stuck in the OCR chain can take ~3
+# minutes and most of Render's 512MB, so each user may have at most this
+# many documents processing at once. Counted from the documents table
+# (survives restarts, correct across instances); rows older than
+# STUCK_DOCUMENT_THRESHOLD_SECONDS are treated as dead and don't count.
+# Two concurrent requests can both pass the check (no lock) — acceptable
+# for a soft resource cap.
+MAX_CONCURRENT_INGESTS_PER_USER = 2
+
+
+def _too_many_processing_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content=error_envelope(
+            "TOO_MANY_PROCESSING",
+            f"You already have {MAX_CONCURRENT_INGESTS_PER_USER} documents processing. "
+            "Wait for one to finish, then try again.",
+        ),
+    )
+
+
+def _at_processing_cap(client, user_id: str) -> bool:
+    processing = queries.count_processing_documents(
+        client, user_id=user_id, started_within_seconds=STUCK_DOCUMENT_THRESHOLD_SECONDS
+    )
+    return processing >= MAX_CONCURRENT_INGESTS_PER_USER
+
 # FEAT-020 (2026-07-27): extended from PDF-only to also accept DOCX,
 # PPTX, and HTML — verified per-format against real fixtures, not assumed
 # from "Docling supports it" alone (.agent/FEATURES.md's FEAT-020 entry
@@ -293,6 +321,10 @@ def post_ingest(
 
     client = get_service_role_client()
 
+    # Before the daily limit, so a refused request doesn't use up a daily slot.
+    if _at_processing_cap(client, user_id):
+        return _too_many_processing_response()
+
     # Postgres-backed daily limit (rate_limit.py) — NOT slowapi's
     # in-memory storage, replacing the old @limiter.limit(INGEST_DAY_LIMIT)
     # decorator. Shares one counter (route="ingest") with POST /reindex —
@@ -375,6 +407,9 @@ def post_reindex(
             status_code=409,
             content=error_envelope("CONFLICT", "document is currently being processed"),
         )
+
+    if _at_processing_cap(client, user_id):
+        return _too_many_processing_response()
 
     try:
         check_daily_limit(client, user_id=user_id, route="ingest", limit=int(INGEST_DAY_LIMIT.split("/")[0]))

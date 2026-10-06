@@ -115,12 +115,13 @@ Source of truth for what is and is not in scope, per phase. Check here before de
 - [x] README at repo root: overview, screenshots, tech stack, quick start
 - [ ] Custom domain (if one is available)
 - [x] CI: `pytest` (against a local Supabase stack), `next lint`, `tsc` and `next build` on every PR (`.github/workflows/ci.yml`). Playwright e2e is not run in CI
-- [ ] Error tracking (Sentry free tier, FEAT-025)
-- [ ] Uptime monitor (UptimeRobot free) against `GET /health`
+- [ ] Error tracking (Sentry free tier, FEAT-025). **Code done** 2026-10-06 (API + web, inactive until a DSN is set); still needs the Sentry projects created and DSNs added on Render/Vercel (docs/DEPLOYMENT.md §Monitoring)
+- [ ] Uptime monitor (UptimeRobot free) against `GET /health`. Setup steps in docs/DEPLOYMENT.md §Monitoring; needs an UptimeRobot account (no code change)
 - [ ] **Production job execution for `/ingest`.** FastAPI `BackgroundTasks` is not a job system. Status of each facet:
   - [x] **Durability** — a lazy reaper in `GET /documents` marks documents stuck in `parsing`/`embedded` for 30+ minutes as `failed`, and `POST /reindex` recovers them. Not a real crash-recovery system: no automatic retry, and detection only happens when the user lists documents.
   - [x] **Rate limiting** — per-user and global per-minute limits (in memory), daily limits in Postgres (FEAT-024). In-memory counters are only correct while the API runs as a single instance; move to a shared store (Redis via slowapi `storage_uri=`) before scaling out. There is no single budget spanning both `/ingest` and `/query`.
-  - [ ] **Worker pool / queue / job-level timeout** — still open. Ingest runs on the request-serving process with no backpressure or per-user concurrency cap. Each OCR call has a 60s timeout, but one page that exhausts all three OCR tiers can take ~3 minutes.
+  - [x] **Per-user concurrency cap** (2026-10-06) — at most 2 documents processing per user (`MAX_CONCURRENT_INGESTS_PER_USER`); `/ingest` and `/reindex` return `429 TOO_MANY_PROCESSING` beyond that. Counted in Postgres, so it holds across restarts and instances.
+  - [ ] **Worker pool / queue / job-level timeout** — still open. Ingest still runs on the request-serving process; there is no global (all-users) cap. Each OCR call has a 60s timeout, but one page that exhausts all three OCR tiers can take ~3 minutes.
 
 ### Explicitly out of scope
 - Marketing site beyond the landing page

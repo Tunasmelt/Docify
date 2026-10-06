@@ -35,14 +35,14 @@ Docify runs on three free-tier services. This page covers how they're wired, how
   docker build -t docify-api .
   docker run --rm --memory=512m -p 8000:8000 --env-file .env docify-api
   ```
-- **Environment variables** (set in the Render dashboard, never committed): `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `VOYAGE_API_KEY`, `GEMINI_API_KEY`, `OCR_SPACE_API_KEY`, `FRONTEND_ORIGINS` (the Vercel URL; comma-separate multiple origins). `SUPABASE_JWT_SECRET` and `TESSERACT_CMD` are not needed. `RENDER_GIT_COMMIT` and `PORT` are injected by Render.
+- **Environment variables** (set in the Render dashboard, never committed): `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `VOYAGE_API_KEY`, `GEMINI_API_KEY`, `OCR_SPACE_API_KEY`, `FRONTEND_ORIGINS` (the Vercel URL; comma-separate multiple origins), and optionally `SENTRY_DSN` (see §Monitoring). `SUPABASE_JWT_SECRET` and `TESSERACT_CMD` are not needed. `RENDER_GIT_COMMIT` and `PORT` are injected by Render.
 - **Free-tier behaviour:** the instance sleeps after ~15 minutes idle and loses all in-memory state. Per-minute rate limits reset on restart (harmless), while daily limits persist in Postgres. A restart kills any in-flight ingest; the stuck-document reaper marks it `failed` within 30 minutes, and users recover it with re-index.
 - **If a pushed commit never deploys:** Render's GitHub webhook can go stale. Re-saving the service's branch setting (or a `PATCH` to its branch config via the API) forces a resync.
 
 ## Web (Vercel)
 
 - Git-linked to `Tunasmelt/Docify`, root directory `apps/web`. Vercel detects pnpm from `pnpm-lock.yaml`; no build overrides are needed.
-- **Environment variables:** `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` (production project), and `NEXT_PUBLIC_API_URL=https://docify-api.onrender.com`. `NEXT_PUBLIC_*` values are inlined at build time, so redeploy after changing them.
+- **Environment variables:** `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` (production project), `NEXT_PUBLIC_API_URL=https://docify-api.onrender.com`, and optionally `NEXT_PUBLIC_SENTRY_DSN` plus `SENTRY_ORG`/`SENTRY_PROJECT`/`SENTRY_AUTH_TOKEN` (see §Monitoring). `NEXT_PUBLIC_*` values are inlined at build time, so redeploy after changing them.
 - Vercel's default deployment protection (SSO) is disabled so the `.vercel.app` URL is public. Re-check this if the project is ever recreated.
 - `pnpm build` fails on ESLint errors, so run it locally before merging.
 
@@ -52,6 +52,26 @@ Docify runs on three free-tier services. This page covers how they're wired, how
 - **Auth → URL configuration:** the site URL and redirect allowlist must include the Vercel URL, or password-reset and OAuth redirects fail.
 - **Google OAuth:** the provider must be configured with a real Google client. A live end-to-end sign-in has not yet been verified (MEMORY.md §Open questions).
 - The service-role key bypasses RLS. It belongs only in Render's environment, never in Vercel or any `NEXT_PUBLIC_*` variable.
+
+---
+
+## Monitoring
+
+Both are free tier and need accounts only the owner can create; the code side is already in place.
+
+**Sentry (errors).** The SDKs in both apps stay off until a DSN is set. Sentry org: `forklift-yu` (EU region).
+1. In Sentry, create two projects: `docify-api` (platform: FastAPI) and `docify-web` (platform: Next.js).
+2. Render → `docify-api` → Environment: add `SENTRY_DSN` (the docify-api DSN). Optional: `SENTRY_ENVIRONMENT` (default `production`). Releases are tagged with `RENDER_GIT_COMMIT` automatically.
+3. Vercel → `docify-web` → Environment Variables (Production): add `NEXT_PUBLIC_SENTRY_DSN` (the docify-web DSN). It's inlined at build time, so redeploy afterwards. Optional, for readable browser stack traces: `SENTRY_ORG=forklift-yu`, `SENTRY_PROJECT=docify-web`, and `SENTRY_AUTH_TOKEN` (an org auth token with `project:releases`) enable source-map upload during the build.
+4. Check it works: a failed ingest shows up in `docify-api` within a minute (every `logger.error`/`logger.exception` is reported, not just crashes).
+
+What is sent: error messages and stack traces. Not sent: request bodies, local variables, cookies/auth headers/IPs, session replays, performance traces (SECURITY.md).
+
+**UptimeRobot (availability).**
+1. Add an HTTP(s) monitor for `https://docify-api.onrender.com/health`, keyword type, expecting `"status":"ok"`, at the free 5-minute interval, alerting by email.
+2. Optionally a second one for `https://docify-web-steel.vercel.app`.
+
+Note that a 5-minute ping keeps the free Render instance from ever idling, so it stops the cold starts too. That uses about 730 instance-hours a month, within Render's 750 free hours for a single service; a second always-on Render service would exceed it.
 
 ---
 

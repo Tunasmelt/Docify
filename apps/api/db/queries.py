@@ -56,7 +56,31 @@ def mark_parsing(client, document_id: str) -> None:
     # a document that may be sitting at status='failed' with a real error
     # string from its last attempt, and that stale message must not
     # linger once a fresh attempt is genuinely underway.
-    client.table("documents").update({"status": "parsing", "error": None}).eq("id", document_id).execute()
+    # updated_at marks when this processing attempt started (nothing else
+    # writes it), which count_processing_documents() relies on for a reindex.
+    client.table("documents").update({"status": "parsing", "error": None, "updated_at": _now_iso()}).eq(
+        "id", document_id
+    ).execute()
+
+
+_PROCESSING_STATUSES = ["uploaded", "parsing", "embedded"]
+
+
+def count_processing_documents(client, *, user_id: str, started_within_seconds: int) -> int:
+    """This user's documents still being processed. Rows that started longer
+    ago than the stuck-document threshold are ignored: their background task
+    is presumed dead (the reaper will mark them failed) and must not block
+    new uploads."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=started_within_seconds)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    result = (
+        client.table("documents")
+        .select("id", count="exact")
+        .eq("user_id", user_id)
+        .in_("status", _PROCESSING_STATUSES)
+        .gt("updated_at", cutoff)
+        .execute()
+    )
+    return result.count or 0
 
 
 def mark_parsed(client, document_id: str, *, page_count: int | None) -> None:

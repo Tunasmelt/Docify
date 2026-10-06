@@ -52,6 +52,7 @@ Two exceptions, both from the framework rather than route code: a request body/q
 | `CONFLICT` | 409 | Not allowed in the resource's current state (e.g. deleting or re-indexing a document that is still processing) |
 | `VALIDATION_ERROR` | 422 | A route-level check failed (empty question, unsupported mime type, bad cursor, bad title) |
 | `RATE_LIMITED` | 429 | This API's per-user or global limit was hit (see `/ingest` and `/query`). Includes `Retry-After` (seconds) |
+| `TOO_MANY_PROCESSING` | 429 | `/ingest` or `/reindex` while the caller already has 2 documents processing. The message says so; retry once one finishes |
 | `GENERATE_FAILED` | 502 | The Gemini generation call failed |
 | `STORAGE_ERROR` | 500 | A Supabase Storage call failed; the resource was left unmodified and retrying is safe |
 | `DELETE_FAILED` | 500 | `DELETE /account` cleaned Storage but the final auth-user deletion failed; DB rows are untouched and retrying is safe |
@@ -114,6 +115,7 @@ Supported `mime_type`s: PDF, DOCX, PPTX, HTML.
   - **10/day per user** (Postgres `usage_counters`, so it survives Render restarts)
 
   `/ingest` and `/reindex` share all three counters. Limits derive from shared vendor quotas (Voyage 3 RPM; Gemini 2.5 Flash OCR 20/day) — reasoning in `routes/ingest.py`.
+- `429 TOO_MANY_PROCESSING` — the caller already has **2 documents processing** (`uploaded`/`parsing`/`embedded`, started within the last 30 minutes). Checked before the daily limit, so a refused request doesn't use a daily slot. Ingest runs in the API process with no queue; this keeps one user from filling the 512 MB instance.
 
 ---
 
@@ -145,6 +147,7 @@ Reports `parsing` (not `uploaded`) because the route resets the document to `par
 - `404 NOT_FOUND`
 - `409 CONFLICT` — the document is still processing (`status in ('parsing', 'embedded')`)
 - `429 RATE_LIMITED` — shares all of `/ingest`'s counters (one combined 10/day budget)
+- `429 TOO_MANY_PROCESSING` — same 2-document cap as `/ingest`
 
 ---
 
@@ -195,7 +198,7 @@ Renders one page of a PDF as a PNG, for the citation page preview. With all four
 
 **Query params:** `x0`, `y0`, `x1`, `y1` (optional, PDF points from the page's top-left).
 
-**Response 200:** `image/png` (110 dpi), `Cache-Control: private, max-age=300`. Not rate-limited (no vendor API calls).
+**Response 200:** `image/png` (110 dpi), `Cache-Control: private, max-age=86400`. Not rate-limited (no vendor API calls). The rendered page (without highlight) is cached in API memory per document and page (32 MB LRU), so repeat views skip the Storage download and render; ownership is checked before the cache.
 
 **Errors:**
 - `404 NOT_FOUND` — the document doesn't exist, isn't the caller's, or has no such page

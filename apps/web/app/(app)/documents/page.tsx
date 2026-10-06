@@ -223,7 +223,9 @@ export default function DocumentsPage() {
       commitDocs(docs.map((d) => (d.id === id ? { ...d, status: "parsing", error: null } : d)));
       startPolling();
     } catch (err) {
-      if (err instanceof ApiError && err.code === "RATE_LIMITED") {
+      if (err instanceof ApiError && err.code === "TOO_MANY_PROCESSING") {
+        setRetryError(err.message);
+      } else if (err instanceof ApiError && err.code === "RATE_LIMITED") {
         setRetryError("Too many processing requests right now — wait a minute and try again.");
       } else if (err instanceof ApiError && err.code === "CONFLICT") {
         setRetryError("This document is already being processed.");
