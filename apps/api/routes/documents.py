@@ -23,7 +23,7 @@ _VALID_STATUSES = {"uploaded", "parsing", "embedded", "ready", "failed"}
 
 
 @router.get("/documents", response_model=DocumentListResponse)
-async def list_documents(
+def list_documents(
     request: Request,
     status: str | None = None,
     limit: int = Query(50, ge=1, le=200),
@@ -71,7 +71,7 @@ async def list_documents(
 
 
 @router.get("/documents/{document_id}", response_model=DocumentResponse)
-async def get_document(document_id: str, request: Request):
+def get_document(document_id: str, request: Request):
     user_id = request.state.user_id
     client = get_service_role_client()
 
@@ -110,7 +110,7 @@ def _storage_deletion_failed(document_id: str, user_id: str, *, bucket: str) -> 
 
 
 @router.delete("/documents/{document_id}", status_code=204)
-async def delete_document(document_id: str, request: Request):
+def delete_document(document_id: str, request: Request):
     user_id = request.state.user_id
     client = get_service_role_client()
 
@@ -183,3 +183,84 @@ async def delete_document(document_id: str, request: Request):
     queries.delete_document(client, document_id)
 
     return Response(status_code=204)
+
+
+# ── Page preview ────────────────────────────────────────────────────────────
+# Renders one page of a PDF as a PNG, optionally with a rectangle (a citation's
+# bbox, in PDF points from the top-left) highlighted — what "Open page N in
+# document" shows. PDF only: DOCX/HTML have no pages, and PPTX slides aren't
+# rendered server-side. No vendor API calls, so not rate-limited.
+PAGE_IMAGE_RESOLUTION = 110
+_HIGHLIGHT_FILL = (255, 196, 0, 70)
+_HIGHLIGHT_OUTLINE = (214, 140, 0, 255)
+
+
+@router.get("/documents/{document_id}/pages/{page_number}/image")
+def get_page_image(
+    document_id: str,
+    page_number: int,
+    request: Request,
+    x0: float | None = None,
+    y0: float | None = None,
+    x1: float | None = None,
+    y1: float | None = None,
+):
+    user_id = request.state.user_id
+    client = get_service_role_client()
+
+    row = queries.get_document_file(client, document_id=document_id, user_id=user_id)
+    if row is None:
+        return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "document not found"))
+    if row["mime_type"] != "application/pdf":
+        return JSONResponse(
+            status_code=422,
+            content=error_envelope("VALIDATION_ERROR", "page previews are only available for PDF documents"),
+        )
+    if page_number < 1:
+        return JSONResponse(status_code=422, content=error_envelope("VALIDATION_ERROR", "page_number must be >= 1"))
+
+    try:
+        file_bytes = client.storage.from_("uploads").download(row["storage_path"].removeprefix("uploads/"))
+    except Exception:
+        logger.warning("get_page_image: storage download failed for document %s", document_id)
+        return JSONResponse(
+            status_code=500, content=error_envelope("STORAGE_ERROR", "couldn't load this document's file")
+        )
+
+    try:
+        png = _render_page_png(file_bytes, page_number, (x0, y0, x1, y1))
+    except Exception:
+        logger.warning("get_page_image: failed to render page %s of document %s", page_number, document_id, exc_info=True)
+        return JSONResponse(status_code=422, content=error_envelope("VALIDATION_ERROR", "couldn't render this page"))
+    if png is None:
+        return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "page not found"))
+
+    return Response(content=png, media_type="image/png", headers={"Cache-Control": "private, max-age=300"})
+
+
+def _render_page_png(file_bytes: bytes, page_number: int, highlight: tuple) -> bytes | None:
+    # Imported here, not at module level: keeps pdfplumber out of the app's
+    # import graph for every other route (see tests/test_parser_rewrite.py).
+    from io import BytesIO
+
+    import pdfplumber
+    from PIL import Image, ImageDraw
+
+    with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+        if page_number > len(pdf.pages):
+            return None
+        image = pdf.pages[page_number - 1].to_image(resolution=PAGE_IMAGE_RESOLUTION).original.convert("RGBA")
+
+    if all(v is not None for v in highlight):
+        scale = PAGE_IMAGE_RESOLUTION / 72.0
+        hx0, hy0, hx1, hy1 = (v * scale for v in highlight)
+        if hx1 > hx0 and hy1 > hy0:
+            overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+            ImageDraw.Draw(overlay).rectangle(
+                (hx0 - 4, hy0 - 4, hx1 + 4, hy1 + 4), fill=_HIGHLIGHT_FILL, outline=_HIGHLIGHT_OUTLINE, width=3
+            )
+            image = Image.alpha_composite(image, overlay)
+
+    out = BytesIO()
+    image.convert("RGB").save(out, format="PNG", optimize=True)
+    return out.getvalue()

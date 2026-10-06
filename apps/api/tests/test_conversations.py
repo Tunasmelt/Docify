@@ -48,6 +48,7 @@ def _override(retriever, generator, verifier):
     app.dependency_overrides[query.get_retriever] = lambda: retriever
     app.dependency_overrides[query.get_generator] = lambda: generator
     app.dependency_overrides[query.get_verifier] = lambda: verifier
+    app.dependency_overrides[query.get_query_rewriter] = lambda: _PassthroughRewriter()
 
 
 @pytest.fixture(autouse=True)
@@ -493,3 +494,11 @@ def test_delete_conversation_returns_404_for_nonexistent_or_another_user_s_conve
 
     still_works_for_owner = app_client.get(f"/conversations/{conv_id}/messages", headers={"Authorization": f"Bearer {token_a}"})
     assert still_works_for_owner.status_code == 200
+
+
+class _PassthroughRewriter:
+    """Follow-up questions are searched unchanged — no real Gemini rewrite call."""
+
+    def rewrite(self, question, history):
+        return question
+

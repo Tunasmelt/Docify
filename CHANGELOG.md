@@ -6,6 +6,103 @@ Entry types: `feature` · `fix` · `decision` · `refactor` · `test` · `infra`
 
 ---
 
+## 2026-10-06 — feature: two-column PDFs, highlighted page preview, follow-up query rewriting, batched verification
+
+**Phase:** 5
+**Feature:** n/a (2026-10-06 code review, "Later" group)
+**Changed:**
+- **Two-column PDFs** (`services/parser.py`). Lines were grouped by height alone, so both columns merged into one garbled line. The parser now finds the gutter: an empty vertical strip in the middle of the page with text on both sides on many rows. It splits lines there and reads each section's left column, then its right; a full-width line (a title) starts a new section. Paragraphs never continue across the gutter, list-indent detection uses each column's own margin, and tables, figures and captions are placed in the same reading order. Single-column pages are unaffected: all fixture element counts are unchanged.
+- **Highlighted page preview.** Citations now carry `bbox` (`CitationResponse.bbox`, live and from history). Each chunk stores the union of its elements' boxes instead of only the first element's. The new `GET /documents/{id}/pages/{n}/image` renders the PDF page server-side with pdfplumber (no new dependency) and draws the bbox. In the chat source panel, "Open page N in document" (PDFs only) opens the page in a dialog; before, it only logged "[not yet built]" to the console.
+- **Follow-up query rewriting** (`services/query_rewriter.py`, both query routes). With conversation history, a Gemini 3.5 Flash-Lite call turns the question into a standalone search query for retrieval only; generation still gets the original question. Any failure falls back to the original. First turns never call it. This reverses the earlier "no query rewriting" Locked decision (MEMORY.md decision log).
+- **Batched verification** (`services/verifier.py`). All claims of an answer go in one Gemini call (groups of 12, structured list response) instead of one call per claim. Every item gets the same quote checks. A failed or malformed batch falls back to per-claim calls, and an item missing from the response is verified on its own. A model claiming `unverified` is no longer trusted as a verdict.
+**Verified:**
+- New regression tests fail on the old code and pass on the new: parser 4 (generated two-column PDFs), page image 6, citation bbox 3, query rewriter 4 unit + 2 `/query` + 1 `/query/stream`, verifier batch 7.
+- Existing verifier tests that pinned one call per claim now target the per-claim fallback (`_verify_each`).
+- Full backend suite against local Supabase: 458 passed, 1 environmental failure (Voyage tokenizer download blocked by the proxy).
+- Playwright `page-preview.e2e.ts` and `document-retry.e2e.ts` pass against local Supabase plus the local API. Web `tsc` and `next build` pass.
+- `google-genai` was checked to accept and parse `list[_BatchVerdictItem]` as a response schema.
+**Deploy:** no migrations. Rollback: revert the commit.
+
+---
+
+## 2026-10-06 — fix: partly scanned OCR, section-aware chunks, tenant-safe vector search, unsupported-claim removal, Gemini retries, failed-document recovery UI
+
+**Phase:** 5
+**Feature:** n/a (fixes from the 2026-10-06 code review, "Next" group)
+**Changed:**
+- **OCR for partly scanned pages** (`services/parser.py`). OCR used to run only on pages with zero text, so a scan with a stray text layer (scanned.pdf page 1: a 13-character title over a full-page scan) lost its whole body. Pages with under 200 characters of text over an image covering half the page or more are now OCR'd too, and the OCR text replaces their thin text layer. OCR elements now stay in page order, and their bbox is in PDF points rather than image pixels. Verified with the real Tesseract tier: page 1's letter body is now recovered.
+- **Section headings in chunks** (`services/chunker.py`). Every heading starts a new chunk, so headings are no longer stranded at the end of the previous chunk. Continuation chunks, page-break chunks, tables and figures get their section heading prefixed (stored as `metadata.section_heading` too), which gives uncaptioned figures searchable text. A heading directly above a table or figure folds into that chunk. A grouped chunk's type now reflects its body (`text`/`list`), not its first heading.
+- **Tenant-safe vector search** (migration `20261006_002_vector_search_iterative_scan.sql`). The HNSW index returned ~40 nearest chunks across all tenants before the user/document filter; reproduced locally, another tenant's 400 nearby chunks left a user with 0 of their 5. `match_chunks_by_vector` now uses `hnsw.iterative_scan = strict_order`.
+- **Unsupported claims removed** (`routes/query.py`, both `/query` and `/query/stream`). A sentence whose citations were all judged unsupported is removed (not just un-cited), and the answer notes how many statements were removed. Mixed sentences keep their supported citation. `raw_content` keeps the original. Decision recorded in MEMORY.md.
+- **Gemini retries** (`services/gemini_retry.py`, generator, verifier). Transient 429/5xx/network failures are retried up to 3 attempts, honoring Gemini's `retryDelay` (1s/2s backoff otherwise), but never waiting more than 8s on an interactive request. Streaming only retries before the first token reaches the client. The embedder's retry-delay parsing now uses the same helper.
+- **Failed-document recovery UI** (`apps/web`). Failed documents show their error and a **Retry** button (`POST /reindex`). The card returns to processing and polling restarts; rate-limit and conflict errors show inline.
+**Verified:** Regression tests for each item fail on the old code and pass on the new: parser 4, chunker 8, retriever 1 (real HNSW scenario in local Postgres), query 7 + stream 1, Gemini retry 10, Playwright e2e 1 (real browser + local Supabase + local API). Existing tests that pinned the old behaviour were updated: OCR call counts (3 low-yield pages, not 2) and clean_digital.pdf chunk grouping. Full backend suite against local Supabase (placeholder API keys): 431 passed, 1 environmental failure (the Voyage tokenizer download is blocked by this environment's proxy). Web `tsc` and `next build` (ESLint) pass. In `upload.e2e.ts`, 4 of 6 pass; the other 2 need a real Voyage key to reach Ready, which this environment doesn't have (the tokenizer download is blocked by the proxy).
+**Deploy:** apply `20261006_001` and `20261006_002` to production before deploying.
+**Rollback:** revert the commit. Each migration's `-- ROLLBACK` block restores the previous function.
+
+---
+
+## 2026-10-06 — fix: event-loop blocking, HTML/DOCX reading order, FTS any-term matching, table/figure quote grounding
+
+**Phase:** 5
+**Feature:** n/a (fixes from the 2026-10-06 code review, "Now" group)
+**Changed:**
+- **Server no longer freezes during a query.** Every route was `async def` but called the synchronous Supabase client, and `/query` also called the synchronous retriever, Gemini, and verifier, so one question blocked the single worker for its full duration. Blocking handlers are now plain `def` (FastAPI's threadpool), and `/query/stream`'s pre-stream ownership and history checks use `asyncio.to_thread`. Measured with a live server: `/health` waited 1.76s behind a 2s `/query` before, and under 0.5s after. `routes/*.py`, `tests/test_event_loop.py` (structural guard + live-server test).
+- **HTML reading order.** `tree.css("h1, …, p, li, …")` returns nodes grouped by selector, so every heading came out before every paragraph and tables landed after the text around them. The DOM is now walked in order. Nested matches (`<p>` in `<li>`, `<caption>` in `<table>`) are no longer emitted twice, and a table's `<caption>` is emitted just before the table. `services/parser.py` (`_iter_html_blocks`).
+- **DOCX reading order.** Paragraphs, then all tables, then all images became body order (`Document.iter_inner_content()`), with inline images emitted at the paragraph that contains them.
+- **Full-text search matches any term.** `websearch_to_tsquery` ANDed every question term, so natural-language questions rarely matched and hybrid search was effectively vector-only. Migration `20261006_001_fts_any_term_matching.sql` ORs the question's normalized lexemes (`fts_any_term_query`), and `ts_rank` puts chunks matching more terms first.
+- **Table and figure citations are no longer wrongly dropped.** Quote grounding now ignores markdown table syntax, case, Unicode compatibility forms, and curly-quote/dash variants, so `"Q3 $4.20M"` matches `| Q3 | $4.20M |`. Fabricated quotes are still rejected. For figure chunks, a quote that isn't in the caption (it was read off the image, which can't be checked against stored text) keeps the verdict but isn't displayed. `services/verifier.py`.
+**Verified:** New regression tests fail on the old code and pass on the new (3 parser, 2 event-loop, 3 FTS, 5 verifier). Full backend suite against a local Supabase stack: 389 passed. All 12 failures also fail on the unmodified code and are environmental (no Gemini/OCR.space keys, no `tesseract`, no network for the Voyage tokenizer), plus the known flaky RRF tie-break test (MEMORY.md §Open questions 2026-08-02). With placeholder API keys, the `/query`, `/query/stream`, rate-limit, and event-loop suites pass in full (73 passed).
+**Deploy:** apply `20261006_001_fts_any_term_matching.sql` to production before deploying this code.
+**Rollback:** revert the commit. The migration's `-- ROLLBACK` block restores the previous `match_chunks_by_fts`.
+
+---
+
+## 2026-10-06 — docs: documentation accuracy pass across .agent/, AGENT.md, and new developer/deploy guides
+
+**Phase:** 5
+**Feature:** n/a (docs)
+**Context:** A review of all project documentation found claims that no longer matched the code, deployment state, or each other.
+**Changed:**
+- **Multi-tenancy description corrected** (ARCHITECTURE.md, SCHEMA.md, STANDARDS.md, AGENT.md, MEMORY.md anti-pattern note). FastAPI uses the service-role key, which bypasses RLS, so the explicit `user_id` filter is the tenant boundary on that path. RLS protects only direct browser→Supabase access. The docs previously claimed the database enforced isolation for all paths.
+- **Docling references removed or marked historical** (AGENT.md stack, API_CONTRACT.md error codes and the stale "known OOM limitation", SCHEMA.md page-number notes, STANDARDS.md examples, `pyproject.toml` comments).
+- **Status brought current:** Vercel deploy (FEAT-021), landing page (FEAT-023), and the FEAT-032/033 "uncommitted" notes are resolved; migration `002` is applied to production; MEMORY.md's chunking and polling open questions are moved to Resolved.
+- **SCHEMA.md:** complete migration log (13 migrations), new RPC function reference, `citations.marker` column, Gemini `verifier_model` example, format-specific `page_number` semantics based on the current parser.
+- **API_CONTRACT.md:** `/health` now documents `commit`; the error-code table matches the codes the API actually returns; contract-version note.
+- **History removed from reference docs.** ARCHITECTURE, SCOPE, SCHEMA, and API_CONTRACT now state current truth; edit history stays in this file and git.
+- **Single-agent workflow recorded** (AGENT.md §AGENT ROLES, ARCHITECTURE.md Locked decisions, MEMORY.md decision log 2026-10-06), replacing the four-agent lane model that never operated.
+- **STANDARDS.md** now matches reality: dependency-pinning policy, env var list, test tooling (no vitest), e2e count, `Embedder` naming, `master` as default branch, and the absence of CI and a Python linter noted as gaps.
+- **New:** `docs/DEVELOPMENT.md` (local stack, migrations, env, tests, contributing), `docs/DEPLOYMENT.md` (Render/Vercel/Supabase runbook), `SECURITY.md`, `.agent/api-docs/parser-libs.md` (version and API-surface inventory, not yet re-verified against upstream docs).
+- `apps/api/.env.example` now lists `FRONTEND_ORIGINS`. `pyproject.toml` and `main.py` comments are condensed with no code or dependency changes (verified: parsed TOML identical, Python AST identical, `uv lock --check` clean).
+- References to the never-committed review files `2026-08-01-parser-research.md` and `2026-08-02-parser-rewrite-audit.md` now point at the matching CHANGELOG entries. The past CHANGELOG entries themselves are left as written.
+- This entry plus backfilled entries for 2026-08-04 → 2026-09-02, which were missing.
+**Not changed:** `README.md`, at the owner's request.
+**Rollback:** `git revert` this commit. Docs and comments only.
+
+---
+
+## 2026-09-02 — docs: MIT license, external-facing README, real screenshots *(backfilled 2026-10-06)*
+
+**Changed:** `LICENSE` (MIT), `README.md` rewritten for an external audience, `docs/screenshots/` (5 captures from the live deployment), `"license": "MIT"` in `package.json`/`pyproject.toml`. Commit `396145d`.
+
+---
+
+## 2026-08-19 — feature: `GET /health` reports the running commit *(backfilled 2026-10-06)*
+
+**Context:** Twice, a committed fix silently never reached production (the Dockerfile COPY gap and an unpushed retry fix). Both were found only by forensic log reading.
+**Changed:** `HealthResponse.commit` from Render's `RENDER_GIT_COMMIT` (`"unknown"` elsewhere). `routes/health.py`, `models/health.py`, `tests/test_health.py`, MEMORY.md anti-pattern 2026-08-18. Commit `91436d1`.
+**Rollback:** revert the commit; additive field only.
+
+---
+
+## 2026-08-19 — fix: honor server-guided retry timing for both embedding providers *(backfilled 2026-10-06)*
+
+**Context:** Production incident. A 108-chunk document exhausted Voyage's 3 RPM limit, fell back to Gemini, then hit Gemini's per-minute 429, and the whole ingest failed. Neither client honored the server's retry delay: google-genai has no retry logic, and Voyage's SDK parses `retry_after` but never uses it.
+**Changed:** `services/embedder.py`. The Gemini fallback retries up to 3 attempts, sleeping the `retryDelay` from the 429 payload (default 15s), and only on 429/RESOURCE_EXHAUSTED. Voyage now uses a tenacity wait strategy that honors `retry-after`. `tenacity` is declared as a direct dependency. The Dockerfile pre-downloads the Voyage tokenizer at build time. Tests replay the real incident payload. Commit `fdfed16`.
+**Rollback:** revert the commit.
+
+---
+
 ## 2026-08-09 — infra: first production deploy of apps/web to Vercel, and a real production-currency fix on Render
 
 **Phase:** 5 (final deployment step — frontend goes live)
@@ -24,6 +121,64 @@ First deployment triggered git-sourced (not a file upload) against current `mast
 **Changed:** `apps/api/Dockerfile` (`184e972`). Vercel project `docify-web` created and configured entirely via API (no source changes on the apps/web side).
 **Impact:** the deployed backend now genuinely matches `master`, closing a gap where the original portfolio-defining bug (Docling OOM on `/ingest`) had silently been live in production for 32 commits' worth of unrelated feature work. The frontend is live for the first time, git-linked for continuous deployment rather than a one-off snapshot.
 **Rollback:** Render — redeploy commit `4be11f30cb76` via the dashboard/API (not recommended, reintroduces the OOM bug). Vercel — delete project `docify-web` via the dashboard/API; no data/schema impact either way.
+
+---
+
+## 2026-08-08 — feature: landing page (FEAT-023) *(backfilled 2026-10-06)*
+
+**Changed:** `apps/web/app/page.tsx` was a bare redirect to `/login`. It now renders a public landing page (`components/landing/*`, built from the Claude Design reference). `middleware.ts` makes `/` public and sends signed-in users to `/documents`. `e2e/landing.e2e.ts`. Commit `ef70e5f`.
+
+---
+
+## 2026-08-08 — feature: settings batch 2 — preferences wiring (FEAT-033) *(backfilled 2026-10-06)*
+
+**Changed:** `QueryRequest.rerank` threaded to `Retriever.retrieve()` on `/query` and `/query/stream`. Chat/documents pages read `defaultK`/`rerank`/`streaming` from `usePreferences()` (localStorage) and choose streaming vs non-streaming. `useCurrentUser()` replaces the hard-coded placeholder identity, and the sidebar shows the real avatar. The settings page now renders the export and danger-zone sections that batch 3 had committed but left unreachable. Commits `6959763` (hook), `d9cedee`.
+
+---
+
+## 2026-08-08 — fix: commit files that earlier feature commits depended on but never included *(backfilled 2026-10-06)*
+
+**Context:** A fresh-clone check found committed code importing files that existed only in the working tree, so a clean checkout of `master` did not build.
+**Changed:** `hooks/use-preferences.ts` (`6959763`), `migrations/20260804_001_avatars_bucket.sql` (`3dc50bf`), `deleteAccount()` in `lib/supabase/profile.ts` (`32f5895`), `e2e/_local-supabase.ts` helpers (`bbfca55`), `tests/_local_supabase.py` tolerance for already-deleted users (`30488ba`). Also fixed unescaped apostrophes that failed `next build` (`755d89e`). Standing rules added: fresh-clone verification and `next build` (STANDARDS.md `490c4af`, MEMORY.md `b9c7978`).
+
+---
+
+## 2026-08-08 — docs: reconciliation pass across .agent/ *(backfilled 2026-10-06)*
+
+**Changed:** ARCHITECTURE (direct browser→FastAPI calls, not a proxy; Gemini OCR quota corrected to 20/day; verify flow rewritten; four stale open decisions locked), STANDARDS, GAPS, FEATURES (FEAT-028–035 backfilled), SCOPE (phase statuses), `api-docs/voyage.md` rerank section. Commits `68690ae`, `48c1be5`.
+
+---
+
+## 2026-08-07 — feature: settings batch 3 — data export (FEAT-034) and permanent account deletion (FEAT-035) *(backfilled 2026-10-06)*
+
+**Changed:**
+- `GET /export/conversations?format=json|markdown`: all conversations, messages, and citations, deliberately **unfiltered** (it includes `unsupported` citations). CORS now exposes `Content-Disposition`. Commit `f5d8d32`.
+- `DELETE /account`: removes Storage objects under `{user_id}/` in `uploads` → `figures` → `avatars`, then deletes the auth user (all 6 tables cascade). A mid-sequence failure leaves the account intact. The client requires the current password plus typed-email confirmation. SCHEMA.md backfilled with `usage_counters` and `avatars`. Commit `e765e34`.
+**Rollback:** revert the commits. No schema changes.
+
+---
+
+## 2026-08-06 — fix: settings batch 1 (FEAT-032) — email change requires the current password *(backfilled 2026-10-06)*
+
+**Context:** An audit found that Supabase completes an email change on an unauthenticated GET of the confirmation link (platform behaviour, independent of PKCE). An earlier same-day escalation to "session hijack" was wrong and has been corrected (`.agent/reviews/2026-08-05-settings-audit.md`).
+**Changed:** `requestEmailChange` now verifies the current password first. The same commit carries the settings batch 1 UI: profile, avatar, email, password, and sign-out of other sessions (`components/settings/*`, `hooks/use-current-user.ts`, `lib/supabase/profile.ts`, `e2e/settings.e2e.ts`). Commit `fbc4a5b`.
+
+---
+
+## 2026-08-04 — feature: chat UI modernization batches 1–3 (FEAT-029/030/031) *(backfilled 2026-10-06)*
+
+**Changed:**
+- Batch 1 (`d66373d`): copy message, relative timestamps, streaming cursor, scroll-to-bottom pill, keyboard shortcuts, document scope chips, citation hover preview. Frontend only.
+- Batch 2 (`94289f6`): stop generation (aborts the fetch; the server discards the turn exactly as for a disconnect) and regenerate (appends a new turn, since no message-update endpoint exists).
+- Batch 3 (`05b406b`): `POST /conversations/{id}/rename` (doesn't bump `updated_at`) and `DELETE /conversations/{id}` (FK cascade), with dialogs in the conversation list and chat header.
+
+---
+
+## 2026-08-04 — feature: `unverified` citation verdict, distinct from `unsupported` (FEAT-028) *(backfilled 2026-10-06)*
+
+**Context:** Every verification failure (network error, quota, malformed response) was coerced to `unsupported` and dropped, conflating "checked and false" with "never checked."
+**Changed:** The verifier's infrastructure-failure paths now return `unverified`, which is kept and shown with its own dashed style. Fabricated-quote detection stays `unsupported`. Migration `20260803_001_citation_verdict_unverified.sql` (`alter type verdict add value`). Commit `0984082`.
+**Rollback:** Postgres can't drop an enum value. Reverting the code is enough, since nothing writes `unverified` afterwards.
 
 ---
 

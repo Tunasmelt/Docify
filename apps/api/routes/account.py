@@ -152,7 +152,7 @@ def _storage_deletion_failed(user_id: str, *, bucket: str) -> JSONResponse:
 # whichever user_id the (already-valid) JWT resolves to — the same trust
 # boundary every other route in this API already rests on.
 @router.delete("/account", status_code=204)
-async def delete_account(request: Request):
+def delete_account(request: Request):
     user_id = request.state.user_id
     client = get_service_role_client()
 

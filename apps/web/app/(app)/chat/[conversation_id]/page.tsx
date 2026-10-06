@@ -10,6 +10,7 @@ import { ThemeToggle } from "@/components/theme-toggle";
 import { UserMessageBubble, AssistantMessageBubble } from "@/components/chat/message-bubble";
 import { LoadingStages, type StreamingStage } from "@/components/chat/loading-stages";
 import { QuestionInput } from "@/components/chat/question-input";
+import { PagePreviewDialog } from "@/components/chat/page-preview-dialog";
 import { SourcePanel } from "@/components/chat/source-panel";
 import { ScrollToBottomPill } from "@/components/chat/scroll-to-bottom-pill";
 import { DocumentScopeChips } from "@/components/chat/document-scope-chips";
@@ -77,6 +78,7 @@ export default function ChatPage({ params }: { params: { conversation_id: string
   const [streamingId, setStreamingId] = React.useState<string | null>(null);
   const [streamingStage, setStreamingStage] = React.useState<StreamingStage | null>(null);
   const [activeCitation, setActiveCitation] = React.useState<Citation | null>(null);
+  const [previewCitation, setPreviewCitation] = React.useState<Citation | null>(null);
   const [mobileMenuOpen, setMobileMenuOpen] = React.useState(false);
   const [recentConversations, setRecentConversations] = React.useState<ApiConversation[] | null>(null);
   const [docNamesById, setDocNamesById] = React.useState<Map<string, string>>(new Map());
@@ -642,13 +644,9 @@ export default function ChatPage({ params }: { params: { conversation_id: string
         <SourcePanel
           citation={activeCitation}
           onClose={() => setActiveCitation(null)}
-          onOpenInDocument={(citation) =>
-            // Real per-page document viewing is Phase 4+ scope (not part
-            // of this wiring pass — no route/viewer exists yet to open).
-            // eslint-disable-next-line no-console
-            console.log("[not yet built] open document at location", citation.location)
-          }
+          onOpenInDocument={setPreviewCitation}
         />
+        <PagePreviewDialog citation={previewCitation} onClose={() => setPreviewCitation(null)} />
       </div>
       <RenameConversationDialog
         target={renameOpen && conversationId ? { id: conversationId, currentTitle: title ?? "" } : null}

@@ -26,4 +26,14 @@ export interface ApiCitation {
    * absent entirely (not `null`) on text/table citations, per
    * `response_model_exclude_none=True` on both routes. */
   figure_url?: string;
+  /** The cited chunk's position on its page (PDF points, top-left origin).
+   * Omitted for sources with no real location (DOCX/HTML). */
+  bbox?: CitationBBox;
+}
+
+export interface CitationBBox {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
 }

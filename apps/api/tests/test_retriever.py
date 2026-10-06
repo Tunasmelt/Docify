@@ -1250,3 +1250,141 @@ def test_real_mixed_provider_retrieval_surfaces_chunks_from_either_provider(admi
     admin.table("documents").delete().eq("id", document_id).execute()
 
     assert all_passed
+
+
+# --- FTS term matching (2026-10-06, migration 20261006_001) -------------------
+# websearch_to_tsquery ANDs every term, so a natural-language question only
+# matched chunks containing ALL of its words — in practice, almost none.
+# Any term now matches, and chunks matching more terms rank higher.
+
+
+def _fts(admin, question: str, user_id: str, document_id: str) -> list[dict]:
+    return admin.rpc(
+        "match_chunks_by_fts",
+        {"query_text": question, "match_user_id": user_id, "match_document_ids": [document_id], "match_limit": 10},
+    ).execute().data
+
+
+def test_fts_matches_a_natural_question_when_only_some_terms_appear(admin, user_a):
+    user_id, _token = user_a
+    document_id = _create_document(admin, user_id, "fts-any-term.pdf")
+    chunk_id = _insert_chunk(
+        admin, document_id=document_id, user_id=user_id, chunk_index=0,
+        content="Third-quarter revenue totaled 4.2 million dollars.", embedding=_vector_along_dimension(0),
+    )
+
+    rows = _fts(admin, "How much revenue did the company make, and what drove the growth?", user_id, document_id)
+
+    assert [row["id"] for row in rows] == [chunk_id]
+
+
+def test_fts_ranks_chunks_matching_more_terms_higher(admin, user_a):
+    user_id, _token = user_a
+    document_id = _create_document(admin, user_id, "fts-rank.pdf")
+    one_term = _insert_chunk(
+        admin, document_id=document_id, user_id=user_id, chunk_index=0,
+        content="Revenue is discussed in a later section.", embedding=_vector_along_dimension(0),
+    )
+    two_terms = _insert_chunk(
+        admin, document_id=document_id, user_id=user_id, chunk_index=1,
+        content="Revenue growth in the third quarter was strong.", embedding=_vector_along_dimension(1),
+    )
+
+    rows = _fts(admin, "revenue growth", user_id, document_id)
+
+    assert [row["id"] for row in rows] == [two_terms, one_term]
+
+
+def test_fts_question_of_only_stopwords_or_punctuation_matches_nothing_without_erroring(admin, user_a):
+    user_id, _token = user_a
+    document_id = _create_document(admin, user_id, "fts-stopwords.pdf")
+    _insert_chunk(
+        admin, document_id=document_id, user_id=user_id, chunk_index=0,
+        content="What is this about?", embedding=_vector_along_dimension(0),
+    )
+
+    assert _fts(admin, "what is it?", user_id, document_id) == []
+    assert _fts(admin, "!!! ' \\ ''", user_id, document_id) == []
+
+
+# --- Vector search under tenant filtering (2026-10-06, migration 20261006_002) -
+# The HNSW index returns the ~40 nearest chunks across ALL tenants before the
+# user_id/document filter runs. With another tenant's chunks crowding the
+# query's neighbourhood, a user got few or none of their own chunks back.
+
+_HNSW_SCENARIO_SQL = """
+insert into auth.users (id, instance_id, aud, role, email) values
+ (%(a)s, '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', %(a_email)s),
+ (%(b)s, '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', %(b_email)s);
+insert into documents (id, user_id, filename, storage_path, mime_type, size_bytes) values
+ (%(doc_a)s, %(a)s, 'a.pdf', 'uploads/a/a.pdf', 'application/pdf', 1),
+ (%(doc_b)s, %(b)s, 'b.pdf', 'uploads/b/b.pdf', 'application/pdf', 1);
+select setseed(0.42);
+-- user B: 400 varied chunks right next to the query vector (distance ~0.016)
+insert into chunks (document_id, user_id, chunk_index, element_type, page_number, content, embedding)
+select %(doc_b)s, %(b)s, g, 'text', 1, 'b ' || g,
+  (select array_agg(case when i = 1 then 1.0 else (random() - 0.5) * 0.02 end)::vector(1024)
+   from generate_series(1, 1024 + g * 0) i)
+from generate_series(1, 400) g;
+-- user A: 5 chunks a little further away (distance ~0.12) than all of B's
+insert into chunks (document_id, user_id, chunk_index, element_type, page_number, content, embedding)
+select %(doc_a)s, %(a)s, g, 'text', 1, 'a ' || g,
+  (select array_agg(case when i = 1 then 1.0 else (random() - 0.5) * 0.06 end)::vector(1024)
+   from generate_series(1, 1024 + g * 0) i)
+from generate_series(1, 5) g;
+analyze chunks;
+"""
+
+
+def test_vector_search_returns_a_users_own_chunks_even_when_other_tenants_crowd_the_index(require_local_supabase):
+    import uuid
+
+    import psycopg
+
+    from tests._local_supabase import LOCAL_POSTGRES_DSN
+
+    ids = {name: str(uuid.uuid4()) for name in ("a", "b", "doc_a", "doc_b")}
+    ids["a_email"] = f"hnsw-a-{ids['a'][:8]}@example.com"
+    ids["b_email"] = f"hnsw-b-{ids['b'][:8]}@example.com"
+
+    query_vector = "(select array_agg(case when i = 1 then 1.0 else 0 end)::vector(1024) from generate_series(1, 1024) i)"
+
+    # Other tests delete their chunks without vacuuming; dead entries left in
+    # the HNSW graph (many of them axis-aligned test vectors) make its
+    # traversal order-dependent. Start from a clean graph.
+    with psycopg.connect(LOCAL_POSTGRES_DSN, autocommit=True) as conn:
+        conn.execute("vacuum chunks")
+
+    with psycopg.connect(LOCAL_POSTGRES_DSN) as conn:
+        try:
+            with conn.cursor() as cur:
+                for statement in filter(str.strip, _HNSW_SCENARIO_SQL.split(";")):
+                    cur.execute(statement, ids)
+                # Make the planner use the HNSW index, as it does at production scale.
+                for setting in ("enable_seqscan", "enable_bitmapscan", "enable_sort"):
+                    cur.execute(f"set local {setting} = off")
+
+                # Control: without iterative scan, the crowding bug is present.
+                cur.execute("set local hnsw.iterative_scan = off")
+                cur.execute(
+                    f"""
+                    select count(*) from (
+                      select c.id from chunks c
+                      where c.user_id = %(a)s and c.document_id = any(array[%(doc_a)s]::uuid[])
+                        and c.embedding_provider = 'voyage'
+                      order by c.embedding <=> {query_vector} limit 8) s
+                    """,
+                    ids,
+                )
+                without_iterative_scan = cur.fetchone()[0]
+
+                cur.execute(
+                    f"select id from match_chunks_by_vector({query_vector}, %(a)s, array[%(doc_a)s]::uuid[], 8, 'voyage')",
+                    ids,
+                )
+                returned = cur.fetchall()
+        finally:
+            conn.rollback()
+
+    assert without_iterative_scan < 5, "test setup: other tenants' chunks did not crowd out user A's"
+    assert len(returned) == 5, f"user A has 5 chunks in scope but vector search returned {len(returned)}"

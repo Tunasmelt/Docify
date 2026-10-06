@@ -995,3 +995,71 @@ def test_stream_real_disconnect_during_verification_still_persists_consistently(
         assert len(citations) == 1
         assert citations[0]["verdict"] == "unverified", "the in-flight call's real fail-safe verdict must persist unmodified"
         assert citations[0]["message_id"] in {m["id"] for m in messages}
+
+
+# 2026-10-06: the stream's final answer removes unsupported claims too, same
+# rule as POST /query (see test_query.py's _remove_unsupported_claims tests).
+def test_stream_final_answer_removes_the_unsupported_sentence(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id = _ingest_doc_with_content(app_client, admin, user_id, token, "doc.pdf", "Revenue grew 12%.")
+    chunk_row = _real_chunk_row(admin, document_id)
+    final = GenerateStreamResult(
+        answer="The outlook is fabricated [1].", cited_indices=[1], hallucinated_markers=[],
+        model="gemini-3.6-flash", input_tokens=1, output_tokens=1, latency_ms=1.0,
+    )
+    _override(
+        retriever=FakeRetriever([_retrieved_chunk(document_id, chunk_row)]),
+        generator=FakeStreamingGenerator(["The outlook is fabricated [1]."], final),
+        verifier=type("V", (), {"verify_batch": staticmethod(lambda pairs: [_verdict(VerdictLabel.UNSUPPORTED, None) for _ in pairs])})(),
+    )
+
+    with app_client.stream(
+        "POST", "/query/stream", json={"question": "q", "document_ids": [document_id]},
+        headers={"Authorization": f"Bearer {token}"},
+    ) as response:
+        events = _parse_sse(response)
+
+    resolved = next(data for name, data in events if name == "citations-resolved")
+    assert "fabricated" not in resolved["answer"]
+    assert "1 statement was removed" in resolved["answer"]
+    assert resolved["citations"] == []
+
+
+# 2026-10-06: follow-up questions are rewritten for retrieval on the stream
+# path too (same _search_question as POST /query).
+def test_stream_follow_up_searches_with_the_rewritten_question(app_client, admin, user_a):
+    from tests.test_query import PassthroughRewriter
+
+    user_id, token = user_a
+    document_id = _ingest_doc_with_content(app_client, admin, user_id, token, "doc.pdf", "Q2 revenue was $3.6M.")
+    chunk_row = _real_chunk_row(admin, document_id)
+    seeded = admin.rpc(
+        "create_query_turn",
+        {
+            "p_user_id": user_id, "p_conversation_id": None, "p_document_ids": [document_id],
+            "p_question": "What was Q3 revenue?", "p_answer_content": "It was $4.2M.",
+            "p_answer_raw_content": "It was $4.2M.", "p_retrieved_chunk_ids": [],
+            "p_answer_metadata": {}, "p_citations": [],
+        },
+    ).execute().data[0]
+
+    retriever, rewriter = FakeRetriever([_retrieved_chunk(document_id, chunk_row)]), PassthroughRewriter("What was Q2 revenue?")
+    final = GenerateStreamResult(
+        answer="Q2 was $3.6M [1].", cited_indices=[1], hallucinated_markers=[],
+        model="gemini-3.6-flash", input_tokens=1, output_tokens=1, latency_ms=1.0,
+    )
+    _override(
+        retriever=retriever, rewriter=rewriter,
+        generator=FakeStreamingGenerator(["Q2 was $3.6M [1]."], final),
+        verifier=type("V", (), {"verify_batch": staticmethod(lambda pairs: [_verdict(VerdictLabel.SUPPORTED, "Q2 revenue") for _ in pairs])})(),
+    )
+
+    with app_client.stream(
+        "POST", "/query/stream",
+        json={"question": "And for Q2?", "document_ids": [document_id], "conversation_id": seeded["conversation_id"]},
+        headers={"Authorization": f"Bearer {token}"},
+    ) as response:
+        _parse_sse(response)
+
+    assert retriever.calls[0]["question"] == "What was Q2 revenue?"
+    assert rewriter.calls[0]["question"] == "And for Q2?"

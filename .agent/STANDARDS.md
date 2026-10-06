@@ -10,7 +10,7 @@ Coding standards and conventions for this project. Violations are flagged in GAP
 - Frontend: `kebab-case.tsx` for files, `PascalCase` for component names within them
   - `components/chat/message-bubble.tsx` exports `MessageBubble`
 - Backend Python: `snake_case.py` for files, `snake_case` for functions, `PascalCase` for classes
-  - `services/embedder.py` exports `class VoyageEmbedder:` and `def embed_chunks(...)`
+  - `services/embedder.py` exports `class Embedder:` with `def embed(...)`
 - Migrations: `YYYYMMDD_NNN_short_description.sql` — e.g. `20260722_001_initial.sql`
 
 ### Symbols
@@ -20,7 +20,7 @@ Coding standards and conventions for this project. Violations are flagged in GAP
 - **Hooks:** `useSomething` prefix
 - **Python classes:** `PascalCase`, one class per file for services
 - **Test files:**
-  - Frontend: `foo.test.ts` for unit, `foo.e2e.ts` for integration/e2e (Playwright) — corrected 2026-08-07, all 12 real Playwright files in `apps/web/e2e/` use `.e2e.ts`; `.spec.ts` was the originally planned suffix and was never actually used
+  - Frontend: `foo.e2e.ts` for Playwright e2e (`apps/web/e2e/`). There is no frontend unit-test runner yet; if one is added, use `foo.test.ts`
   - Backend: `test_foo.py` for pytest
 
 ### Database
@@ -32,7 +32,9 @@ Coding standards and conventions for this project. Violations are flagged in GAP
 
 ### Env vars
 - `SCREAMING_SNAKE_CASE`
-- Grouped by service prefix: `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `VOYAGE_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`
+- Every variable the code reads must appear in that app's `.env.example`. Current set:
+  - `apps/api`: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_JWT_SECRET` (legacy, unused), `VOYAGE_API_KEY`, `GEMINI_API_KEY`, `OCR_SPACE_API_KEY`, `TESSERACT_CMD` (optional), `FRONTEND_ORIGINS` (comma-separated CORS origins). `RENDER_GIT_COMMIT` is injected by Render, never set by hand
+  - `apps/web`: `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `NEXT_PUBLIC_API_URL`
 - Every app has `.env.example` at its root listing all required vars
 
 ---
@@ -40,9 +42,7 @@ Coding standards and conventions for this project. Violations are flagged in GAP
 ## Structure
 
 ### Frontend directory layout
-**Corrected 2026-08-07** — `app/api/` was planned as a thin-proxy layer; it was never built
-(see ARCHITECTURE.md's System diagram). The browser calls FastAPI directly via `lib/api/`'s
-`apiFetch()`, which is why FastAPI's own CORS middleware exists at all.
+The browser calls FastAPI directly via `lib/api/`'s `apiFetch()` — there is no Next.js proxy layer.
 ```
 apps/web/
 ├── app/                       Next.js App Router pages
@@ -50,7 +50,7 @@ apps/web/
 │   ├── (app)/                 authenticated pages (protected by middleware)
 │   ├── auth/callback/         Supabase Auth PKCE callback (the one real route handler
 │   │                          in this app — not a FastAPI proxy)
-│   └── api/                   empty, unused — no proxy route was ever added here
+│   └── api/                   placeholder only — no Next.js API routes exist
 ├── components/
 │   ├── ui/                    shadcn primitives — never modify these directly
 │   ├── {feature}/             feature-scoped components
@@ -93,6 +93,8 @@ apps/api/
 
 ### Backend
 - **Every route wraps errors in the standard envelope** (see API_CONTRACT.md)
+- **Every service-role query is scoped by the JWT-derived `user_id`.** The service role bypasses RLS, so this filter is the tenant boundary for FastAPI — a query without it is a cross-tenant leak (SCHEMA.md §Service-role client discipline)
+- **Route handlers that call the Supabase client or any vendor SDK are plain `def`, never `async def`.** Those clients block; in an `async def` handler they freeze the event loop for every user. An `async def` route must `await asyncio.to_thread(...)` for each blocking call (`tests/test_event_loop.py` enforces this)
 - Use FastAPI's exception handlers, not per-route try/except
 - Custom exceptions live in `apps/api/errors.py` with codes matching the API contract
 - Never leak stack traces or `str(exception)` to the client
@@ -131,13 +133,15 @@ Levels: `DEBUG` · `INFO` · `WARN` · `ERROR` · `FATAL`
 
 ## Testing
 
-Every feature has tests at up to three levels:
+Every feature has tests at the levels that apply:
 
 | Level | Tool | What it tests | Where |
 |---|---|---|---|
-| Unit | vitest / pytest | Pure functions, no I/O | `*.test.ts`, `test_*.py` next to source |
-| Integration | vitest / pytest with test DB | Route + service against real Supabase local instance | `*.spec.ts`, `test_*_integration.py` |
-| E2E | Playwright | Full user journey | `e2e/*.e2e.ts` at frontend root |
+| Unit | pytest | Pure functions, fakes for vendor APIs | `apps/api/tests/test_*.py` |
+| Integration | pytest + local Supabase (`supabase start`) | Routes, RPCs, RLS, Storage against a real local stack (skipped if it isn't running) | `apps/api/tests/test_*.py` |
+| E2E | Playwright | Full user journeys against both apps + local Supabase | `apps/web/e2e/*.e2e.ts` |
+
+Run: `cd apps/api && uv run pytest` · `cd apps/web && pnpm e2e`. See `docs/DEVELOPMENT.md` for the local stack.
 
 ### Rules
 - **Tests written before implementation** using acceptance criteria from FEATURES.md
@@ -145,8 +149,9 @@ Every feature has tests at up to three levels:
 - **No mocking of Supabase in integration tests** — use `supabase start` for a local instance
 - **E2E tests hit real backend via Playwright's page** — not a mock; run against `npm run dev` for both apps
 - **Snapshot tests only for stable UI primitives** — never for evolving business components
-- **A real `git clone` (or `git stash`) + fresh install + build/test is required before closing out any multi-file feature — `tsc --noEmit`/`pytest`/`next dev`/Playwright-against-a-local-dev-server are not sufficient on their own.** Added 2026-08-07 after a real, project-wide gap: those four checks all run against the *working tree*, which during active development always includes uncommitted and untracked files alongside committed ones — none of them can distinguish "this file exists on disk" from "this file is actually in git history." A fresh-clone check closes that blind spot; nothing else in this stack does. Full incident writeup: `.agent/MEMORY.md`'s 2026-08-07 anti-pattern entry (four independent missing-commit bugs found across four recent feature commits, none caught by any prior verification pass).
-- **Frontend verification must include a real `next build`, not just `next dev`/`tsc --noEmit`.** Added 2026-08-07 for the same reason as above: `next build` runs ESLint as a hard, build-blocking gate (`react/no-unescaped-entities` and others); `next dev` only warns, and `tsc --noEmit` doesn't run ESLint at all. `next build` had never actually been run against this repo before this date — six files were failing it, three of them pre-dating this session entirely. "The dev server runs" and "the production build succeeds" are different guarantees; only the first was ever being checked.
+- **Verify from a fresh clone before closing a multi-file feature.** `pytest`, `tsc`, `next dev`, and Playwright all run against the working tree and cannot tell that a file was never committed. Clone (or `git stash -u`), install, build, and test (MEMORY.md §Anti-patterns 2026-08-07).
+- **Frontend verification includes `next build`.** It runs ESLint as a blocking gate; `next dev` only warns and `tsc --noEmit` skips ESLint.
+- **Verify deploys, not just commits.** After pushing a backend fix, check `GET /health`'s `commit` matches (MEMORY.md §Anti-patterns 2026-08-18).
 
 ---
 
@@ -167,13 +172,13 @@ Every feature has tests at up to three levels:
 - **type:** `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `infra`
 - **scope:** `web`, `api`, `schema`, `docs`, `ci`, or `FEAT-NNN`
 - **summary:** imperative, lowercase, no trailing period, <72 chars
-- **agent-tag:** one of `[claude-code]`, `[claude-design]`, `[gemini]`, `[codex]`
+- **agent-tag:** the agent that made the commit — in practice `[claude-code]`; `[codex]` for external review fixes
 
 Examples:
 ```
-feat(api): add /ingest endpoint with docling parse [claude-code]
-fix(web): resolve chat scroll jump on new message [claude-design]
-chore(api): pin voyageai to 0.3.4 [gemini]
+feat(api): add /ingest endpoint with pdfplumber parse [claude-code]
+fix(web): resolve chat scroll jump on new message [claude-code]
+chore(api): bump voyageai to 0.3.7 [claude-code]
 test(api): add citation verifier edge cases [codex]
 docs(schema): add rls policy for figures storage bucket [claude-code]
 ```
@@ -183,12 +188,13 @@ docs(schema): add rls policy for figures storage bucket [claude-code]
 - Every PR that changes behavior updates CHANGELOG.md
 - Every PR that changes SCHEMA.md or ARCHITECTURE.md locked decisions has human sign-off in the description
 - No PR merges without `/gap-check` clean
+- There is no CI yet (SCOPE.md Phase 5), so run `uv run pytest` and `pnpm build` locally before opening a PR
 
 ### Never do
-- Commit directly to `main`
+- Commit directly to `master`
 - Commit `.env` files or real API keys
 - Force-push shared branches
-- Rewrite history on `main`
+- Rewrite history on `master`
 
 ---
 
@@ -201,7 +207,7 @@ Explicit forbidden patterns. `/gap-check` looks for these:
 - Any-typed values in TS (`: any`) except at explicit API boundaries with a comment explaining why
 - `# type: ignore` in Python without a comment explaining why
 - Direct Supabase queries from `apps/web` for user-owned tables (`documents`, `chunks`, `conversations`, `messages`, `citations`) that could go through `apps/api` — the frontend should be a thin client. (Pure Supabase Auth/Storage operations — login, session management, avatar upload — are the one legitimate exception; those go directly from the browser to Supabase by design, see ARCHITECTURE.md's System diagram.)
-- Business logic in Next.js API routes — **corrected 2026-08-07: this app has no Next.js API routes at all** (`app/api/` is empty; the browser calls FastAPI directly). If one is ever added, it must stay a thin proxy — auth check + forward, nothing more.
+- Business logic in Next.js API routes. None exist today; if one is ever added it must stay a thin proxy (auth check + forward).
 - Skipping `/api-check` before writing external API code
 - Storing API keys anywhere other than env vars
 - Committing before running `/gap-check` locally
@@ -213,4 +219,11 @@ Explicit forbidden patterns. `/gap-check` looks for these:
 - Frontend: `pnpm` preferred over `npm` or `yarn`. Lockfile committed.
 - Backend: `uv` (fast, modern) preferred over `pip`. `pyproject.toml` + `uv.lock` committed.
 - **Never auto-install packages.** Agent lists what it wants, human confirms.
-- Pin exact versions for production dependencies. Ranges OK for dev dependencies.
+- Backend: bound every dependency to a compatible range in `pyproject.toml` (`>=x.y,<x.z`), with a comment when a floor exists for a security fix. Exact versions come from `uv.lock`.
+- Frontend: framework packages whose minor versions must match (`next`, `eslint-config-next`, `@supabase/*`, `@playwright/test`) are pinned exactly; others use `^`. Exact versions come from `pnpm-lock.yaml`.
+- Lockfiles are always committed and regenerated with the tool (`uv lock`, `pnpm install`), never edited by hand.
+
+## Tooling gaps
+
+- Python has no linter/formatter configured (`ruff` is only in `.gitignore`). Until one is added, match the surrounding style.
+- No CI pipeline exists (tracked in SCOPE.md Phase 5).

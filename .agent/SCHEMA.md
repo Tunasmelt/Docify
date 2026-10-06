@@ -2,7 +2,7 @@
 
 Source of truth for the Postgres schema. Changes to this file require: (1) a migration file added, (2) a CHANGELOG entry with rollback SQL, (3) human confirmation before merge.
 
-**Multi-tenancy is enforced at the DB layer via RLS.** Every user-owned table has `user_id uuid not null references auth.users(id) on delete cascade`, and every such table has policies that restrict rows to `auth.uid() = user_id`. Application code must not bypass this.
+**Multi-tenancy.** Every user-owned table has `user_id uuid not null references auth.users(id) on delete cascade` and RLS policies restricting rows to `auth.uid() = user_id`. RLS protects every request made with the anon key + a user JWT (the browser's direct Supabase calls). **FastAPI uses the service-role key, which bypasses RLS** — on that path the explicit `user_id` filter in every query and RPC is the only tenant boundary. See ARCHITECTURE.md §Multi-tenancy and §Service-role client discipline below.
 
 ---
 
@@ -23,13 +23,9 @@ create type document_status     as enum ('uploaded', 'parsing', 'embedded', 'rea
 create type element_type       as enum ('text', 'heading', 'table', 'figure', 'caption', 'list');
 create type message_role       as enum ('user', 'assistant');
 create type verdict            as enum ('supported', 'partial', 'unsupported', 'unverified');
--- 'unverified' added 2026-08-03 (migrations/20260803_001_citation_verdict_unverified.sql,
--- `alter type verdict add value`) -- distinct from 'unsupported': used only when
--- verification genuinely could not run (Gemini call errored, timed out, or returned a
--- malformed/non-schema response), never as a substitute for a real 'unsupported' verdict
--- or for a citation the recovery cascade correctly dropped before verification. See
--- services/verifier.py's VerdictLabel docstring and API_CONTRACT.md's POST /query entry.
-create type embedding_provider as enum ('voyage', 'gemini');  -- 2026-07-31, see chunks.embedding_provider below
+-- 'unverified' = verification could not run (Gemini error/timeout/malformed response);
+-- never a substitute for a real 'unsupported' verdict. See services/verifier.py.
+create type embedding_provider as enum ('voyage', 'gemini');  -- see chunks.embedding_provider below
 ```
 
 ---
@@ -44,7 +40,7 @@ create table documents (
   id             uuid primary key default gen_random_uuid(),
   user_id        uuid not null references auth.users(id) on delete cascade,
   filename       text not null,
-  storage_path   text not null,             -- uploads/{user_id}/{uuid}.pdf
+  storage_path   text not null,             -- uploads/{user_id}/{uuid}.{ext}
   mime_type      text not null,
   size_bytes     bigint not null,
   page_count     int,                       -- null until parsed
@@ -72,11 +68,11 @@ create table chunks (
   chunk_index        int not null,              -- ordinal position within document
   element_type       element_type not null,
   page_number        int not null,
-  bbox               jsonb,                     -- {x0,y0,x1,y1} on the source page
+  bbox               jsonb,                     -- {x0,y0,x1,y1}: union of the chunk's elements on its page
   content            text not null,             -- the extracted text
   figure_path        text,                      -- storage path if element_type='figure'
   embedding          vector(1024) not null,
-  embedding_provider embedding_provider not null default 'voyage',  -- 2026-07-31, see note below
+  embedding_provider embedding_provider not null default 'voyage',  -- see note below
   ts                 tsvector generated always as (to_tsvector('english', content)) stored,
   metadata           jsonb not null default '{}'::jsonb,
   created_at         timestamptz not null default now(),
@@ -91,18 +87,20 @@ create index chunks_embedding_idx on chunks
   with (m = 16, ef_construction = 64);
 ```
 
-**`embedding_provider` (2026-07-31, migration `20260731_001_embedding_provider_fallback.sql`) — CRITICAL constraint, not an implementation detail.** `services/embedder.py`'s `Embedder.embed()` falls back to Gemini (`gemini-embedding-2`) for a batch only once Voyage's own SDK-internal retries (`RateLimitError`/`ServiceUnavailableError`/`Timeout`, `MAX_RETRIES=3`) are genuinely exhausted for that batch — the real motivating scenario is this account's empirically-observed 3 RPM free-tier ceiling (`.agent/MEMORY.md`) being hit mid-ingest, not a whole-document failure. Tracking is per CHUNK, not per document, because that's the real failure granularity: a single document's chunks can legitimately end up split across both providers if only some batches hit the fallback.
+**`embedding_provider` — critical constraint.** `services/embedder.py` falls back to Gemini (`gemini-embedding-2`, truncated to 1024 dims) for a batch only once Voyage's own retries are exhausted (typically its 3 RPM free-tier ceiling mid-ingest). Tracking is per chunk because one document's chunks can be split across both providers.
 
-**A Voyage-embedded vector and a Gemini-embedded vector are NOT comparable via cosine similarity, even though both are `vector(1024)`** — they are points in two different, unrelated embedding spaces that merely happen to share a dimension count. `match_chunks_by_vector` takes an explicit `match_provider` parameter and filters on it; `services/retriever.py`'s `Retriever.retrieve()` runs one independent vector search PER distinct provider actually present in a given `document_ids` scope (via `distinct_embedding_providers`), and RRF-fuses all of them together with FTS purely on RANK — it never compares a raw distance across the filter. See `.agent/MEMORY.md`'s standing anti-pattern entry before touching any of this.
+**A Voyage vector and a Gemini vector are not comparable by cosine similarity**, even though both are `vector(1024)` — they live in unrelated embedding spaces. `match_chunks_by_vector` takes a `match_provider` parameter and filters on it; `Retriever.retrieve()` runs one vector search per provider present (via `distinct_embedding_providers`) and fuses them with FTS by rank only. Read `.agent/MEMORY.md §Anti-patterns` (2026-07-31) before touching this.
 
-**`page_number`'s real meaning depends on the source document's format (FEAT-020, 2026-07-27), confirmed live per format, not assumed:**
-- **PDF:** the real PDF page number (unchanged, as before FEAT-020).
-- **PPTX:** the real slide index (1-indexed) — Docling reports this via the same `item.prov[0].page_no` mechanism as PDF; confirmed against a real 3-slide fixture that `page_no` genuinely tracks slide position. Column name stays `page_number` for schema/API stability, but this is really "slide number" for a PPTX-sourced chunk.
-- **DOCX / HTML:** always `1`, for every chunk in the document. Confirmed live, not assumed: Docling's DOCX and HTML backends never populate `item.prov` at all — no element, of any type, in any DOCX/HTML document ever carries page or bbox information. There is no real page/pagination concept for Docling to report for these two formats (`doc.pages` itself is empty). `page_number` stayed `not null` (no migration) — `1` is an explicit, honest sentinel meaning "no real location available," not a fabricated page number. `bbox` likewise gets a zero-sized `{x0:0,y0:0,x1:0,y1:0}` sentinel for these two formats (the column is already nullable, but a fixed zero-box was chosen over `null` for consistency with how OCR-recovered PDF elements already always populate some bbox).
+**`page_number` and `bbox` depend on the source format** (set by `services/parser.py`):
+- **PDF:** the real 1-indexed page number and real bbox.
+- **PPTX:** the real 1-indexed slide number (the column name stays `page_number` for API stability). Bbox comes from the shape's position.
+- **DOCX / HTML:** these formats have no pagination, so every chunk gets `page_number = 1` and a zero-size sentinel bbox `{x0:0,y0:0,x1:0,y1:0}` meaning "no location available".
 
-**Frontend gap closed (2026-07-27 follow-up).** The mime-type gap noted above is fixed: `documents.mime_type` now flows all the way to the client (`document_mime_type` on `CitationResponse`/`ApiCitation`) via a new migration (`match_chunks_by_vector`/`match_chunks_by_fts` gained a `document_mime_type` output column — required `DROP FUNCTION` first, confirmed live that Postgres does not allow `CREATE OR REPLACE FUNCTION` to change `RETURNS TABLE` columns) and `CITATION_JOIN_COLUMNS`' `documents(filename,mime_type)` embed. `lib/chat/parse-message.ts`'s `citationLocation()` is the one place the format→display decision is made (PDF/unknown → "page", PPTX → "slide", DOCX/HTML → `null`, omitted entirely); every display site (`source-panel.tsx`, `message-bubble.tsx`, `citation-marker.tsx`) reads `citation.location` instead of a raw page number. Verified in a real browser against all 4 formats (screenshots + rendered text captured, not just code review).
+The frontend turns this into a display label in one place — `apps/web/lib/chat/parse-message.ts`'s `citationLocation()` (PDF → "page", PPTX → "slide", DOCX/HTML → omitted) — using `document_mime_type`, which the retrieval functions return alongside each chunk.
 
-**`chunks.metadata->>'association_method'` reaches the API but not the frontend yet (2026-08-02).** Same real gap, same fix as the mime-type one above: `association_method` (chunker.py's own output — `"explicit"`/`"heuristic"`/`"unmatched"`/null, see `services/chunker.py`'s `Chunk` dataclass) was already being computed and written into every chunk row's `metadata` at ingest time (`db/queries.py`'s `build_chunk_rows`), but `match_chunks_by_vector`/`match_chunks_by_fts` never selected it — real, free citation-confidence information (was this table/figure caption a confident explicit parser link, or a weaker chunker.py proximity guess?) silently discarded at the retrieval boundary. Closed via migration `20260802_002_citation_association_method.sql` (same `DROP FUNCTION` + `CREATE FUNCTION` requirement, `RETURNS TABLE` can't be altered in place) — `association_method` now flows through `RetrievedChunk` (`services/retriever.py`) to `CitationResponse.association_method` (API_CONTRACT.md's `/query` entry has the full field semantics). **Deliberately stops at the API boundary for this pass** — no frontend display work (a badge/tooltip/filter is a real design decision, not a mechanical wiring task like the mime-type case above) — revisit when that UI work is actually scoped.
+**`metadata->>'section_heading'`** is the heading in effect for the chunk (also prefixed to `content` when the chunk doesn't start with it — see ARCHITECTURE.md's chunking decision).
+
+**`metadata->>'association_method'`** (`"explicit"` / `"heuristic"` / `"unmatched"` / null) records how a table/figure caption was linked to its element by the chunker. The retrieval functions return it and the API exposes it as `CitationResponse.association_method`; the frontend does not display it yet.
 
 ### `conversations`
 Grouping of Q&A over one or more documents.
@@ -152,9 +150,10 @@ create table citations (
   claim_span       text not null,           -- the specific claim being verified
   claim_start      int,                     -- char offset in message.content
   claim_end        int,
+  marker           int not null,            -- the inline [N] marker in the answer (20260725_001)
   verdict          verdict not null,
   supporting_quote text,                    -- verifier's quoted span from source
-  verifier_model   text not null,           -- e.g. 'claude-haiku-4-5-20251001'
+  verifier_model   text not null,           -- e.g. 'gemini-3.5-flash-lite'
   verified_at      timestamptz not null default now()
 );
 
@@ -164,14 +163,7 @@ create index citations_user_idx    on citations(user_id);
 ```
 
 ### `usage_counters`
-Postgres-backed daily rate-limit bookkeeping (FEAT-024 follow-up,
-`migrations/20260802_001_usage_counters.sql`) — added 2026-08-02 but
-missing from this doc until the settings batch 3 account-deletion audit
-(2026-08-06) found the gap by grepping migrations directly rather than
-trusting this file. One row per `(user_id, route, day)`. No RLS
-policies — RLS is enabled with zero policies defined, so only
-`service_role` (`BYPASSRLS`) can ever touch it; not user-facing, never
-queried by any client-facing route.
+Postgres-backed daily rate-limit counters (`rate_limit.py`). Daily limits live here rather than in slowapi's memory so they survive Render's idle spin-down. One row per `(user_id, route, day)`; `route` is a label (`"ingest"` covers `/ingest` + `/reindex`, `"query"` covers `/query` + `/query/stream`). RLS is enabled with **no** policies, so only the service role can read or write it.
 
 ```sql
 create table usage_counters (
@@ -182,15 +174,13 @@ create table usage_counters (
   primary key (user_id, route, day)
 );
 ```
-No separate `user_id` index — the composite primary key `(user_id,
-route, day)` already covers every real lookup this table serves
-(`increment_usage_counter`'s own atomic upsert-by-exact-key).
+The composite primary key covers every lookup; incremented atomically by `increment_usage_counter()`.
 
 ---
 
 ## Row-Level Security policies
 
-RLS is enabled on every user-owned table. The policy is uniform: `auth.uid() = user_id`. This is the load-bearing multi-tenancy mechanism.
+RLS is enabled on every user-owned table. The policy is uniform: `auth.uid() = user_id`. It is the tenant boundary for every request made with the anon key and a user JWT (the browser's direct Supabase access).
 
 ```sql
 -- documents
@@ -223,26 +213,35 @@ create policy citations_select on citations for select using (auth.uid() = user_
 -- Inserts come from service-role during /query
 ```
 
-**Service-role client discipline** (from FastAPI):
-- Service-role bypasses RLS. This is required because FastAPI writes rows on behalf of authenticated users.
-- Every INSERT and SELECT still includes `user_id` explicitly in the payload / WHERE clause.
-- Never expose the service-role key to the frontend or in any client-side code.
+**Service-role client discipline** (FastAPI):
+- The service role bypasses RLS. FastAPI needs it to write rows (chunks, messages, citations) that users cannot write directly.
+- Because RLS does not apply, **the explicit `user_id` filter is the only tenant boundary on this path.** Every INSERT includes the JWT-derived `user_id`; every SELECT/UPDATE/DELETE and every RPC (`match_chunks_by_vector`, `match_chunks_by_fts`, `distinct_embedding_providers`, `create_query_turn`, `increment_usage_counter`) is scoped by it. A query missing it is a cross-tenant leak, not a style issue.
+- Ownership lookups return the same 404 whether a row doesn't exist or belongs to another user.
+- Never expose the service-role key to the frontend or any client-side code.
+
+## Database functions (RPC)
+
+PostgREST cannot express vector/FTS ranking or multi-table transactions, so these live in SQL and are called via `client.rpc(...)`:
+
+| Function | Purpose | Defined / last changed |
+|---|---|---|
+| `match_chunks_by_vector(query_embedding, match_user_id, match_document_ids, match_limit, match_provider)` | Cosine search within one embedding provider (iterative HNSW scan, so filtering never starves results); returns chunk + filename, mime type, association_method | `20260724_001`, `20260727_001`, `20260731_001`, `20260802_002`, `20261006_002` |
+| `match_chunks_by_fts(query_text, match_user_id, match_document_ids, match_limit)` | Postgres FTS search; **any** question term matches, chunks matching more terms rank higher | `20260724_001`, `20260727_001`, `20260802_002`, `20261006_001` |
+| `fts_any_term_query(query_text)` | Builds an OR `tsquery` from the question's english-normalized lexemes; NULL (matches nothing) if the question is all stopwords | `20261006_001` |
+| `distinct_embedding_providers(match_user_id, match_document_ids)` | Which providers have chunks in a document scope | `20260731_001` |
+| `create_query_turn(p_user_id, ...)` | Atomically writes conversation (if new) + 2 messages + citations; a malformed citation is skipped with a warning rather than rolling back the turn | `20260724_002`, `20260725_002`, `20260731_002` |
+| `increment_usage_counter(p_user_id, p_route, p_day)` | Atomic upsert-and-increment for daily rate limits; executable by `service_role` only | `20260802_001` |
+
+Changing a function's `RETURNS TABLE` columns requires `DROP FUNCTION` + `CREATE FUNCTION` — Postgres does not allow `CREATE OR REPLACE` to change them.
 
 ---
 
 ## Supabase Storage buckets & policies
 
-Three buckets, all path-scoped `{user_id}/...`. `uploads`/`figures` are
-private, RLS-scoped to `user_id` on SELECT too; `avatars` (added
-2026-08-04, missing from this doc until the 2026-08-06 account-deletion
-audit found the gap) is deliberately public-read — see
-`migrations/20260804_001_avatars_bucket.sql`'s own comment for the full
-reasoning (an avatar is categorically lower-sensitivity than real
-document content, and public-read avoids needing a signed-URL refresh
-mechanism everywhere identity renders).
+Three buckets, all path-scoped `{user_id}/...`. `uploads` and `figures` are private, with RLS on SELECT too. `avatars` is deliberately public-read (an avatar is low-sensitivity, and public URLs avoid signed-URL refresh wherever identity renders) — see `migrations/20260804_001_avatars_bucket.sql`.
 
 ```
-uploads/{user_id}/{document_uuid}.pdf       -- original uploaded PDFs
+uploads/{user_id}/{uuid}.{ext}              -- original uploaded files (pdf/docx/pptx/html)
 figures/{user_id}/{document_id}/{fig}.png   -- cropped figure images from parsing
 avatars/{user_id}/avatar                    -- profile picture, one fixed object per user
 ```
@@ -262,13 +261,8 @@ create policy uploads_delete on storage.objects for delete
 create policy figures_select on storage.objects for select
   using (bucket_id = 'figures' and (storage.foldername(name))[1] = auth.uid()::text);
 
--- avatars bucket — write (insert/update/delete) scoped to owner; SELECT
--- is open to any bucket_id='avatars' row with no owner check (content
--- is already public via the bucket's own public flag, so this reveals
--- nothing additional — found necessary by real testing, not assumed:
--- upload(..., upsert:true)'s own conflict-resolution needs to SELECT
--- the existing row, which a zero-policy SELECT would block even though
--- INSERT/UPDATE were each individually correct).
+-- avatars bucket — writes scoped to owner; SELECT open to any avatars row (content is
+-- already public; upload(..., upsert: true) needs SELECT to resolve conflicts)
 create policy avatars_insert on storage.objects for insert
   with check (bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text);
 create policy avatars_update on storage.objects for update
@@ -279,13 +273,7 @@ create policy avatars_select on storage.objects for select
   using (bucket_id = 'avatars');
 ```
 
-**None of these three buckets cascade on `auth.users` deletion** —
-`storage.objects` has no real foreign key to `auth.users` (it's
-Supabase Storage's own extension schema); `DELETE /account`
-(`routes/account.py`, settings batch 3) removes every object under
-each bucket's `{user_id}/` prefix explicitly, the same requirement
-`DELETE /documents/{id}` already established for `uploads`/`figures`
-per-document.
+**Storage objects do not cascade on `auth.users` deletion** — `storage.objects` has no foreign key to it. `DELETE /documents/{id}` removes that document's `uploads`/`figures` objects, and `DELETE /account` removes everything under `{user_id}/` in all three buckets, before any DB row is deleted.
 
 ---
 
@@ -299,11 +287,12 @@ per-document.
 
 ## Migration convention
 
-- Migrations live in `apps/api/migrations/` as timestamped SQL files: `20260721_001_initial.sql`
-- Each migration is idempotent where possible (`create ... if not exists`, `drop policy if exists`)
-- Migrations are applied via Supabase CLI (`supabase db push`) in dev; in prod, run them manually against the prod project before deploy
-- Every migration file has a matching `-- ROLLBACK` block at the bottom documenting reversal
-- Schema changes require a CHANGELOG entry
+- Migrations live in `apps/api/migrations/` as `YYYYMMDD_NNN_short_description.sql` (e.g. `20260722_001_initial.sql`) and are applied in filename order
+- Idempotent where possible (`create ... if not exists`, `drop policy if exists`, `drop function if exists`)
+- **Local:** `supabase start` from `apps/api/` applies nothing automatically — run each file against the local DB (`psql postgresql://postgres:postgres@127.0.0.1:54322/postgres -f <file>`) or via Studio
+- **Production:** applied manually, in order, through the Supabase dashboard SQL editor before deploying code that depends on them. They are therefore not recorded in Supabase's CLI migration history (`supabase migration list` is empty) — that is expected
+- Each migration documents its rollback in a trailing `-- ROLLBACK` comment block
+- Every schema change needs a CHANGELOG entry and a row in the migration log below
 
 ---
 
@@ -319,10 +308,24 @@ per-document.
 
 ## Migration log
 
-| Date | Migration | Summary |
+Migrations up to `20260804_001` are applied to the production project; later ones must be applied before deploying the code that ships with them (docs/DEPLOYMENT.md). Full reasoning for each is in the file's header comment and the matching CHANGELOG entry.
+
+| Migration | Feature | Summary |
 |---|---|---|
-| 2026-07-22 | `apps/api/migrations/20260722_001_initial.sql` | Initial schema — everything in this document (extensions, enums, 5 tables, indexes incl. HNSW on `chunks.embedding`, RLS policies, `uploads`/`figures` storage buckets + policies). Applied manually via Supabase dashboard SQL editor against the live project; verified clean with `apps/api/migrations/verify_20260722_001.sql` (all checks `OK`). Applied via the dashboard SQL editor rather than `supabase db push`, so it's not recorded in Supabase's own CLI-tracked migration history (confirmed via `supabase migration list` returning empty for this project) — that's expected, not a gap. |
-| 2026-07-22 | `apps/api/migrations/20260722_002_grant_table_privileges.sql` | **Fixes a real gap found only by live-testing enforcement, not by reading the SQL.** `001_initial.sql` created all 5 tables with RLS policies but never granted the underlying table-level privileges (`SELECT`/`INSERT`/`UPDATE`/`DELETE`) to `anon`/`authenticated`/`service_role` — Postgres requires both a GRANT and a matching RLS policy; RLS alone doesn't unlock a table a role has no base privilege on. This blocked *everything*, including `service_role` (which has `BYPASSRLS` — irrelevant here, since GRANT and RLS bypass are independent layers). Confirmed the live project has the identical gap (nothing has ever written to these tables there). Grants added mirror the existing policies exactly: `authenticated` gets only the operations a policy exists for (full CRUD on `documents`/`conversations`, `SELECT`-only on `chunks`/`messages`/`citations`); `service_role` gets full CRUD everywhere; `anon` gets nothing. Applied and verified locally via `supabase start`; **not yet applied to the live project** — needs the same dashboard-SQL-editor treatment as `001`. |
-| 2026-08-02 | `apps/api/migrations/20260802_001_usage_counters.sql` | Adds `usage_counters` (Postgres-backed daily rate-limit bookkeeping, FEAT-024 follow-up — see this doc's own `usage_counters` section for the full table and RLS reasoning). **This table + migration existed since 2026-08-02 but was missing from this log and from the `### usage_counters` schema section entirely until the 2026-08-06 settings-batch-3 account-deletion audit found the gap by grepping every migration for `user_id`/`storage.buckets` directly rather than trusting this document** — the audit's own explicit mandate ("grep, don't rely on memory of what existed"). Backfilled here rather than left stale. |
-| 2026-08-04 | `apps/api/migrations/20260804_001_avatars_bucket.sql` | Adds the `avatars` Storage bucket (public-read, RLS-scoped writes — see this doc's own Storage buckets section for the full policy set and reasoning). Same gap as the row above: existed since 2026-08-04, missing from this log until the 2026-08-06 account-deletion audit's enumeration pass found it. Backfilled here rather than left stale. |
-| 2026-08-06 | *(no new migration — settings batch 3, part 2: account deletion, `apps/api/routes/account.py`)* | `DELETE /account` needed no schema change at all: every one of the 6 user-scoped tables already cascades on `auth.users` deletion via its existing `on delete cascade` FK (confirmed by grepping every migration, not assumed), so deleting the auth user is sufficient by itself for the DB side. Storage cleanup (the one part that genuinely needs code, not schema) is explicit application-level removal across all 3 user-scoped buckets, reusing `DELETE /documents/{id}`'s already-proven Storage-before-DB-row pattern. Listed here as a real, deliberate "no migration needed" entry rather than a silent omission — the enumeration itself (this row's whole justification) is the correctness-critical artifact for this feature, not any SQL. |
+| `20260722_001_initial.sql` | FEAT-001 | Extensions, enums, the 5 core tables, indexes (incl. HNSW on `chunks.embedding`), RLS policies, `uploads`/`figures` buckets + policies. Verify with `verify_20260722_001.sql` |
+| `20260722_002_grant_table_privileges.sql` | FEAT-001 | Table GRANTs that `001` omitted — RLS alone does not unlock a table a role has no base privilege on. `authenticated` gets only what its policies allow; `service_role` full CRUD; `anon` nothing |
+| `20260724_001_hybrid_search_functions.sql` | FEAT-009 | `match_chunks_by_vector` and `match_chunks_by_fts` RPCs |
+| `20260724_002_query_persistence_function.sql` | FEAT-012 | `create_query_turn` — atomic conversation/messages/citations write |
+| `20260725_001_citation_marker_column.sql` | FEAT-026 | `citations.marker` — persists which `[N]` a citation came from |
+| `20260725_002_query_persistence_function_marker.sql` | FEAT-026 | `create_query_turn` writes `marker` |
+| `20260727_001_citation_document_mime_type.sql` | FEAT-020 | Retrieval functions return `document_mime_type` for format-aware citation display |
+| `20260731_001_embedding_provider_fallback.sql` | Embedding fallback | `embedding_provider` enum + `chunks.embedding_provider`; provider-filtered `match_chunks_by_vector`; `distinct_embedding_providers` |
+| `20260731_002_citation_persistence_defensive.sql` | Fix | Each citation insert in `create_query_turn` wrapped in its own exception block so one bad citation can't roll back a whole turn |
+| `20260802_001_usage_counters.sql` | FEAT-024 | `usage_counters` table + `increment_usage_counter` for Postgres-backed daily rate limits |
+| `20260802_002_citation_association_method.sql` | Fix | Retrieval functions return `association_method` |
+| `20260803_001_citation_verdict_unverified.sql` | FEAT-028 | Adds `'unverified'` to the `verdict` enum |
+| `20260804_001_avatars_bucket.sql` | FEAT-032 | Public-read `avatars` bucket with owner-scoped write policies |
+| `20261006_001_fts_any_term_matching.sql` | Fix | `match_chunks_by_fts` matches any question term instead of requiring all of them (`websearch_to_tsquery` ANDed every term, so natural-language questions rarely matched); adds `fts_any_term_query` |
+| `20261006_002_vector_search_iterative_scan.sql` | Fix | `match_chunks_by_vector` runs with `hnsw.iterative_scan = strict_order` so the tenant/document/provider filters can't leave a user with fewer results than exist (the HNSW index returned ~40 nearest chunks across all tenants before filtering) |
+
+Account deletion (FEAT-035) needed no migration: all 6 user-scoped tables already cascade on `auth.users` deletion, and Storage cleanup is done in application code.

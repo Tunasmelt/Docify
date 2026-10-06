@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import time
 from dataclasses import dataclass
 from io import BytesIO
@@ -14,6 +13,8 @@ from google.genai import types
 from google.genai.errors import APIError as GeminiAPIError
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 from voyageai.error import RateLimitError, ServiceUnavailableError, Timeout, VoyageError
+
+from services.gemini_retry import retry_info_delay_seconds
 
 # 2026-08-01 (FEAT-027): same fix as db/queries.py — Chunk is used only as a
 # type hint here (embed()'s functions duck-type chunk.content/chunk.image,
@@ -366,16 +367,8 @@ def _parse_gemini_retry_delay_seconds(exc: Exception) -> float:
     deliberately never raises here: a malformed field must degrade to a
     safe default, not crash the retry path meant to recover from the
     original error."""
-    details = getattr(exc, "details", None)
-    if isinstance(details, dict):
-        for item in details.get("error", {}).get("details", []) or []:
-            if not isinstance(item, dict) or not str(item.get("@type", "")).endswith("RetryInfo"):
-                continue
-            match = re.fullmatch(r"(\d+(?:\.\d+)?)s", str(item.get("retryDelay", "")))
-            if match:
-                return float(match.group(1))
-            break
-    return GEMINI_DEFAULT_RETRY_DELAY_SECONDS
+    delay = retry_info_delay_seconds(exc)
+    return GEMINI_DEFAULT_RETRY_DELAY_SECONDS if delay is None else delay
 
 # Local, no-extra-API-call estimate for the pre-send safety check below —
 # deliberately conservative (i.e. deliberately overestimates token count),

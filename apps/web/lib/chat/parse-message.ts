@@ -64,6 +64,8 @@ function apiCitationToClientCitation(id: string, c: ApiCitation): Citation {
     excerpt: c.supporting_quote ?? c.snippet,
     isFigure: c.element_type === "figure",
     figureUrl: c.figure_url,
+    documentId: c.document_id,
+    bbox: c.bbox,
   };
 }
 

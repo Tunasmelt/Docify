@@ -76,21 +76,19 @@ def scanned_doc():
 def test_groups_text_heading_list_elements_respecting_boundaries(clean_digital_doc):
     chunks = Chunker().chunk(clean_digital_doc)
 
-    # FEAT-027 real count: clean_digital.pdf now has 22 elements (6
-    # heading + 6 text + 9 list + 1 table — one more than the old
-    # Docling-based parser's 21, a real minor paragraph-grouping
-    # granularity difference, see test_parser.py). Elements are now built
-    # in real reading order (interleaved by page position, not grouped by
-    # type), so the table sits where it actually appears — after the
-    # "Table" heading/intro text, before the closing paragraph — splitting
-    # the surrounding text into two groups. Observed directly: 3 chunks.
-    assert len(chunks) == 3
-    assert chunks[0].element_type == ElementType.HEADING  # leading group up to the table
-    assert len(chunks[0].source_element_indices) == 19
-    assert chunks[1].element_type == ElementType.TABLE
-    assert len(chunks[1].source_element_indices) == 1  # table never grouped with surrounding text
-    assert chunks[2].element_type == ElementType.TEXT  # closing paragraphs after the table
-    assert len(chunks[2].source_element_indices) == 2
+    # clean_digital.pdf: 22 elements (6 heading + 6 text + 9 list + 1 table).
+    # Since 2026-10-06 every heading starts a new chunk, so each section is
+    # its own chunk; the "Table" heading folds into the table chunk as its
+    # prefix; the closing paragraph is prefixed with its section heading.
+    types = [c.element_type for c in chunks]
+    assert types == [
+        ElementType.TEXT, ElementType.LIST, ElementType.TEXT, ElementType.TEXT, ElementType.TABLE, ElementType.TEXT,
+    ]
+    assert [c.content.split("\n")[0] for c in chunks] == [
+        "Sample Document for PDF Testing", "Text Formatting Examples", "Lists", "Quote", "Table", "Table",
+    ]
+    assert sum(len(c.source_element_indices) for c in chunks) == 22  # every element lands in exactly one chunk
+    assert len({i for c in chunks for i in c.source_element_indices}) == 22
 
 
 # FEAT-020 (2026-07-27) real bug, found via the real end-to-end /query
@@ -546,3 +544,99 @@ def test_reparsing_the_same_file_bytes_produces_identical_chunk_order():
     assert [c.chunk_index for c in chunks_a] == [c.chunk_index for c in chunks_b]
     assert [c.content for c in chunks_a] == [c.content for c in chunks_b]
     assert [c.element_type for c in chunks_a] == [c.element_type for c in chunks_b]
+
+
+# ── Section headings (2026-10-06) ─────────────────────────────────────────────
+# Chunks used to carry no section context: a chunk starting mid-section had no
+# heading, a heading could be stranded as the last line of the previous chunk,
+# and a grouped chunk took the type of its first element (so most text chunks
+# were labelled "heading").
+
+
+def _h(text, page=1, eid=None):
+    return make_element(ElementType.HEADING, page_number=page, content=text, element_id=eid or f"h-{text}")
+
+
+def _t(text, page=1, eid=None):
+    return make_element(ElementType.TEXT, page_number=page, content=text, element_id=eid or f"t-{text[:12]}")
+
+
+def _chunk(elements):
+    return Chunker().chunk(ParsedDocument(elements=elements, dropped_elements=0))
+
+
+def test_a_heading_starts_a_new_chunk_instead_of_trailing_the_previous_one():
+    chunks = _chunk([_h("Intro"), _t("Intro body."), _h("Results"), _t("Results body.")])
+
+    assert [c.content for c in chunks] == ["Intro\nIntro body.", "Results\nResults body."]
+
+
+def test_consecutive_headings_stay_together_with_their_body():
+    chunks = _chunk([_h("Report title"), _h("Introduction"), _t("Body text.")])
+
+    assert [c.content for c in chunks] == ["Report title\nIntroduction\nBody text."]
+
+
+def test_continuation_chunk_is_prefixed_with_its_section_heading():
+    long_paragraph = "word " * 1200  # ~1500 tokens: more than one TOKEN_BUDGET chunk
+    elements = [_h("Quarterly Results"), _t(long_paragraph, eid="p1"), _t("Second paragraph.", eid="p2")]
+
+    chunks = _chunk(elements)
+
+    assert len(chunks) == 2
+    assert chunks[0].content.startswith("Quarterly Results\n")
+    assert chunks[1].content == "Quarterly Results\nSecond paragraph."
+    assert chunks[1].section_heading == "Quarterly Results"
+
+
+def test_section_heading_carries_across_a_page_break():
+    chunks = _chunk([_h("Methods", page=1), _t("Page one text.", page=1), _t("Page two text.", page=2)])
+
+    assert [c.content for c in chunks] == ["Methods\nPage one text.", "Methods\nPage two text."]
+    assert chunks[1].page_numbers == [2]
+
+
+def test_tables_and_uncaptioned_figures_get_their_section_heading():
+    figure_image = Image.new("RGB", (4, 4))
+    elements = [
+        _h("Revenue"),
+        make_element(ElementType.TABLE, content="| Q | $ |\n|---|---|\n| Q3 | 4.2 |", element_id="tbl"),
+        make_element(ElementType.FIGURE, content=figure_image, element_id="fig"),
+    ]
+
+    table, figure = [c for c in _chunk(elements) if c.element_type in (ElementType.TABLE, ElementType.FIGURE)]
+
+    assert table.content.startswith("Revenue\n\n| Q | $ |")
+    assert figure.content == "Revenue"
+
+
+def test_text_before_any_heading_gets_no_prefix():
+    chunks = _chunk([_t("Preamble with no heading.")])
+
+    assert chunks[0].content == "Preamble with no heading."
+    assert chunks[0].section_heading is None
+
+
+def test_grouped_chunk_type_reflects_its_body_not_its_first_heading():
+    heading_only = _chunk([_h("Lonely heading")])
+    with_body = _chunk([_h("Section"), _t("Body.")])
+    list_only = _chunk([make_element(ElementType.LIST, content="- a", element_id="l1")])
+
+    assert heading_only[0].element_type == ElementType.HEADING
+    assert with_body[0].element_type == ElementType.TEXT
+    assert list_only[0].element_type == ElementType.LIST
+
+
+def test_heading_directly_above_a_table_becomes_its_prefix_not_a_lone_chunk():
+    elements = [
+        _h("Table"),
+        make_element(ElementType.TABLE, content="| A |\n|---|\n| 1 |", element_id="tbl"),
+        _t("After the table."),
+    ]
+
+    chunks = _chunk(elements)
+
+    assert [c.element_type for c in chunks] == [ElementType.TABLE, ElementType.TEXT]
+    assert chunks[0].content == "Table\n\n| A |\n|---|\n| 1 |"
+    assert chunks[0].source_element_indices[0] == 1  # the table stays the primary source element
+    assert chunks[1].content == "Table\nAfter the table."

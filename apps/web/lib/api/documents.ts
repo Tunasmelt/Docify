@@ -1,6 +1,7 @@
 import { createClient } from "@/lib/supabase/browser";
 import type { DocumentStatus } from "@/lib/status-styles";
-import { apiFetch, ApiError, forceReauth } from "@/lib/api/client";
+import { API_URL, apiFetch, ApiError, forceReauth, getAccessToken } from "@/lib/api/client";
+import type { CitationBBox } from "@/lib/api/types";
 
 export { ApiError };
 
@@ -36,6 +37,13 @@ export async function getDocument(id: string): Promise<ApiDocument> {
 
 export async function deleteDocument(id: string): Promise<void> {
   await apiFetch<void>(`/documents/${id}`, { method: "DELETE" });
+}
+
+/** Re-runs parsing + embedding for an existing document (POST /reindex) —
+ * the recovery path for a document that ended in `failed`. Resolves once
+ * the API has reset it to `parsing`; poll for the outcome. */
+export async function reindexDocument(id: string): Promise<IngestResponse> {
+  return apiFetch<IngestResponse>(`/reindex/${id}`, { method: "POST" });
 }
 
 /** Direct-to-Storage upload (ARCHITECTURE.md's ingest flow), then
@@ -80,4 +88,39 @@ export async function uploadDocument(file: File): Promise<IngestResponse> {
       size_bytes: file.size,
     }),
   });
+}
+
+/** Renders one PDF page server-side, with `bbox` highlighted, and returns
+ * an object URL for an <img>. The caller must URL.revokeObjectURL() it.
+ * (A plain <img src> can't send the bearer token, hence fetch + blob.) */
+export async function fetchPageImage(
+  documentId: string,
+  pageNumber: number,
+  bbox?: CitationBBox
+): Promise<string> {
+  const token = await getAccessToken();
+  const params = bbox
+    ? "?" + new URLSearchParams({
+        x0: String(bbox.x0),
+        y0: String(bbox.y0),
+        x1: String(bbox.x1),
+        y1: String(bbox.y1),
+      }).toString()
+    : "";
+  const res = await fetch(`${API_URL}/documents/${documentId}/pages/${pageNumber}/image${params}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (res.status === 401) {
+    await forceReauth();
+    throw new ApiError(401, "UNAUTHORIZED", "Session expired");
+  }
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new ApiError(
+      res.status,
+      body?.error?.code ?? "UNKNOWN_ERROR",
+      body?.error?.message ?? `Request failed with status ${res.status}`
+    );
+  }
+  return URL.createObjectURL(await res.blob());
 }

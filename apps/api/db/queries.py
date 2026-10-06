@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
+from services.document_model import BBox
 from services.embedder import EmbeddedChunk
 
 # 2026-08-01 (FEAT-027): Chunk/ParsedElement are used ONLY as type hints in
@@ -74,6 +75,28 @@ def mark_failed(client, document_id: str, *, error: str) -> None:
     client.table("documents").update({"status": "failed", "error": error}).eq("id", document_id).execute()
 
 
+def _chunk_bbox(chunk, elements) -> BBox:
+    """Union of the chunk's source elements' boxes on its first page (the
+    page stored in page_number), so a citation highlight covers the whole
+    chunk rather than only its first element. Elements without a real
+    location (the zero sentinel box) are ignored; if none has one, the
+    sentinel is kept."""
+    page = min(chunk.page_numbers)
+    boxes = [
+        elements[i].bbox
+        for i in chunk.source_element_indices
+        if elements[i].page_number == page and elements[i].bbox.x1 > elements[i].bbox.x0
+    ]
+    if not boxes:
+        return elements[chunk.source_element_indices[0]].bbox
+    return BBox(
+        x0=min(b.x0 for b in boxes),
+        y0=min(b.y0 for b in boxes),
+        x1=max(b.x1 for b in boxes),
+        y1=max(b.y1 for b in boxes),
+    )
+
+
 def build_chunk_rows(
     *,
     document_id: str,
@@ -103,8 +126,7 @@ def build_chunk_rows(
     """
     rows = []
     for chunk, embedded in zip(chunks, embedded_chunks, strict=True):
-        source_element = elements[chunk.source_element_indices[0]]
-        bbox = source_element.bbox
+        bbox = _chunk_bbox(chunk, elements)
         rows.append(
             {
                 "document_id": document_id,
@@ -123,6 +145,7 @@ def build_chunk_rows(
                     "association_method": chunk.association_method,
                     "merged_caption_ids": chunk.merged_caption_ids,
                     "split_from_element_id": chunk.split_from_element_id,
+                    "section_heading": chunk.section_heading,
                 },
             }
         )
@@ -151,6 +174,21 @@ def get_document(client, *, document_id: str, user_id: str) -> dict | None:
     remember to hide the distinction themselves (API_CONTRACT.md: same
     response either way)."""
     rows = client.table("documents").select(DOCUMENT_RESPONSE_COLUMNS).eq("id", document_id).eq("user_id", user_id).execute().data
+    return rows[0] if rows else None
+
+
+def get_document_file(client, *, document_id: str, user_id: str) -> dict | None:
+    """storage_path + mime_type for serving the original file's pages.
+    Scoped to user_id in the query itself (same 404-for-both discipline as
+    get_document())."""
+    rows = (
+        client.table("documents")
+        .select("id,storage_path,mime_type")
+        .eq("id", document_id)
+        .eq("user_id", user_id)
+        .execute()
+        .data
+    )
     return rows[0] if rows else None
 
 
@@ -488,7 +526,7 @@ def list_messages_for_conversation(
 
 CITATION_JOIN_COLUMNS = (
     "id,message_id,marker,verdict,supporting_quote,chunk_id,"
-    "chunks(document_id,page_number,element_type,content,figure_path,documents(filename,mime_type))"
+    "chunks(document_id,page_number,element_type,content,figure_path,bbox,documents(filename,mime_type))"
 )
 
 

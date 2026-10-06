@@ -8,6 +8,50 @@ Rule: a feature is not `complete` until acceptance criteria pass AND `/gap-check
 
 ---
 
+## Index
+
+One row per feature; details are in the sections below.
+
+| ID | Feature | Phase | Status |
+|---|---|---|---|
+| FEAT-000 | Repo skeleton | 0 | complete |
+| FEAT-001 | Supabase project + initial migration | 0 | complete |
+| FEAT-002 | /health endpoint | 1 | complete |
+| FEAT-003 | JWT auth middleware | 1 | complete |
+| FEAT-004 | Docling parser service | 1 | superseded by FEAT-027 |
+| FEAT-005 | Chunker | 1 | complete |
+| FEAT-006 | Voyage embedder wrapper | 1 | complete |
+| FEAT-007 | /ingest endpoint | 1 | complete |
+| FEAT-008 | /documents list + detail + delete | 1 | complete |
+| FEAT-009 | Retriever service (hybrid + RRF) | 2 | complete |
+| FEAT-010 | Gemini generator wrapper | 2 | complete |
+| FEAT-011 | Citation verifier | 2 | complete |
+| FEAT-012 | /query endpoint | 2 | complete |
+| FEAT-013 | Next.js app shell + Supabase Auth | 3 | tested |
+| FEAT-014 | Upload UI + document list | 3 | tested |
+| FEAT-015 | Chat UI + citation source panel | 3 | tested |
+| FEAT-016 | SSE streaming responses | 2 | tested |
+| FEAT-017 | OCR fallback via Gemini Flash, extended to a 3-tier chain (Gemini -… | 4 | tested |
+| FEAT-019 | Conversation memory in prompt | 2 | complete |
+| FEAT-020 | DOCX/PPTX/HTML ingestion | 4 | complete |
+| FEAT-021 | Vercel prod deploy | 5 | complete |
+| FEAT-022 | Render prod deploy | 5 | complete |
+| FEAT-023 | Landing page | 5 | complete |
+| FEAT-024 | Rate limiting on POST /ingest and POST /query (+ /query/stream) | 5 | tested |
+| FEAT-025 | Error tracking (Sentry free) | 5 | planned |
+| FEAT-026 | GET /conversations + GET /conversations/{id}/messages + citation fi… | 2 | tested |
+| FEAT-027 | Parser rewrite | 1 | complete |
+| FEAT-028 | UNVERIFIED citation state, distinct from UNSUPPORTED | 4 | complete |
+| FEAT-029 | Chat UI modernization, batch 1 | 3 | complete |
+| FEAT-030 | Chat UI modernization, batch 2 | 3 | complete |
+| FEAT-031 | Chat UI modernization, batch 3 | 3 | complete |
+| FEAT-032 | Settings, profile + security (batch 1) | 4 | complete |
+| FEAT-033 | Settings, preferences (batch 2) | 4 | complete |
+| FEAT-034 | Export conversations (Settings batch 3, part 1) | 4 | complete |
+| FEAT-035 | Permanent account deletion (Settings batch 3, part 2) | 4 | complete |
+
+---
+
 ## Phase 0 — Setup
 
 ### [FEAT-000] Repo skeleton
@@ -16,7 +60,7 @@ Rule: a feature is not `complete` until acceptance criteria pass AND `/gap-check
 **Owner:** claude-code
 **Files:**
 - `apps/web/package.json` — Next.js 14 App Router boilerplate
-- `apps/api/pyproject.toml` — FastAPI + Docling + Voyage + Gemini deps
+- `apps/api/pyproject.toml` — FastAPI + Voyage + Gemini deps (originally Docling; replaced by FEAT-027)
 - `.gitignore` — node_modules, .env, __pycache__, HANDOFF.md, .agent/logs, .agent/index.json
 - `README.md` — root readme with quick-start
 - `apps/web/.env.example`, `apps/api/.env.example`
@@ -155,7 +199,7 @@ Rule: a feature is not `complete` until acceptance criteria pass AND `/gap-check
 **Phase:** 1
 **Status:** complete
 **Owner:** claude-code
-**Depends on:** FEAT-004 (superseded, contract preserved), `.agent/reviews/2026-08-01-parser-research.md` (the investigation this implements against)
+**Depends on:** FEAT-004 (superseded, contract preserved), the parser research summarized in CHANGELOG.md's 2026-08-01 FEAT-027 entry (the standalone `.agent/reviews/2026-08-01-parser-research.md` was never committed)
 **Files:**
 - `apps/api/services/document_model.py` (new — ElementType/BBox/ParsedElement/ParsedDocument/ParseError, split out of parser.py so chunker.py can depend on them at runtime without pulling in the heavy parsing libraries)
 - `apps/api/services/parser.py` (rewrite; re-exports document_model's types for backward compatibility)
@@ -195,7 +239,7 @@ Rule: a feature is not `complete` until acceptance criteria pass AND `/gap-check
 | slides.pptx | 8 | heading:3 text:4 figure:1 | [1,2,3] | corrected 2026-08-02 (was heading:4 text:3) — see below |
 | page.html | 8 | heading:3 text:3 caption:1 table:1 | [1] (sentinel) | |
 
-**Corrections (2026-08-02, independent audit + fix pass, `.agent/reviews/2026-08-02-parser-rewrite-audit.md`):**
+**Corrections (2026-08-02, independent audit + fix pass, summarized in CHANGELOG.md's 2026-08-02 fix entry; the standalone audit file was never committed):**
 - **Multi-line caption truncation, fixed.** Captions spanning more than one visual line (common in `table_heavy.pdf` — e.g. `"Table 10: ...(multiple layout problems)"`) were silently cut to their first line. Root cause: `_classify_line` classifies one physical line at a time, and unlike TEXT lines, CAPTION lines never merged with a following continuation line. Worse, the truncated-off continuation line (e.g. `"layout problems)"`) was short and inherited the caption's own bold styling, so it independently matched the whole-line-bold HEADING heuristic and became its own spurious HEADING element — this is why table_heavy.pdf's heading count drops from 10 to 3 above: all 7 "missing" headings were exactly these orphaned caption fragments, not real document headings. Fixed by merging a close-gap TEXT-or-HEADING-classified line into an in-progress caption instead of starting a new element. Table/list/caption-link counts (29/29/6) are unaffected — only caption text completeness and the heading count (a pre-existing bug artifact) changed.
 - **PPTX subtitle misclassified as HEADING, fixed.** `"TITLE" in str(shape.placeholder_format.type)` also matched `SUBTITLE` (python-pptx's `str()` for that enum member is `"SUBTITLE (4)"`, which contains the substring `"TITLE"`). Fixed via exact enum-member comparison (`placeholder_format.type in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE)`). This is why `slides.pptx`'s heading count drops from 4 to 3 above — the real slide-1 subtitle now correctly classifies as TEXT.
 - Both fixes verified with new regression tests: `test_multiline_captions_are_not_truncated_to_first_line`, `test_pptx_subtitle_placeholder_is_not_misclassified_as_heading` (`apps/api/tests/test_parser.py`).
@@ -1131,14 +1175,14 @@ This is a real EPA letter about lead service line compliance — confirms both t
 
 ### [FEAT-032] Settings, profile + security (batch 1) — display name, avatar, email change, password change, sign-out-other-sessions
 **Phase:** 4 (Settings — explicitly deferred from Phase 3, see SCOPE.md)
-**Status:** complete, **with one real gap: its own Storage migration is not committed** (see below)
+**Status:** complete
 **Owner:** claude-code
 **Files:**
 - `apps/web/app/(app)/settings/page.tsx`
 - `apps/web/components/settings/profile-section.tsx`, `email-section.tsx`, `security-section.tsx`, `appearance-section.tsx`, `settings-section.tsx`
 - `apps/web/hooks/use-current-user.ts` (new — replaces three independently-copy-pasted hardcoded `USER` fake-identity constants previously in documents/chat pages)
 - `apps/web/lib/supabase/profile.ts` (new) — `updateDisplayName`, `uploadAvatar`, `requestEmailChange`, `signOutOtherSessions`, `deleteAccount`
-- `apps/api/migrations/20260804_001_avatars_bucket.sql` — **UNCOMMITTED as of 2026-08-07** (confirmed via `git status`; the code that depends on it, `uploadAvatar`/the `avatars` bucket policies, IS committed and has been tested against it locally — this is a real, current gap between what's in git and what the working tree/local Supabase actually has applied, not a documentation issue). Flagged here rather than silently treated as done.
+- `apps/api/migrations/20260804_001_avatars_bucket.sql` — committed in `3dc50bf` (2026-08-08; it had been missing from the original batch commit)
 - `apps/web/e2e/settings.e2e.ts` (new, 376 lines)
 **Tests:**
 - `apps/web/e2e/settings.e2e.ts` — 8 tests: display name persistence, avatar upload + RLS (user B can read but not write user A's avatar), password-change link, sign-out-other-sessions (a second real session genuinely invalidated), email change (real Mailpit, both addresses, either link alone completes it), and the wrong-password-blocks-email-change regression test below
@@ -1156,14 +1200,14 @@ This is a real EPA letter about lead service line compliance — confirms both t
 
 ### [FEAT-033] Settings, preferences (batch 2) — theme, default k, rerank, streaming
 **Phase:** 4 (Settings)
-**Status:** complete but **UNCOMMITTED as of 2026-08-07**
+**Status:** complete
 **Owner:** claude-code
 **Depends on:** FEAT-032
 **Files:**
-- `apps/web/hooks/use-preferences.ts` — **UNCOMMITTED.** `apps/web/components/settings/preferences-section.tsx` (which imports this hook) IS committed (as part of FEAT-032's `fbc4a5b`) — **the repository as currently committed is broken**: a fresh clone at `fbc4a5b` has a component importing a hook file that has never been committed. Confirmed via `git log --all -- apps/web/hooks/use-preferences.ts` returning empty. This needs a decision (commit the hook, or revert the component's dependency on it) before this is genuinely "done" from git's own point of view, not just in the working tree.
+- `apps/web/hooks/use-preferences.ts` — committed in `6959763` (2026-08-08; `preferences-section.tsx` had been committed in `fbc4a5b` without it, which broke fresh clones until then)
 - `apps/web/components/settings/preferences-section.tsx` (committed, see above)
 - `apps/api/models/query.py`, `routes/query.py` — `QueryRequest.rerank` wired through (the `k` field was already wired before this batch); `.agent/API_CONTRACT.md` updated
-- `apps/web/e2e/preferences.e2e.ts` — **UNCOMMITTED**
+- `apps/web/e2e/preferences.e2e.ts`
 **Tests:**
 - `apps/web/e2e/preferences.e2e.ts` — 5 tests: theme persistence (no flash, next-themes' own pre-hydration script), k/rerank/streaming persistence across reload, real request-body verification (k and rerank genuinely reach `POST /query/stream`), streaming-off genuinely uses `POST /query` not `/query/stream`, and a rerank on/off round-trip proving both real code paths complete successfully (not gated on a live timing comparison — see below)
 **Acceptance criteria:**
@@ -1171,7 +1215,7 @@ This is a real EPA letter about lead service line compliance — confirms both t
 - [x] `rerank` defaults off, discloses its own real measured ~380ms cost in the UI copy (`.agent/MEMORY.md`'s 2026-07-27 measurement), not presented as a free toggle
 - [x] Real backend wiring proven via request-body inspection, not just "the toggle state saved" — **not** via a live latency comparison, which was tried first and found genuinely unreliable in this environment (two different measurement approaches both produced real, contradictory swings from Gemini generation's own independent latency variance) and deliberately dropped in favor of the request-body proof
 
-**Changelog:** Not yet committed — see the file-level gap noted above. No CHANGELOG.md entry exists for this batch.
+**Changelog:** commits `6959763` (hook) and `d9cedee` (preferences wiring), 2026-08-08. CHANGELOG.md 2026-08-08 entry.
 
 ---
 
@@ -1220,12 +1264,11 @@ This is a real EPA letter about lead service line compliance — confirms both t
 
 ## Phase 5 — Deploy (see SCOPE.md for full list)
 
-- [FEAT-021] Vercel prod deploy — planned
-- [FEAT-022] Render prod deploy — **done 2026-07-27/28, not "planned"** (corrected 2026-08-07 docs-reconciliation pass — SCOPE.md's own Phase 5 checklist already had this checked off with real evidence; this one-line status just never got updated to match). Live at `https://docify-api.onrender.com`. See CHANGELOG.md 2026-07-28 "docs: document the real Render production deploy."
-- [FEAT-023] Landing page + demo — planned
-- (FEAT-024 built 2026-07-28 — see its entry above, filed after FEAT-020, its most recent code dependency)
+- [FEAT-021] Vercel prod deploy — **complete** 2026-08-09. Project `docify-web`, git-linked with auto-deploy on push; live at `https://docify-web-steel.vercel.app`. CHANGELOG.md 2026-08-09.
+- [FEAT-022] Render prod deploy — **complete** 2026-07-27 (Docker runtime). Live at `https://docify-api.onrender.com`. CHANGELOG.md 2026-07-27 and 2026-08-09 (Dockerfile COPY fix).
+- [FEAT-023] Landing page — **complete** 2026-08-08 (`ef70e5f`, `components/landing/`, public `/`). A demo video and "try with a sample document" flow are still open (SCOPE.md Phase 5).
 - [FEAT-025] Error tracking (Sentry free) — planned
-- (FEAT-028 through FEAT-035 built 2026-08-04 through 2026-08-07 — filed under Phase 3/4 above, near their nearest code dependency, not here — Settings/chat-modernization work, not a Phase 5 deploy concern)
+- FEAT-024 and FEAT-028–035 are filed under Phases 3/4 above, next to their code dependencies.
 
 ---
 
@@ -1234,6 +1277,6 @@ This is a real EPA letter about lead service line compliance — confirms both t
 Promoted from HANDOFF.md `## Agent Suggestions` inbox after review. Not yet scheduled into a phase.
 
 - **Embedder process-lifetime singleton** — safe per `.agent/reviews/2026-07-23-efficiency.md`'s concrete thread-safety assessment (tokenizer cache, Rust `tokenizers` backend, HTTP client all confirmed safe for concurrent use). Low risk, real win. Independent of Phase 5.
-- **Parser/DocumentConverter process-lifetime singleton + lock around `.parse()`** — captures the expensive model-loading reuse while sidestepping Docling's own unvalidated concurrent-`execute()` caveat (see the same review). Independent of Phase 5.
+- **Parser process-lifetime singleton** — originally proposed to amortize Docling's model loading. FEAT-027's parser has no expensive model state (~17MB import), so the payoff is now small; keep only if profiling shows `Parser()` construction matters.
 - **Known gap, stated not hidden: chat UI modernization batch 2's "regenerate" APPENDS rather than replaces in place.** Investigated during that batch: the backend has no endpoint to delete or update an existing message (`GET /conversations` and `GET /conversations/{id}/messages` are the only conversation routes today), and `create_query_turn` always inserts one new user + one new assistant message pair per call — so a true in-place "replace the last answer, no duplicate question" regenerate is not achievable without a new backend endpoint. Current behavior: clicking regenerate re-asks the original question as a new, appended turn (`apps/web/app/(app)/chat/[conversation_id]/page.tsx`'s `regenerate()`), so a conversation legitimately grows a duplicate-text user message per regenerate click, both live and after reload. Revisit if/when a message-mutation endpoint is added (would also unblock batch 3's rename/delete work).
 - Both currently unimplemented — pick up opportunistically if/when this area is next touched, not urgent standalone work.

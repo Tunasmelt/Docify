@@ -530,9 +530,12 @@ def test_ocr_fallback_recovers_real_text_on_scanned_pdf(capsys, caplog):
                 else:
                     print(f"  [{element.element_type.value}] <image {element.content.size}>")
 
-    # Page 1 has real embedded text (the title) — this parser already
-    # extracted it directly, so this page must NOT trigger OCR at all.
-    assert not any(e.element_id == "ocr-page-1" for e in doc.elements)
+    # Page 1 has a tiny real text layer (the 13-character title) over a
+    # full-page scan. Since 2026-10-06 that still counts as low-yield, so
+    # the scanned body is OCR'd too and replaces the thin text layer.
+    page_1_ocr = [e for e in by_page.get(1, []) if e.element_id == "ocr-page-1"]
+    assert len(page_1_ocr) == 1
+    assert len(page_1_ocr[0].content.strip()) > 50
 
     # Pages 2 and 3 (zero elements from direct extraction — the actual bug
     # FEAT-017 fixes) must carry real, non-trivial recovered text.
@@ -581,11 +584,11 @@ def test_ocr_fallback_call_failure_degrades_gracefully_not_a_crash(caplog):
     assert len(doc.elements) == 1  # page 1's pre-existing element only
     assert {e.page_number for e in doc.elements} == {1}
     assert not any(e.element_id.startswith("ocr-page-") for e in doc.elements)
-    assert ocr_client.calls == 2  # both low-yield pages independently attempted
+    assert ocr_client.calls == 3  # all three low-yield pages independently attempted (page 1 is a partly scanned page)
 
     warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
     assert any("OCR" in w and ("raised" in w.lower() or "fail" in w.lower()) for w in warnings)
-    assert sum(1 for w in warnings if "page" in w.lower()) >= 2
+    assert sum(1 for w in warnings if "page" in w.lower()) >= 3
 
 
 # --- 3-tier chain: full deterministic combination matrix (unchanged contract) -
@@ -619,11 +622,11 @@ def test_ocr_chain_tier1_succeeds_tiers_2_and_3_never_called():
 
     doc = parser.parse(load("scanned.pdf"), filename="scanned.pdf")
 
-    assert tier1.calls == 2  # pages 2 and 3
+    assert tier1.calls == 3  # pages 1-3 (page 1 is partly scanned)
     assert tier2.calls == 0
     assert tier3.calls == 0
     recovered = _recovered_elements(doc)
-    assert len(recovered) == 2
+    assert len(recovered) == 3
     assert all(e.content == "gemini recovered this" for e in recovered)
 
 
@@ -635,11 +638,11 @@ def test_ocr_chain_tier1_fails_tier2_succeeds_tier3_never_called():
 
     doc = parser.parse(load("scanned.pdf"), filename="scanned.pdf")
 
-    assert tier1.calls == 2
-    assert tier2.calls == 2
+    assert tier1.calls == 3
+    assert tier2.calls == 3
     assert tier3.calls == 0
     recovered = _recovered_elements(doc)
-    assert len(recovered) == 2
+    assert len(recovered) == 3
     assert all(e.content == "ocrspace recovered this" for e in recovered)
 
 
@@ -651,11 +654,11 @@ def test_ocr_chain_tiers_1_and_2_fail_tier3_succeeds():
 
     doc = parser.parse(load("scanned.pdf"), filename="scanned.pdf")
 
-    assert tier1.calls == 2
-    assert tier2.calls == 2
-    assert tier3.calls == 2
+    assert tier1.calls == 3
+    assert tier2.calls == 3
+    assert tier3.calls == 3
     recovered = _recovered_elements(doc)
-    assert len(recovered) == 2
+    assert len(recovered) == 3
     assert all(e.content == "tesseract recovered this" for e in recovered)
 
 
@@ -668,16 +671,16 @@ def test_ocr_chain_all_three_tiers_fail_page_stays_unrecovered(caplog):
     with caplog.at_level("WARNING"):
         doc = parser.parse(load("scanned.pdf"), filename="scanned.pdf")
 
-    assert tier1.calls == 2
-    assert tier2.calls == 2
-    assert tier3.calls == 2
+    assert tier1.calls == 3
+    assert tier2.calls == 3
+    assert tier3.calls == 3
 
     assert len(doc.elements) == 1
     assert {e.page_number for e in doc.elements} == {1}
     assert _recovered_elements(doc) == []
 
     warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
-    assert sum(1 for w in warnings if "exhausted all tiers" in w) == 2
+    assert sum(1 for w in warnings if "exhausted all tiers" in w) == 3
 
 
 # --- Real 3-way tier comparison (task brief item 7, FEAT-017 original) ------
@@ -760,11 +763,11 @@ def test_ocrspace_is_errored_on_processing_makes_the_chain_fall_through_to_tier3
 
     doc = parser.parse(load("scanned.pdf"), filename="scanned.pdf")
 
-    assert tier1.calls == 2
-    assert mock_http.calls == 2
-    assert tier3.calls == 2
+    assert tier1.calls == 3
+    assert mock_http.calls == 3
+    assert tier3.calls == 3
     recovered = _recovered_elements(doc)
-    assert len(recovered) == 2
+    assert len(recovered) == 3
     assert all(e.content == "tesseract recovered this" for e in recovered)
 
 
@@ -785,10 +788,10 @@ def test_chain_treats_whitespace_only_success_as_failure_not_valid_recovery():
 
     doc = parser.parse(load("scanned.pdf"), filename="scanned.pdf")
 
-    assert tier1.calls == 2
-    assert tier2.calls == 2
+    assert tier1.calls == 3
+    assert tier2.calls == 3
     recovered = _recovered_elements(doc)
-    assert len(recovered) == 2
+    assert len(recovered) == 3
     assert all(e.content == "tier2 recovered this" for e in recovered)
 
 
@@ -800,7 +803,7 @@ def test_chain_treats_empty_string_success_as_failure_not_valid_recovery():
     doc = parser.parse(load("scanned.pdf"), filename="scanned.pdf")
 
     recovered = _recovered_elements(doc)
-    assert len(recovered) == 2
+    assert len(recovered) == 3
     assert all(e.content == "tier2 recovered this" for e in recovered)
 
 
@@ -1000,3 +1003,220 @@ def test_html_elements_get_sentinel_page_number_and_zero_bbox():
     for element in doc.elements:
         assert element.page_number == 1
         assert element.bbox == BBox(x0=0.0, y0=0.0, x1=0.0, y1=0.0)
+
+
+# ── Reading order (2026-10-06): HTML and DOCX elements must come out in
+# document order. Before this fix, HTML emitted every heading first (CSS
+# selector-group order, not DOM order) and DOCX emitted all paragraphs, then
+# all tables, then all images — detaching every section/table/figure from
+# its surrounding text before chunking ever saw it.
+
+def _contents(doc) -> list[str]:
+    return [e.content if isinstance(e.content, str) else "<figure>" for e in doc.elements]
+
+
+def _index_of(contents: list[str], needle: str) -> int:
+    return next(i for i, c in enumerate(contents) if needle in c)
+
+
+def test_html_elements_come_out_in_document_order():
+    contents = _contents(Parser().parse(load("page.html"), filename="page.html"))
+
+    order = [
+        _index_of(contents, "Docify HTML Fixture"),
+        _index_of(contents, "This is a real HTML page"),
+        _index_of(contents, "Quarterly Results"),
+        _index_of(contents, "Table 1 below shows"),
+        _index_of(contents, "| Quarter |"),
+        _index_of(contents, "Table 1: Quarterly revenue"),
+        _index_of(contents, "Conclusion"),
+        _index_of(contents, "Revenue grew steadily"),
+    ]
+    assert order == sorted(order)
+
+
+def test_html_nested_matching_tags_are_not_emitted_twice():
+    html = (
+        b"<html><body><ul><li><p>Outer item text</p></li></ul>"
+        b"<table><caption>Table 9: nested caption</caption>"
+        b"<tr><th>A</th></tr><tr><td>1</td></tr></table></body></html>"
+    )
+    doc = Parser().parse(html, filename="nested.html")
+    contents = _contents(doc)
+
+    assert sum("Outer item text" in c for c in contents) == 1
+    assert sum("Table 9: nested caption" in c for c in contents) == 1
+    caption_idx = _index_of(contents, "Table 9: nested caption")
+    table_idx = _index_of(contents, "| A |")
+    assert caption_idx < table_idx
+    assert doc.elements[caption_idx].element_type == ElementType.CAPTION
+
+
+def test_docx_tables_and_figures_stay_in_document_order():
+    doc = Parser().parse(load("table.docx"), filename="table.docx")
+    contents = _contents(doc)
+
+    order = [
+        _index_of(contents, "Quarterly Results"),
+        _index_of(contents, "Table 1 below shows"),
+        _index_of(contents, "| Quarter |"),
+        _index_of(contents, "Revenue Chart"),
+        _index_of(contents, "<figure>"),
+        _index_of(contents, "Conclusion"),
+    ]
+    assert order == sorted(order)
+    for element in doc.elements:
+        if element.element_type == ElementType.FIGURE:
+            element.content.close()
+
+
+
+# ── OCR for partly scanned pages (2026-10-06) ─────────────────────────────────
+# OCR used to run only on pages with ZERO text. scanned.pdf's page 1 has a
+# 13-character text layer ("SAMPLE LETTER") over a full-page scan, so its
+# scanned body was silently lost.
+
+
+class _FixedTextOcrClient:
+    def __init__(self, text: str):
+        self._text = text
+        self.pages_seen = 0
+
+    def transcribe_page(self, image):
+        self.pages_seen += 1
+        return self._text
+
+
+def _text_pdf(lines: list[tuple[float, float, str]], font_size: float = 10) -> bytes:
+    """A one-page US Letter PDF (Helvetica, no images) with each `(x, y, text)`
+    drawn at PDF coordinates (origin bottom-left)."""
+    def esc(t: str) -> str:
+        return t.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+    stream = "\n".join(
+        f"BT /F1 {font_size} Tf {x} {y} Td ({esc(text)}) Tj ET" for x, y, text in lines
+    ).encode()
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R "
+        b"/Resources << /Font << /F1 5 0 R >> >> >>",
+        b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for i, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj\n".encode() + body + b"\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode()
+    for off in offsets:
+        out += f"{off:010d} 00000 n \n".encode()
+    out += f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    return bytes(out)
+
+
+def _minimal_text_only_pdf(text: str) -> bytes:
+    """A one-page PDF with a single short line of real text and no images."""
+    return _text_pdf([(72, 720, text)], font_size=12)
+
+
+def test_partly_scanned_page_is_ocrd_and_replaces_its_thin_text_layer():
+    ocr = _FixedTextOcrClient("SAMPLE LETTER\nDear customer, thank you for your order of 12 widgets.")
+    doc = Parser(ocr_tiers=[("fake", ocr)]).parse(load("scanned.pdf"), filename="scanned.pdf")
+
+    page_1 = [e for e in doc.elements if e.page_number == 1]
+    assert [e.element_id for e in page_1] == ["ocr-page-1"]
+    assert "thank you for your order" in page_1[0].content
+    assert ocr.pages_seen == 3
+
+
+def test_ocr_elements_stay_in_page_order_with_bbox_in_pdf_points():
+    ocr = _FixedTextOcrClient("recovered text")
+    doc = Parser(ocr_tiers=[("fake", ocr)]).parse(load("scanned.pdf"), filename="scanned.pdf")
+
+    pages = [e.page_number for e in doc.elements]
+    assert pages == sorted(pages)
+    page_1 = next(e for e in doc.elements if e.element_id == "ocr-page-1")
+    # scanned.pdf pages are US Letter (612 x 792 pt), not 150-dpi pixels.
+    assert (round(page_1.bbox.x1), round(page_1.bbox.y1)) == (612, 792)
+
+
+def test_partly_scanned_page_keeps_its_text_layer_when_every_ocr_tier_fails():
+    doc = Parser(ocr_tiers=[("fake", FakeOcrClient())]).parse(load("scanned.pdf"), filename="scanned.pdf")
+
+    page_1 = [e for e in doc.elements if e.page_number == 1]
+    assert len(page_1) == 1
+    assert page_1[0].content == "SAMPLE LETTER"
+
+
+def test_short_digital_page_without_a_scan_image_is_not_ocrd():
+    ocr = _FixedTextOcrClient("should never be used")
+    doc = Parser(ocr_tiers=[("fake", ocr)]).parse(_minimal_text_only_pdf("Short page"), filename="short.pdf")
+
+    assert ocr.pages_seen == 0
+    assert [e.content for e in doc.elements] == ["Short page"]
+
+
+
+# ── Two-column PDFs (2026-10-06) ──────────────────────────────────────────────
+# Lines used to be grouped purely by vertical position, so text from both
+# columns at the same height merged into one garbled line ("left words right
+# words") and paragraphs interleaved across columns.
+
+
+def _two_column_page() -> bytes:
+    lines = [(72, 740, "A Study of Two Column Layouts In Practice")]  # full-width title
+    left = [f"Left column sentence number {i} continues here." for i in range(1, 9)]
+    right = [f"Right column sentence number {i} goes on." for i in range(1, 9)]
+    for i, (l_text, r_text) in enumerate(zip(left, right)):
+        y = 700 - i * 14
+        lines.append((72, y, l_text))
+        lines.append((320, y, r_text))
+    return _text_pdf(lines)
+
+
+def test_two_column_text_is_read_column_by_column_not_merged_across():
+    doc = Parser(ocr_tiers=[]).parse(_two_column_page(), filename="two-col.pdf")
+    text = "\n".join(e.content for e in doc.elements if isinstance(e.content, str))
+
+    # No line mixes the two columns.
+    for line in text.split("\n"):
+        assert not ("Left column" in line and "Right column" in line), line
+    # Reading order: title, then the whole left column, then the whole right column.
+    order = [
+        text.index("A Study of Two Column"),
+        text.index("Left column sentence number 1 "),
+        text.index("Left column sentence number 8 "),
+        text.index("Right column sentence number 1 "),
+        text.index("Right column sentence number 8 "),
+    ]
+    assert order == sorted(order)
+
+
+def test_two_column_paragraphs_do_not_merge_across_the_gutter():
+    doc = Parser(ocr_tiers=[]).parse(_two_column_page(), filename="two-col.pdf")
+
+    for element in doc.elements:
+        if isinstance(element.content, str):
+            assert not ("Left column" in element.content and "Right column" in element.content)
+
+
+def test_right_column_short_lines_are_not_misread_as_indented_list_items():
+    lines = []
+    for i in range(8):
+        y = 700 - i * 14
+        lines.append((72, y, f"Body text on the left side number {i}."))
+        lines.append((320, y, f"Short right {i}." if i % 2 else f"Longer right column body text {i} here."))
+    doc = Parser(ocr_tiers=[]).parse(_text_pdf(lines), filename="two-col.pdf")
+
+    assert not [e for e in doc.elements if e.element_type == ElementType.LIST]
+
+
+def test_single_column_page_with_short_lines_is_unaffected():
+    lines = [(72, 700 - i * 14, f"Short line {i}") for i in range(10)]
+    doc = Parser(ocr_tiers=[]).parse(_text_pdf(lines), filename="one-col.pdf")
+    text = "\n".join(e.content for e in doc.elements if isinstance(e.content, str))
+
+    assert [ln for ln in text.split("\n") if ln] == [f"Short line {i}" for i in range(10)]

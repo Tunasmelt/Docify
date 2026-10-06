@@ -10,10 +10,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from db import queries
 from db.client import get_service_role_client
 from errors import error_envelope
-from models.query import CitationResponse, QueryMetadata, QueryRequest, QueryResponse
+from models.query import CitationResponse, QueryMetadata, QueryRequest, QueryResponse, display_bbox
 from rate_limit import limiter
 from services.figure_fetcher import fetch_generator_chunks, signed_figure_url
 from services.generator import CITATION_BRACKET, CITATION_NUMBER, GenerationError, Generator, GeneratorChunk
+from services.query_rewriter import QueryRewriter
 from services.retriever import Retriever
 from services.verifier import Verdict, VerdictLabel, Verifier
 
@@ -91,6 +92,23 @@ def get_generator() -> Generator:
 
 def get_verifier() -> Verifier:
     return Verifier()
+
+
+def get_query_rewriter() -> QueryRewriter:
+    return QueryRewriter()
+
+
+def _search_question(rewriter: QueryRewriter, payload: QueryRequest, prior_messages: list[dict]) -> str:
+    """The question retrieval searches with: rewritten into a standalone query
+    when the conversation has history (a follow-up like "and for Q2?" names
+    nothing on its own), else the user's own words. Generation always gets
+    the original question."""
+    if not prior_messages:
+        return payload.question
+    rewritten = rewriter.rewrite(payload.question, prior_messages)
+    if rewritten != payload.question:
+        logger.info("query: follow-up rewritten for retrieval (%d -> %d chars)", len(payload.question), len(rewritten))
+    return rewritten
 
 
 # 2026-08-02 — resolution cascade for _extract_claim_spans (Part 3,
@@ -250,6 +268,81 @@ def _extract_claim_spans(answer: str, cited_positions: set[int]) -> dict[int, st
     return spans
 
 
+_SENTENCE_WITH_SEPARATOR = re.compile(r"(?<=[.!?])(\s+)")
+_LEADING_MARKERS = re.compile(r"^((?:\s*\[[^\[\]]*\])+)\s*")
+_EMPTY_LIST_ITEM = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)])?\s*$")
+
+
+def _markers_in(text: str) -> list[int]:
+    return [
+        int(n.group())
+        for bracket in CITATION_BRACKET.finditer(text)
+        for n in CITATION_NUMBER.finditer(bracket.group(1))
+    ]
+
+
+def _has_prose(text: str) -> bool:
+    return bool(re.sub(r"[\s.,;:!?]", "", CITATION_BRACKET.sub("", text)))
+
+
+def _remove_unsupported_claims(answer: str, unsupported_positions: set[int]) -> tuple[str, int]:
+    """Removes every sentence whose citations were ALL judged unsupported by
+    the verifier — stripping only the [N] marker would leave the rejected
+    claim in the answer, now looking like ordinary uncited text. A sentence
+    that also cites a kept source stays (the kept source supports it); its
+    unsupported marker is stripped later by _strip_dropped_markers. Works
+    line by line so markdown lists keep their structure, and a marker-only
+    segment after a full stop ("Claim. [2]") counts for the sentence before
+    it. Returns (new_answer, number_of_sentences_removed)."""
+    if not unsupported_positions:
+        return answer, 0
+
+    removed = 0
+    out_lines: list[str] = []
+    for line in answer.split("\n"):
+        parts = _SENTENCE_WITH_SEPARATOR.split(line)
+        # parts alternates [sentence, separator, sentence, ...]; markers at the
+        # start of a segment are folded into the preceding sentence.
+        sentences: list[list[str]] = []  # [text, trailing_separator]
+        for i in range(0, len(parts), 2):
+            text = parts[i]
+            separator = parts[i + 1] if i + 1 < len(parts) else ""
+            leading = _LEADING_MARKERS.match(text) if sentences else None
+            if leading and _markers_in(leading.group(1)):
+                # "Claim. [2] Next sentence" — the markers belong to "Claim."
+                sentences[-1][0] += sentences[-1][1] + leading.group(1).strip()
+                sentences[-1][1] = " "
+                text = text[leading.end():]
+                if not text.strip():
+                    sentences[-1][1] = separator
+                    continue
+            sentences.append([text, separator])
+
+        kept_parts: list[str] = []
+        line_had_removal = False
+        for text, separator in sentences:
+            markers = _markers_in(text)
+            if markers and _has_prose(text) and all(m in unsupported_positions for m in markers):
+                removed += 1
+                line_had_removal = True
+                continue
+            kept_parts.append(text + separator)
+        new_line = "".join(kept_parts).rstrip()
+        if line_had_removal and _EMPTY_LIST_ITEM.match(new_line):
+            continue  # the whole line (e.g. a list item) was the unsupported claim
+        out_lines.append(new_line if line_had_removal else line)
+
+    return "\n".join(out_lines), removed
+
+
+def _note_removed_claims(answer: str, removed: int) -> str:
+    if not removed:
+        return answer
+    noun = "statement was" if removed == 1 else "statements were"
+    note = f"_{removed} {noun} removed because the cited source did not support {'it' if removed == 1 else 'them'}._"
+    return f"{answer.rstrip()}\n\n{note}" if answer.strip() else note
+
+
 def _strip_dropped_markers(answer: str, dropped_positions: set[int]) -> str:
     """Rewrites `[...]` brackets to remove only the dropped positions —
     NOT a naive per-marker string replace, since Gemini has been observed
@@ -351,13 +444,14 @@ def _load_history(client, payload: QueryRequest, user_id: str) -> tuple[list[dic
 @router.post("/query", response_model=QueryResponse, response_model_exclude_none=True)
 @limiter.shared_limit(QUERY_MINUTE_LIMIT, scope=QUERY_RATE_LIMIT_SCOPE)
 @limiter.shared_limit(QUERY_DAY_LIMIT, scope=QUERY_RATE_LIMIT_SCOPE)
-async def post_query(
+def post_query(
     payload: QueryRequest,
     request: Request,
     response: Response,
     retriever: Retriever = Depends(get_retriever),
     generator: Generator = Depends(get_generator),
     verifier: Verifier = Depends(get_verifier),
+    rewriter: QueryRewriter = Depends(get_query_rewriter),
 ):
     # `response` is never touched directly below — same reason as
     # routes/ingest.py's post_ingest: this route returns a plain
@@ -391,7 +485,8 @@ async def post_query(
 
     started = time.perf_counter()
 
-    retrieved = retriever.retrieve(payload.question, payload.document_ids, user_id, k=payload.k, rerank=payload.rerank)
+    search_question = _search_question(rewriter, payload, prior_messages)
+    retrieved = retriever.retrieve(search_question, payload.document_ids, user_id, k=payload.k, rerank=payload.rerank)
 
     if not retrieved:
         # A legitimate, benign outcome (no matching content) — not an
@@ -449,6 +544,7 @@ async def post_query(
     # answer with no matching citation object — a real, separate (non-
     # data-loss) bug found while adding these guards, fixed here too.
     dropped_positions: set[int] = set()
+    unsupported_positions: set[int] = set()
 
     verify_pairs: list[tuple[str, GeneratorChunk]] = []
     verify_positions: list[int] = []
@@ -539,6 +635,7 @@ async def post_query(
 
         if verdict.verdict == VerdictLabel.UNSUPPORTED:
             dropped_positions.add(position)
+            unsupported_positions.add(position)
             continue
 
         # figure_path is only set on GeneratorChunk when figure_fetcher.py's
@@ -562,10 +659,13 @@ async def post_query(
                 verdict=verdict.verdict.value,
                 supporting_quote=verdict.quote,
                 figure_url=figure_url,
+                bbox=display_bbox(chunk.bbox),
             )
         )
 
-    final_answer = _strip_dropped_markers(gen_result.answer, dropped_positions) if dropped_positions else gen_result.answer
+    pruned_answer, removed_claims = _remove_unsupported_claims(gen_result.answer, unsupported_positions)
+    final_answer = _strip_dropped_markers(pruned_answer, dropped_positions) if dropped_positions else pruned_answer
+    final_answer = _note_removed_claims(final_answer, removed_claims)
 
     latency_ms = int((time.perf_counter() - started) * 1000)
 
@@ -739,6 +839,7 @@ async def _stream_query_events(
     verifier: Verifier,
     prior_messages: list[dict],
     disconnected: asyncio.Event,
+    rewriter: QueryRewriter,
 ):
     """The actual SSE body for POST /query/stream (FEAT-016). Emits, in
     order: `retrieving` -> `token` (one per Gemini text delta, zero or
@@ -778,9 +879,13 @@ async def _stream_query_events(
         # — real retrieval latency is unbounded (a real Postgres/Voyage
         # call), and this is the very first potentially-long gap in the
         # whole stream, right after only one small event has gone out.
-        retrieve_task = asyncio.ensure_future(
-            asyncio.to_thread(retriever.retrieve, payload.question, payload.document_ids, user_id, k=payload.k, rerank=payload.rerank)
-        )
+        async def search_then_retrieve():
+            search_question = await asyncio.to_thread(_search_question, rewriter, payload, prior_messages)
+            return await asyncio.to_thread(
+                retriever.retrieve, search_question, payload.document_ids, user_id, k=payload.k, rerank=payload.rerank
+            )
+
+        retrieve_task = asyncio.ensure_future(search_then_retrieve())
         async for heartbeat in _yield_heartbeats_until_done(retrieve_task):
             yield heartbeat
         retrieved = retrieve_task.result()
@@ -899,6 +1004,7 @@ async def _stream_query_events(
         # add to the same set — see post_query's identical comment. Same
         # dangling-marker fix applied identically to both paths.
         dropped_positions: set[int] = set()
+        unsupported_positions: set[int] = set()
 
         verify_pairs: list[tuple[str, GeneratorChunk]] = []
         verify_positions: list[int] = []
@@ -967,6 +1073,7 @@ async def _stream_query_events(
 
             if verdict.verdict == VerdictLabel.UNSUPPORTED:
                 dropped_positions.add(position)
+                unsupported_positions.add(position)
                 continue
 
             figure_url = None
@@ -987,12 +1094,13 @@ async def _stream_query_events(
                     verdict=verdict.verdict.value,
                     supporting_quote=verdict.quote,
                     figure_url=figure_url,
+                    bbox=display_bbox(chunk.bbox),
                 )
             )
 
-        final_answer = (
-            _strip_dropped_markers(final_result.answer, dropped_positions) if dropped_positions else final_result.answer
-        )
+        pruned_answer, removed_claims = _remove_unsupported_claims(final_result.answer, unsupported_positions)
+        final_answer = _strip_dropped_markers(pruned_answer, dropped_positions) if dropped_positions else pruned_answer
+        final_answer = _note_removed_claims(final_answer, removed_claims)
 
         latency_ms = int((time.perf_counter() - started) * 1000)
 
@@ -1057,6 +1165,7 @@ async def _stream_query_events_with_disconnect_watch(
     verifier: Verifier,
     prior_messages: list[dict],
     request: Request,
+    rewriter: QueryRewriter,
 ):
     """Thin wrapper — owns the real disconnect-watcher task's lifecycle
     (spawned here, cancelled in `finally` on every exit path: success,
@@ -1069,7 +1178,7 @@ async def _stream_query_events_with_disconnect_watch(
     watch_task = asyncio.ensure_future(_watch_for_disconnect(request, disconnected))
     try:
         async for frame in _stream_query_events(
-            payload, user_id, client, retriever, generator, verifier, prior_messages, disconnected
+            payload, user_id, client, retriever, generator, verifier, prior_messages, disconnected, rewriter
         ):
             yield frame
     finally:
@@ -1085,6 +1194,7 @@ async def post_query_stream(
     retriever: Retriever = Depends(get_retriever),
     generator: Generator = Depends(get_generator),
     verifier: Verifier = Depends(get_verifier),
+    rewriter: QueryRewriter = Depends(get_query_rewriter),
 ):
     """SSE variant of POST /query (FEAT-016) — same auth/ownership/history
     validation, run to completion BEFORE the StreamingResponse is even
@@ -1103,16 +1213,18 @@ async def post_query_stream(
     error = _validate_payload(payload)
     if error is not None:
         return error
-    error = _check_ownership(client, payload, user_id)
+    # Both are blocking Supabase calls — off the event loop, same as every
+    # call inside the stream itself.
+    error = await asyncio.to_thread(_check_ownership, client, payload, user_id)
     if error is not None:
         return error
-    prior_messages, error = _load_history(client, payload, user_id)
+    prior_messages, error = await asyncio.to_thread(_load_history, client, payload, user_id)
     if error is not None:
         return error
 
     return StreamingResponse(
         _stream_query_events_with_disconnect_watch(
-            payload, user_id, client, retriever, generator, verifier, prior_messages, request
+            payload, user_id, client, retriever, generator, verifier, prior_messages, request, rewriter
         ),
         media_type="text/event-stream",
         headers={

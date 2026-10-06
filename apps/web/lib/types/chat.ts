@@ -1,3 +1,5 @@
+import type { CitationBBox } from "@/lib/api/types";
+
 export type CitationVerdict = "supported" | "partial" | "unverified";
 
 export interface Citation {
@@ -26,6 +28,10 @@ export interface Citation {
    * whose image fetch failed server-side. Never persisted client-side
    * beyond the current render; a fresh one is fetched on every reload. */
   figureUrl?: string;
+  /** Source document id and the chunk's position on its page — used to
+   * render the highlighted page preview ("Open page N in document"). */
+  documentId: string;
+  bbox?: CitationBBox;
 }
 
 export type MessageSegment =

@@ -1,4 +1,5 @@
 import base64
+import bisect
 import logging
 import os
 import re
@@ -7,6 +8,7 @@ from enum import Enum
 from io import BytesIO
 
 import docx
+from docx.table import Table as DocxTable
 import httpx
 import pdfplumber
 import pptx
@@ -378,6 +380,156 @@ def _group_chars_into_lines(page) -> list[dict]:
     return result
 
 
+# ── Column layout ─────────────────────────────────────────────────────────
+# Lines are grouped by vertical position, so on a two-column page the text of
+# both columns at the same height used to merge into one line. A page is
+# treated as two-column when an empty vertical strip (the gutter) runs down
+# its middle with text on both sides of it on many rows; lines are then split
+# at the gutter and read column by column. A line that crosses the gutter (a
+# title, a full-width heading) starts a new section: within each section the
+# left column is read before the right.
+_SEGMENT_GAP_PT = 12.0  # a horizontal gap this wide inside a row separates columns
+_MIN_GUTTER_PT = 8.0
+_MIN_COLUMN_ROWS = 6
+_GUTTER_SEARCH = (0.25, 0.75)  # gutter must lie in this horizontal band of the page
+
+
+def _line_from_chars(chars: list[dict]) -> dict:
+    chars = sorted(chars, key=lambda c: c["x0"])
+    return {
+        "text": "".join(c["text"] for c in chars).strip(),
+        "top": min(c["top"] for c in chars),
+        "bottom": max(c["bottom"] for c in chars),
+        "x0": chars[0]["x0"],
+        "x1": chars[-1]["x1"],
+        "size": sum(c["size"] for c in chars) / len(chars),
+        "bold": all("bold" in c["fontname"].lower() for c in chars),
+    }
+
+
+def _split_at_gaps(chars: list[dict]) -> list[list[dict]]:
+    chars = sorted(chars, key=lambda c: c["x0"])
+    segments = [[chars[0]]]
+    for ch in chars[1:]:
+        if ch["x0"] - segments[-1][-1]["x1"] > _SEGMENT_GAP_PT:
+            segments.append([ch])
+        else:
+            segments[-1].append(ch)
+    return segments
+
+
+def _detect_gutter(rows: list[list[list[dict]]], page_width: float) -> tuple[float, float] | None:
+    """rows: each row's character segments. Returns the gutter's (left, right)
+    x-extent, or None for a single-column page."""
+    if len(rows) < _MIN_COLUMN_ROWS or page_width <= 0:
+        return None
+    width = int(page_width) + 1
+    coverage = [0] * width
+    for segments in rows:
+        covered = set()
+        for seg in segments:
+            covered.update(range(max(0, int(seg[0]["x0"])), min(width, int(seg[-1]["x1"]) + 1)))
+        for x in covered:
+            coverage[x] += 1
+
+    lo, hi = int(page_width * _GUTTER_SEARCH[0]), int(page_width * _GUTTER_SEARCH[1])
+    threshold = max(1, len(rows) // 10)
+    best: tuple[int, int] | None = None
+    start = None
+    for x in range(lo, hi + 1):
+        if coverage[x] <= threshold:
+            start = x if start is None else start
+            if best is None or x - start > best[1] - best[0]:
+                best = (start, x)
+        else:
+            start = None
+    if best is None or best[1] - best[0] < _MIN_GUTTER_PT:
+        return None
+    left, right = float(best[0]), float(best[1])
+    both_sides = sum(
+        1
+        for segments in rows
+        if any(seg[-1]["x1"] <= left + 1 for seg in segments) and any(seg[0]["x0"] >= right - 1 for seg in segments)
+    )
+    if both_sides < max(3, len(rows) * 0.3):
+        return None  # e.g. a single column of short lines leaves the right side empty
+    return left, right
+
+
+def _most_common_x0(lines: list[dict], default: float) -> float:
+    counts: dict[float, int] = {}
+    for line in lines:
+        key = round(line["x0"], 0)
+        counts[key] = counts.get(key, 0) + 1
+    return max(counts, key=lambda k: counts[k]) if counts else default
+
+
+def _page_layout(page, exclude_bboxes: list, body_x0: float) -> dict:
+    """Lines of a page in reading order, excluding those inside tables or
+    figures. Each line carries "col" (-1 full width / single column, 0 left,
+    1 right) and "col_x0" (its column's left margin, for indent heuristics).
+    Also returns the gutter and the tops of full-width lines, which
+    `_reading_order_key` uses to place tables, figures and captions."""
+    by_top: dict[float, list] = {}
+    for ch in page.chars:
+        by_top.setdefault(round(ch["top"], 0), []).append(ch)
+    rows = []
+    for top in sorted(by_top):
+        line = _line_from_chars(by_top[top])
+        if not line["text"]:
+            continue
+        if any(_bbox_overlaps((line["x0"], line["top"], line["x1"], line["bottom"]), tb) for tb in exclude_bboxes):
+            continue
+        rows.append(_split_at_gaps(by_top[top]))
+
+    gutter = _detect_gutter(rows, float(page.width))
+    if gutter is None:
+        lines = [_line_from_chars([c for seg in segments for c in seg]) for segments in rows]
+        lines = [line for line in lines if line["text"]]
+        for line in lines:
+            line["col"], line["col_x0"] = -1, body_x0
+        return {"lines": lines, "gutter": None, "spanning_tops": []}
+
+    left_edge, right_edge = gutter
+    lines: list[dict] = []
+    for segments in rows:
+        if any(seg[0]["x0"] < left_edge - 1 and seg[-1]["x1"] > right_edge + 1 for seg in segments):
+            line = _line_from_chars([c for seg in segments for c in seg])
+            line["col"] = -1
+            lines.append(line)
+            continue
+        for col, side in ((0, [c for seg in segments if seg[-1]["x1"] <= right_edge for c in seg]),
+                          (1, [c for seg in segments if seg[-1]["x1"] > right_edge for c in seg])):
+            if side:
+                line = _line_from_chars(side)
+                if line["text"]:
+                    line["col"] = col
+                    lines.append(line)
+
+    spanning_tops = sorted(line["top"] for line in lines if line["col"] == -1)
+    layout = {"lines": lines, "gutter": gutter, "spanning_tops": spanning_tops}
+    col_x0 = {
+        col: _most_common_x0([line for line in lines if line["col"] == col], body_x0) for col in (-1, 0, 1)
+    }
+    for line in lines:
+        line["col_x0"] = body_x0 if line["col"] == -1 else col_x0[line["col"]]
+    lines.sort(key=lambda line: _reading_order_key(layout, (line["x0"], line["top"], line["x1"], line["bottom"])))
+    return layout
+
+
+def _reading_order_key(layout: dict, bbox: tuple[float, float, float, float]) -> tuple:
+    x0, top, x1, _bottom = bbox
+    gutter = layout["gutter"]
+    if gutter is None:
+        return (0, 0, top)
+    section = bisect.bisect_right(layout["spanning_tops"], top)
+    if x0 < gutter[0] - 1 and x1 > gutter[1] + 1:
+        col = -1
+    else:
+        col = 0 if (x0 + x1) / 2 < (gutter[0] + gutter[1]) / 2 else 1
+    return (section, col, top)
+
+
 def _classify_line(line: dict, body_size: float, body_x0: float) -> ElementType:
     if _CAPTION_PREFIX_RE.match(line["text"]):
         return ElementType.CAPTION
@@ -499,15 +651,8 @@ def _parse_pdf(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
                 figures = _extract_pdf_figures(page)
                 target_bboxes = [t["bbox"] for t in tables] + [f["bbox"] for f in figures]
 
-                lines = _group_chars_into_lines(page)
-                non_table_lines = [
-                    line
-                    for line in lines
-                    if not any(
-                        _bbox_overlaps((line["x0"], line["top"], line["x1"], line["bottom"]), tb)
-                        for tb in target_bboxes
-                    )
-                ]
+                layout = _page_layout(page, target_bboxes, body_x0)
+                non_table_lines = layout["lines"]
 
                 # Classify every remaining line; merge consecutive TEXT
                 # lines into one paragraph-level element (small vertical
@@ -556,8 +701,15 @@ def _parse_pdf(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
                     caption_buffer.clear()
 
                 prev_bottom = None
+                prev_col = None
                 for line in non_table_lines:
-                    kind = _classify_line(line, body_size, body_x0)
+                    if line["col"] != prev_col:
+                        # Never continue a paragraph or caption across columns.
+                        flush_text_buffer()
+                        flush_caption_buffer()
+                        prev_bottom = None
+                        prev_col = line["col"]
+                    kind = _classify_line(line, body_size, line["col_x0"])
                     line_height = line["bottom"] - line["top"] or 12.0
                     gap = (line["top"] - prev_bottom) if prev_bottom is not None else 0.0
 
@@ -622,12 +774,12 @@ def _parse_pdf(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
                     if target_idx is not None:
                         caption_ids_by_target_index.setdefault(target_idx, []).append(cap_id)
 
-                positioned: list[tuple[float, ParsedElement]] = []
+                positioned: list[tuple[tuple, ParsedElement]] = []
                 for t_idx, table in enumerate(tables):
                     element_counter += 1
                     positioned.append(
                         (
-                            table["bbox"][1],
+                            _reading_order_key(layout, table["bbox"]),
                             ParsedElement(
                                 element_type=ElementType.TABLE,
                                 page_number=page_number,
@@ -642,7 +794,7 @@ def _parse_pdf(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
                     element_counter += 1
                     positioned.append(
                         (
-                            figure["bbox"][1],
+                            _reading_order_key(layout, figure["bbox"]),
                             ParsedElement(
                                 element_type=ElementType.FIGURE,
                                 page_number=page_number,
@@ -658,7 +810,7 @@ def _parse_pdf(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
                     method = "explicit" if target_idx is not None else "none"
                     positioned.append(
                         (
-                            caption["bbox"][1],
+                            _reading_order_key(layout, caption["bbox"]),
                             ParsedElement(
                                 element_type=ElementType.CAPTION,
                                 page_number=page_number,
@@ -673,7 +825,7 @@ def _parse_pdf(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
                     element_counter += 1
                     positioned.append(
                         (
-                            el["bbox"][1],
+                            _reading_order_key(layout, el["bbox"]),
                             ParsedElement(
                                 element_type=el["type"],
                                 page_number=page_number,
@@ -731,9 +883,8 @@ _DOCX_LIST_STYLE_RE = re.compile(r"^List\b", re.IGNORECASE)
 _SENTINEL_BBOX = BBox(x0=0.0, y0=0.0, x1=0.0, y1=0.0)
 
 
-def _docx_image_bytes(document, inline_shape) -> bytes | None:
+def _docx_image_bytes_by_rid(document, rid: str) -> bytes | None:
     try:
-        rid = inline_shape._inline.graphic.graphicData.pic.blipFill.blip.embed
         return document.part.related_parts[rid].blob
     except Exception:
         return None
@@ -749,70 +900,78 @@ def _parse_docx(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
     dropped = 0
     counter = 0
 
+    def add_figure(image_bytes: bytes | None) -> None:
+        nonlocal counter, dropped
+        if image_bytes is None:
+            dropped += 1
+            logger.warning("parser: dropped a DOCX figure — could not resolve its image bytes")
+            return
+        try:
+            pil_image = Image.open(BytesIO(image_bytes)).convert("RGB")
+            pil_image.load()  # force decode now, while the source bytes are still in scope
+        except Exception:
+            dropped += 1
+            logger.warning("parser: dropped a DOCX figure — image bytes failed to decode", exc_info=True)
+            return
+        counter += 1
+        elements.append(
+            ParsedElement(
+                element_type=ElementType.FIGURE,
+                page_number=1,
+                bbox=_SENTINEL_BBOX,
+                content=pil_image,
+                element_id=f"docx-fig{counter}",
+            )
+        )
+
     try:
-        for paragraph in document.paragraphs:
+        # Body order, not "all paragraphs, then all tables, then all images":
+        # the chunker groups adjacent elements and matches captions by
+        # proximity, so a table or figure must stay where it sits in the text.
+        for block in document.iter_inner_content():
+            if isinstance(block, DocxTable):
+                rows = [[cell.text for cell in row.cells] for row in block.rows]
+                if len(rows) < _MIN_TABLE_ROWS:
+                    continue
+                counter += 1
+                elements.append(
+                    ParsedElement(
+                        element_type=ElementType.TABLE,
+                        page_number=1,
+                        bbox=_SENTINEL_BBOX,
+                        content=_rows_to_markdown(rows),
+                        element_id=f"docx-table{counter}",
+                    )
+                )
+                continue
+
+            paragraph = block
             text = paragraph.text.strip()
-            if not text:
-                continue
-            style_name = paragraph.style.name if paragraph.style else ""
-            if style_name.lower() == "caption" or _CAPTION_PREFIX_RE.match(text):
-                element_type = ElementType.CAPTION
-            elif _DOCX_HEADING_STYLE_RE.match(style_name):
-                element_type = ElementType.HEADING
-            elif _DOCX_LIST_STYLE_RE.match(style_name) or _BULLET_PREFIX_RE.match(text):
-                element_type = ElementType.LIST
-            else:
-                element_type = ElementType.TEXT
-
-            counter += 1
-            elements.append(
-                ParsedElement(
-                    element_type=element_type,
-                    page_number=1,
-                    bbox=_SENTINEL_BBOX,
-                    content=text,
-                    element_id=f"docx-p{counter}",
+            if text:
+                style_name = paragraph.style.name if paragraph.style else ""
+                if style_name.lower() == "caption" or _CAPTION_PREFIX_RE.match(text):
+                    element_type = ElementType.CAPTION
+                elif _DOCX_HEADING_STYLE_RE.match(style_name):
+                    element_type = ElementType.HEADING
+                elif _DOCX_LIST_STYLE_RE.match(style_name) or _BULLET_PREFIX_RE.match(text):
+                    element_type = ElementType.LIST
+                else:
+                    element_type = ElementType.TEXT
+                counter += 1
+                elements.append(
+                    ParsedElement(
+                        element_type=element_type,
+                        page_number=1,
+                        bbox=_SENTINEL_BBOX,
+                        content=text,
+                        element_id=f"docx-p{counter}",
+                    )
                 )
-            )
 
-        for table in document.tables:
-            rows = [[cell.text for cell in row.cells] for row in table.rows]
-            if len(rows) < _MIN_TABLE_ROWS:
-                continue
-            counter += 1
-            elements.append(
-                ParsedElement(
-                    element_type=ElementType.TABLE,
-                    page_number=1,
-                    bbox=_SENTINEL_BBOX,
-                    content=_rows_to_markdown(rows),
-                    element_id=f"docx-table{counter}",
-                )
-            )
-
-        for shape in document.inline_shapes:
-            image_bytes = _docx_image_bytes(document, shape)
-            if image_bytes is None:
-                dropped += 1
-                logger.warning("parser: dropped a DOCX figure — could not resolve its image bytes")
-                continue
-            try:
-                pil_image = Image.open(BytesIO(image_bytes)).convert("RGB")
-                pil_image.load()  # force decode now, while the source bytes are still in scope
-            except Exception:
-                dropped += 1
-                logger.warning("parser: dropped a DOCX figure — image bytes failed to decode", exc_info=True)
-                continue
-            counter += 1
-            elements.append(
-                ParsedElement(
-                    element_type=ElementType.FIGURE,
-                    page_number=1,
-                    bbox=_SENTINEL_BBOX,
-                    content=pil_image,
-                    element_id=f"docx-fig{counter}",
-                )
-            )
+            # Inline images live inside paragraph runs — same scope as the
+            # old document.inline_shapes (floating/anchored images excluded).
+            for rid in paragraph._element.xpath(".//wp:inline//a:blip/@r:embed"):
+                add_figure(_docx_image_bytes_by_rid(document, rid))
     except ParseError:
         raise
     except Exception as exc:
@@ -958,6 +1117,33 @@ def _parse_pptx(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
 # reasoning as DOCX — HTML has no page/coordinate concept either.
 
 _HTML_HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+_HTML_BLOCK_TAGS = _HTML_HEADING_TAGS | {"p", "li", "table", "figcaption", "caption"}
+_HTML_SKIP_TAGS = {"script", "style", "noscript", "template", "head"}
+
+
+def _iter_html_blocks(root):
+    """Yields block elements in document order. A matched block is not
+    descended into, so nested matches (a <p> inside an <li>, a <caption>
+    inside a <table>) are never emitted twice — the outer block's own text
+    already includes them. (`tree.css("h1, …, p")` returns nodes grouped by
+    selector, not in document order, which detached every heading from its
+    section.)"""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        tag = node.tag
+        if tag in _HTML_BLOCK_TAGS and node is not root:
+            yield node
+            continue
+        if tag in _HTML_SKIP_TAGS:
+            continue
+        children = []
+        child = node.child
+        while child is not None:
+            if child.tag != "-text":
+                children.append(child)
+            child = child.next
+        stack.extend(reversed(children))
 
 
 def _parse_html(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
@@ -970,10 +1156,38 @@ def _parse_html(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
     dropped = 0
     counter = 0
 
+    def emit_text(node, tag: str) -> None:
+        nonlocal counter
+        text = node.text(deep=True, separator=" ").strip()
+        if not text:
+            return
+        if tag in _HTML_HEADING_TAGS:
+            element_type = ElementType.HEADING
+        elif tag == "li":
+            element_type = ElementType.LIST
+        elif tag in ("figcaption", "caption") or _CAPTION_PREFIX_RE.match(text):
+            element_type = ElementType.CAPTION
+        else:
+            element_type = ElementType.TEXT
+        counter += 1
+        elements.append(
+            ParsedElement(
+                element_type=element_type,
+                page_number=1,
+                bbox=_SENTINEL_BBOX,
+                content=text,
+                element_id=f"html-el{counter}",
+            )
+        )
+
     try:
-        for node in tree.css("h1, h2, h3, h4, h5, h6, p, li, table, figcaption, caption"):
+        for node in _iter_html_blocks(tree.body or tree.root):
             tag = node.tag
             if tag == "table":
+                # A <caption> belongs to its table but precedes it in the DOM
+                # — emit it first so it stays adjacent, as the chunker expects.
+                for caption in node.css("caption"):
+                    emit_text(caption, "caption")
                 rows = []
                 for tr in node.css("tr"):
                     cells = [c.text(deep=True, separator=" ").strip() for c in tr.css("td, th")]
@@ -993,29 +1207,7 @@ def _parse_html(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
                 )
                 continue
 
-            text = node.text(deep=True, separator=" ").strip()
-            if not text:
-                continue
-
-            if tag in _HTML_HEADING_TAGS:
-                element_type = ElementType.HEADING
-            elif tag == "li":
-                element_type = ElementType.LIST
-            elif tag in ("figcaption", "caption") or _CAPTION_PREFIX_RE.match(text):
-                element_type = ElementType.CAPTION
-            else:
-                element_type = ElementType.TEXT
-
-            counter += 1
-            elements.append(
-                ParsedElement(
-                    element_type=element_type,
-                    page_number=1,
-                    bbox=_SENTINEL_BBOX,
-                    content=text,
-                    element_id=f"html-el{counter}",
-                )
-            )
+            emit_text(node, tag)
 
         # HTML figure extraction (img tags): confirmed real gap during the
         # original FEAT-020 investigation (Docling itself never resolved
@@ -1036,6 +1228,25 @@ def _parse_html(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
 # ══════════════════════════════════════════════════════════════════════════
 # Parser — format dispatch + OCR fallback
 # ══════════════════════════════════════════════════════════════════════════
+
+# A page whose text layer is this short AND that is mostly one image is a
+# scan with a stray text layer (a title, a stamp) — OCR it. scanned.pdf's
+# page 1 is the real case: 13 characters over a full-page scan.
+_LOW_YIELD_MAX_CHARS = 200
+_SCANNED_PAGE_MIN_IMAGE_COVERAGE = 0.5
+_OCR_REPLACEABLE_TYPES = {ElementType.TEXT, ElementType.HEADING, ElementType.LIST, ElementType.CAPTION}
+
+
+def _largest_image_coverage(page) -> float:
+    page_area = float(page.width) * float(page.height)
+    if page_area <= 0:
+        return 0.0
+    largest = 0.0
+    for img in page.images:
+        area = max(0.0, img["x1"] - img["x0"]) * max(0.0, img["bottom"] - img["top"])
+        largest = max(largest, area / page_area)
+    return largest
+
 
 _EXTENSION_TO_FORMAT = {
     "pdf": "pdf",
@@ -1092,20 +1303,27 @@ class Parser:
         original FEAT-020 investigation and unchanged here.
         """
         with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-            total_pages = len(pdf.pages)
+            page_info = {
+                page.page_number: (float(page.width), float(page.height), _largest_image_coverage(page))
+                for page in pdf.pages
+            }
 
-        pages_with_textual_content = {
-            e.page_number for e in elements if e.element_type in _TEXTUAL_ELEMENT_TYPES
-        }
+        textual_chars_by_page: dict[int, int] = {}
+        for e in elements:
+            if e.element_type in _TEXTUAL_ELEMENT_TYPES and isinstance(e.content, str):
+                textual_chars_by_page[e.page_number] = textual_chars_by_page.get(e.page_number, 0) + len(e.content)
 
-        for page_number in range(1, total_pages + 1):
-            if page_number in pages_with_textual_content:
-                continue
+        for page_number, (width, height, image_coverage) in page_info.items():
+            textual_chars = textual_chars_by_page.get(page_number)
+            if textual_chars is not None and not (
+                textual_chars < _LOW_YIELD_MAX_CHARS and image_coverage >= _SCANNED_PAGE_MIN_IMAGE_COVERAGE
+            ):
+                continue  # a real text layer — no OCR needed
 
             page_image = _render_pdf_page_image(file_bytes, page_number)
             if page_image is None:
                 logger.warning(
-                    "parser: page %s has no textual elements and could not be rendered for OCR fallback",
+                    "parser: page %s is low-yield and could not be rendered for OCR fallback",
                     page_number,
                 )
                 continue
@@ -1139,16 +1357,29 @@ class Parser:
                 )
                 continue
 
-            width, height = page_image.size
+            if textual_chars is not None:
+                # A partly scanned page: OCR transcribes the whole page, including
+                # the few characters of text layer, so the OCR text replaces the
+                # page's text elements rather than duplicating them. Tables and
+                # figures detected on the page are kept.
+                elements = [
+                    e
+                    for e in elements
+                    if not (e.page_number == page_number and e.element_type in _OCR_REPLACEABLE_TYPES)
+                ]
+
             elements.append(
                 ParsedElement(
                     element_type=ElementType.TEXT,
                     page_number=page_number,
-                    bbox=BBox(x0=0.0, y0=0.0, x1=float(width), y1=float(height)),
+                    bbox=BBox(x0=0.0, y0=0.0, x1=width, y1=height),
                     content=recovered_text,
                     element_id=f"ocr-page-{page_number}",
                 )
             )
             logger.info("parser: OCR fallback recovered text on page %s via tier=%s", page_number, recovered_tier)
 
+        # Stable sort: OCR elements land at the end of their own page, not at
+        # the end of the document.
+        elements.sort(key=lambda e: e.page_number)
         return elements
