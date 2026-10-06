@@ -20,7 +20,7 @@ from models.documents import (
 )
 from services.figure_fetcher import signed_figure_url
 from routes._pagination import decode_cursor, encode_cursor
-from routes.ingest import STUCK_DOCUMENT_THRESHOLD_SECONDS
+from routes.ingest import STUCK_DOCUMENT_THRESHOLD_SECONDS, StoragePathError, validate_storage_path
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +104,28 @@ def get_document(document_id: str, request: Request):
         return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "document not found"))
 
     return DocumentResponse(**row)
+
+
+@router.get("/documents/{document_id}/file")
+def get_document_file(document_id: UUID, request: Request):
+    user_id = request.state.user_id
+    client = get_service_role_client()
+    row = queries.get_document_file(client, document_id=str(document_id), user_id=user_id)
+    if row is None:
+        return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "document not found"))
+    try:
+        path = validate_storage_path(row["storage_path"], user_id).removeprefix("uploads/")
+    except StoragePathError:
+        return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "document not found"))
+    try:
+        signed = client.storage.from_("uploads").create_signed_url(path, 600)
+        url = signed.get("signedURL") or signed.get("signedUrl")
+        if not url:
+            raise ValueError("missing signed URL")
+    except Exception:
+        logger.warning("could not sign original file for document %s", document_id)
+        return JSONResponse(status_code=500, content=error_envelope("STORAGE_ERROR", "Couldn't open this document. Try again."))
+    return JSONResponse(content={"url": url, "mime_type": row["mime_type"]}, headers={"Cache-Control": "no-store"})
 
 
 # Same bound as the filenames real file systems allow.

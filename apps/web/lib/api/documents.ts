@@ -36,6 +36,10 @@ export async function getDocument(id: string): Promise<ApiDocument> {
   return apiFetch<ApiDocument>(`/documents/${id}`);
 }
 
+export function getDocumentFile(id: string): Promise<{ url: string; mime_type: string }> {
+  return apiFetch(`/documents/${id}/file`);
+}
+
 /** Changes the document's display name (PATCH /documents/{id}). */
 export async function renameDocument(id: string, filename: string): Promise<ApiDocument> {
   return apiFetch<ApiDocument>(`/documents/${id}`, {

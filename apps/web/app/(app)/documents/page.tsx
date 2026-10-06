@@ -9,6 +9,7 @@ import { Topbar, WorkspaceBadge, MobileMenuButton } from "@/components/layout/to
 import { ThemeToggle } from "@/components/theme-toggle";
 import { Button } from "@/components/ui/button";
 import { UploadZone, type UploadedDocument } from "@/components/documents/upload-zone";
+import { DocumentActionsDialog } from "@/components/documents/document-actions-dialog";
 import { DocumentCard, type DocumentCardData } from "@/components/documents/document-card";
 import { DeleteConfirmDialog } from "@/components/documents/delete-confirm-dialog";
 import { RenameDocumentDialog, type RenameDocumentTarget } from "@/components/documents/rename-document-dialog";
@@ -72,6 +73,7 @@ export default function DocumentsPage() {
   const [renameError, setRenameError] = React.useState<string | null>(null);
   const [renaming, setRenaming] = React.useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = React.useState(false);
+  const [openId, setOpenId] = React.useState<string | null>(null);
   const [selectedIds, setSelectedIds] = React.useState<string[]>([]);
 
   const pollTimeoutRef = React.useRef<ReturnType<typeof setTimeout>>();
@@ -299,12 +301,14 @@ export default function DocumentsPage() {
       ) : (
         <div className="flex flex-col gap-px px-3">
           {cardDocs.map((doc) => (
-            <div
+            <button
+              type="button"
+              onClick={() => { setOpenId(doc.id); setMobileMenuOpen(false); }}
               key={doc.id}
               className="cursor-pointer truncate rounded-md px-2.5 py-1.5 text-[12.5px] text-muted hover:bg-panel-hover hover:text-ink"
             >
               {doc.filename}
-            </div>
+            </button>
           ))}
         </div>
       )}
@@ -407,6 +411,7 @@ export default function DocumentsPage() {
                     <DocumentCard
                       key={doc.id}
                       doc={doc}
+                      onOpen={setOpenId}
                       onDelete={setDeleteId}
                       onRename={openRenameDialog}
                       selected={selectedIds.includes(doc.id)}
@@ -445,6 +450,8 @@ export default function DocumentsPage() {
           setDeleteError(null);
         }}
       />
+
+      <DocumentActionsDialog doc={docs.find((doc) => doc.id === openId) ?? null} onClose={() => setOpenId(null)} />
 
       {selectedIds.length > 0 ? (
         <div className="pointer-events-none fixed inset-x-0 bottom-6 z-40 flex justify-center">

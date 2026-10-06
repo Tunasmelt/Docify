@@ -36,3 +36,6 @@ anywhere in this codebase — checked via grep). Reasoning: long enough that a u
 doesn't hit a race against a expiring URL mid-read; short enough that a leaked/logged URL isn't
 a long-lived credential. Not a hard requirement from any spec — easy to tune later if real usage
 shows it's wrong in either direction.
+
+verified: 2026-10-07
+Rechecked original-file signed URLs against https://supabase.com/docs/reference/python/storage-from-createsignedurl ; create_signed_url(path, expires_in) remains supported. Document file endpoint uses a 600-second URL after ownership and stored-path validation.

@@ -1214,3 +1214,7 @@ CI now runs on pushes to feat/** and fix/** as well as master and pull requests,
 ## 2026-10-07 — infra: remove deprecated CI action runtimes and floating runners
 
 Updated checkout, setup-node, setup-uv and pnpm/action-setup to verified Node 24 releases and Supabase setup-cli to its current composite release. Pinned both jobs to ubuntu-24.04 to avoid the announced ubuntu-latest migration notice and unexpected OS changes. Application Node remains 22; Python remains 3.12. Release action manifests were checked before editing; GitHub CI validates the resulting workflow.
+
+## 2026-10-07 — feature: view or chat from document selection
+
+Document names in cards and sidebar open an action dialog with original-file viewing and a directly scoped chat. PDFs preview inline and can open in a new tab; other originals can be opened/downloaded. Ready row backgrounds toggle multi-document selection, and checkboxes now have document-specific accessible labels. Original-file URLs are short-lived, owner-scoped, validated and never cached. Added real Storage isolation tests and a browser view/selection/chat flow.

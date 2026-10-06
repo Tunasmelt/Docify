@@ -19,6 +19,7 @@ export interface DocumentCardData {
 export interface DocumentCardProps {
   doc: DocumentCardData;
   onDelete: (id: string) => void;
+  onOpen?: (id: string) => void;
   /** Opens the rename dialog. No button is rendered when omitted. */
   onRename?: (id: string) => void;
   /** Selection for scoping a new conversation — only offered for a
@@ -34,18 +35,22 @@ export interface DocumentCardProps {
   retrying?: boolean;
 }
 
-export function DocumentCard({ doc, onDelete, onRename, selected, onToggleSelect, onRetry, retrying }: DocumentCardProps) {
+export function DocumentCard({ doc, onDelete, onOpen, onRename, selected, onToggleSelect, onRetry, retrying }: DocumentCardProps) {
   const style = DOCUMENT_STATUS_STYLES[doc.status];
   const meta = `${doc.pages !== null ? `${doc.pages} PP` : "— PP"} · ${doc.date}`;
   const selectable = doc.status === "ready" && !!onToggleSelect;
   const failed = doc.status === "failed";
 
   return (
-    <div className="flex items-center gap-4 border-b border-line px-[18px] py-3.5 last:border-b-0 hover:bg-panel-hover">
+    <div className={`flex items-center gap-4 border-b border-line px-[18px] py-3.5 last:border-b-0 hover:bg-panel-hover ${selected ? "bg-panel-active" : ""}`}
+      onClick={(event) => {
+        if (selectable && !(event.target as HTMLElement).closest("button,a,input,[role=checkbox]")) onToggleSelect?.(doc.id);
+      }}>
       {onToggleSelect ? (
         selectable ? (
           <Checkbox
             title="Select for a conversation"
+            aria-label={`Select ${doc.filename} for a conversation`}
             checked={selected}
             onCheckedChange={() => onToggleSelect(doc.id)}
             className="flex-shrink-0"
@@ -59,7 +64,7 @@ export function DocumentCard({ doc, onDelete, onRename, selected, onToggleSelect
       </div>
       <div className="min-w-0 flex-1">
         <p className="m-0 truncate font-serif text-[15px] font-medium">
-          {doc.filename}
+          {onOpen ? <button type="button" onClick={() => onOpen(doc.id)} className="max-w-full truncate text-left hover:text-accent hover:underline" aria-label={`Open ${doc.filename}`}>{doc.filename}</button> : doc.filename}
         </p>
         <p className="m-0 mt-0.5 font-mono text-[11px] tracking-[0.04em] text-faint">
           {meta}
