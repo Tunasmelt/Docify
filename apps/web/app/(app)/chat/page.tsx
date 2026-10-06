@@ -162,8 +162,8 @@ export default function ConversationListPage() {
           left={
             <>
               <MobileMenuButton onClick={() => setMobileMenuOpen(true)} />
-              <span className="truncate text-sm font-semibold">Acme Legal</span>
-              <WorkspaceBadge>{workspace.name}</WorkspaceBadge>
+              <span className="truncate text-sm font-semibold">{workspace.name}</span>
+              <WorkspaceBadge>Workspace</WorkspaceBadge>
             </>
           }
           right={<ThemeToggle />}

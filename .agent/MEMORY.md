@@ -283,3 +283,8 @@ Cohere text fallback follows Gemini; embedding order remains Voyage, Gemini, Coh
 ### 2026-10-06 [codex] — test cleanup must match the returned identity
 
 Local GoTrue may ignore GET /auth/v1/admin/users?email=... and return all users. The old e2e cleanup loop deleted every returned account, including concurrent backend test users. It now verifies user.email exactly before deleting. A two-user real-Auth regression test verifies other accounts survive. Never rely on a vendor list filter as the sole deletion boundary.
+
+
+### 2026-10-07 [codex] — centred dialogs need opacity-only entrance animation
+
+Shared DialogContent is positioned with translate(-50%, -50%). The fade-up keyframe ended at transform:none, overriding that centring transform and leaving wide previews off-screen. Use fade-in without transform for dialogs and overlays. Workspace and document additions reuse existing design tokens and dialog/input/button components; headers show the actual active workspace.

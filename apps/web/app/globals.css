@@ -11,6 +11,7 @@
  * before collapsing them into one definition here.
  */
 :root {
+  color-scheme: light;
   --bg: #f7f4ee;
   --surface: #ffffff;
   --ink: #191714;
@@ -41,6 +42,7 @@
 }
 
 :root[data-theme="dark"] {
+  color-scheme: dark;
   --bg: #14120f;
   --surface: #221f1a;
   --ink: #ede7db;

@@ -28,7 +28,7 @@ test("document selection offers original viewing and a directly scoped chat", as
     const original = await page.request.get(originalUrl!);
     expect(original.status()).toBe(200);
     expect((await original.body()).subarray(0, 4).toString()).toBe("%PDF");
-    await dialog.getByRole("button", { name: "Close", exact: true }).click();
+    await dialog.getByRole("button", { name: "Close document", exact: true }).click();
     await main.getByRole("checkbox", { name: "Select preview.pdf for a conversation" }).check();
     await expect(page.getByText("1 SELECTED", { exact: true })).toBeVisible();
     await page.getByRole("button", { name: "Clear", exact: true }).click();
