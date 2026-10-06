@@ -45,6 +45,10 @@ const config: Config = {
         mono: ["var(--font-spline-mono)", "monospace"],
       },
       keyframes: {
+        fadeIn: {
+          from: { opacity: "0" },
+          to: { opacity: "1" },
+        },
         shimmer: {
           "0%": { backgroundPosition: "-400px 0" },
           "100%": { backgroundPosition: "400px 0" },
@@ -71,6 +75,7 @@ const config: Config = {
         },
       },
       animation: {
+        "fade-in": "fadeIn 0.2s ease both",
         shimmer: "shimmer 1.4s linear infinite",
         "pulse-dot": "pulseDot 1.2s ease-in-out infinite",
         "fade-up": "fadeUp 0.5s ease both",

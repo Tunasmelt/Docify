@@ -1218,3 +1218,11 @@ Updated checkout, setup-node, setup-uv and pnpm/action-setup to verified Node 24
 ## 2026-10-07 — feature: view or chat from document selection
 
 Document names in cards and sidebar open an action dialog with original-file viewing and a directly scoped chat. PDFs preview inline and can open in a new tab; other originals can be opened/downloaded. Ready row backgrounds toggle multi-document selection, and checkboxes now have document-specific accessible labels. Original-file URLs are short-lived, owner-scoped, validated and never cached. Added real Storage isolation tests and a browser view/selection/chat flow.
+
+
+## 2026-10-07 — fix: align workspace and document actions with Docify design
+
+- Styled the workspace selector and icon actions with existing sidebar typography, spacing, colour tokens and focus states. Create, rename and delete now use the shared dialog, input and button components.
+- Document actions use matching icons, a close control, themed loading/error states and a viewport-bounded original-file preview. Sidebar document links align left; page headers show the active workspace instead of the Acme Legal placeholder.
+- Workspace loading and retry states use the same theme. Dialog entrance animations fade without overriding the transform that centres the modal.
+- Browser coverage checks workspace dialog cancellation/focus, both themes, mobile fit, and the existing preview/direct-chat flow.

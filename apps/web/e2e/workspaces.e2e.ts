@@ -2,7 +2,7 @@ import { test, expect } from "@playwright/test";
 import { createTestUser, deleteTestUserByEmail, getAccessToken } from "./_local-supabase";
 import { seedDocument, seedConversationTurn } from "./_seed";
 
-test("private workspaces scope documents and chats and persist selection", async ({ page }) => {
+test("private workspaces scope documents and chats and persist selection", async ({ page }, testInfo) => {
   test.setTimeout(120000);
   const email = `e2e-workspaces-${Date.now()}@example.com`;
   const password = "test-password-123";
@@ -18,6 +18,16 @@ test("private workspaces scope documents and chats and persist selection", async
     const selector = page.getByLabel("Workspace", { exact: true });
     await expect(page.getByText("workspace-original.pdf", { exact: true }).first()).toBeVisible();
     const original = await selector.inputValue();
+    await page.screenshot({ path: testInfo.outputPath("workspace-light.png"), animations: "disabled" });
+    await page.getByRole("button", { name: "Dark mode", exact: true }).click();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    await page.screenshot({ path: testInfo.outputPath("workspace-dark.png"), animations: "disabled" });
+    await page.getByRole("button", { name: "New", exact: true }).click();
+    await expect(page.getByRole("dialog", { name: "New workspace" })).toBeVisible();
+    await expect(page.getByLabel("Workspace name")).toBeFocused();
+    await page.screenshot({ path: testInfo.outputPath("workspace-create.png"), animations: "disabled" });
+    await page.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
     await page.getByRole("button", { name: "New", exact: true }).click();
     await page.getByLabel("Workspace name").fill("Research");
     await page.getByRole("button", { name: "Save", exact: true }).click();
@@ -38,6 +48,18 @@ test("private workspaces scope documents and chats and persist selection", async
     await expect(page.getByText("workspace-original.pdf", { exact: true }).first()).toBeVisible();
     await page.getByRole("link", { name: "Conversations", exact: true }).click();
     await expect(page.getByText("Original workspace chat", { exact: true })).toBeVisible();
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.locator("header button").first().click();
+    await expect(selector).toBeVisible();
+    await page.screenshot({ path: testInfo.outputPath("workspace-mobile.png"), animations: "disabled" });
+    await page.getByRole("button", { name: "New", exact: true }).click();
+    const mobileDialog = page.getByRole("dialog", { name: "New workspace" });
+    await expect(mobileDialog).toBeVisible();
+    const bounds = await mobileDialog.boundingBox();
+    expect(bounds!.x).toBeGreaterThanOrEqual(0);
+    expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(390);
+    await page.screenshot({ path: testInfo.outputPath("workspace-mobile-dialog.png"), animations: "disabled" });
+    await page.getByRole("button", { name: "Cancel", exact: true }).click();
   } finally {
     await deleteTestUserByEmail(email);
   }

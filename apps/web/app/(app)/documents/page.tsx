@@ -305,7 +305,7 @@ export default function DocumentsPage() {
               type="button"
               onClick={() => { setOpenId(doc.id); setMobileMenuOpen(false); }}
               key={doc.id}
-              className="cursor-pointer truncate rounded-md px-2.5 py-1.5 text-[12.5px] text-muted hover:bg-panel-hover hover:text-ink"
+              className="cursor-pointer truncate rounded-md px-2.5 py-1.5 text-left text-[12.5px] text-muted transition-colors hover:bg-panel-hover hover:text-ink focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-focus-ring"
             >
               {doc.filename}
             </button>
@@ -329,8 +329,8 @@ export default function DocumentsPage() {
           left={
             <>
               <MobileMenuButton onClick={() => setMobileMenuOpen(true)} />
-              <span className="truncate text-sm font-semibold">Acme Legal</span>
-              <WorkspaceBadge>{workspace.name}</WorkspaceBadge>
+              <span className="truncate text-sm font-semibold">{workspace.name}</span>
+              <WorkspaceBadge>Workspace</WorkspaceBadge>
             </>
           }
           right={

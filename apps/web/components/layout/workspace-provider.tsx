@@ -3,6 +3,8 @@
 import * as React from "react";
 import { ApiError } from "@/lib/api/client";
 import { listWorkspaces, type Workspace } from "@/lib/api/workspaces";
+import { Loader2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
 
 const Context = React.createContext<{
   workspaces: Workspace[];
@@ -44,7 +46,12 @@ export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
     setActiveId(id);
   }, []);
   const active = workspaces.find((w) => w.id === activeId) ?? workspaces[0];
-  if (!active) return <div className="p-6" role="status">{error ?? "Loading workspace…"}{error && <button className="ml-3 underline" onClick={() => refresh().catch(() => {})}>Try again</button>}</div>;
+  if (!active) return <div className="flex min-h-dvh items-center justify-center bg-bg px-6">
+    <div className="max-w-sm text-center">
+      <p className="mb-6 font-serif text-[24px] font-semibold">Docify<sup className="ml-0.5 text-xs text-accent">1</sup></p>
+      {error ? <><p role="alert" className="text-sm leading-relaxed text-destructive">{error}</p><Button variant="outline" className="mt-4" onClick={() => refresh().catch((err) => setError(err instanceof ApiError ? err.message : "Couldn't load workspaces."))}>Try again</Button></> : <p role="status" className="flex items-center justify-center gap-2 text-sm text-muted"><Loader2 size={16} className="animate-spin" aria-hidden="true" />Loading workspace…</p>}
+    </div>
+  </div>;
   return <Context.Provider value={{ workspaces, active, select, refresh }}>
     <React.Fragment key={active.id}>{children}</React.Fragment>
   </Context.Provider>;
