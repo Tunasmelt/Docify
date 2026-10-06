@@ -118,7 +118,11 @@ def _reciprocal_rank_fusion(ranked_lists: list[list[dict]], *, rrf_k: int) -> li
     Gemini distance, only "how this chunk ranked within its own
     provider's search"). Callers pass [vector_results_provider_a,
     vector_results_provider_b, ..., fts_results] — order among the list
-    doesn't matter, RRF treats every ranked list identically."""
+    doesn't matter, RRF treats every ranked list identically.
+
+    Exact ties (common: two chunks that are each rank 1 in a different
+    list) are broken by chunk id, so the order never depends on which
+    list happened to be passed first."""
     scores: dict[str, float] = {}
     rows_by_id: dict[str, dict] = {}
 
@@ -127,7 +131,7 @@ def _reciprocal_rank_fusion(ranked_lists: list[list[dict]], *, rrf_k: int) -> li
             scores[row["id"]] = scores.get(row["id"], 0.0) + 1.0 / (rrf_k + rank)
             rows_by_id.setdefault(row["id"], row)
 
-    ranked_ids = sorted(scores, key=lambda chunk_id: scores[chunk_id], reverse=True)
+    ranked_ids = sorted(scores, key=lambda chunk_id: (-scores[chunk_id], chunk_id))
     return [(rows_by_id[chunk_id], scores[chunk_id]) for chunk_id in ranked_ids]
 
 
@@ -265,7 +269,7 @@ class Retriever:
         with ThreadPoolExecutor(max_workers=len(providers_in_scope) + 1) as pool:
             vector_futures = [
                 pool.submit(self._embed_and_search_for_provider, question, document_ids, user_id, pool_size, provider)
-                for provider in providers_in_scope
+                for provider in sorted(providers_in_scope)
             ]
             fts_future = pool.submit(self._fts_search, question, document_ids, user_id, pool_size)
             vector_result_lists = [future.result() for future in vector_futures]

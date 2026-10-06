@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api:
+    name: API tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: apps/api
+    env:
+      # Vendor clients are faked in tests; these only need to be present.
+      GEMINI_API_KEY: dummy
+      VOYAGE_API_KEY: dummy
+      LOCAL_DB: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Tesseract and psql
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tesseract-ocr postgresql-client
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: apps/api/uv.lock
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      # Integration tests need real Postgres, Auth, Storage and PostgREST.
+      - name: Start local Supabase
+        run: supabase start -x studio,imgproxy,edge-runtime,logflare,vector,supavisor,realtime
+
+      # `supabase start` doesn't apply apps/api/migrations (see docs/DEVELOPMENT.md).
+      - name: Apply migrations
+        env:
+          PGOPTIONS: --client-min-messages=warning
+        run: |
+          for f in $(ls migrations/2*.sql | sort); do
+            psql "$LOCAL_DB" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+          psql "$LOCAL_DB" -v ON_ERROR_STOP=1 -f migrations/verify_20260722_001.sql
+
+      # Integration tests skip (rather than fail) when Supabase is unreachable,
+      # so a missing stack would otherwise show up as a green run.
+      - name: Run tests
+        run: |
+          uv run pytest -q -p no:randomly -rs | tee pytest.log
+          if grep -q "no local Supabase reachable" pytest.log; then
+            echo "::error::Integration tests were skipped: local Supabase not reachable"
+            exit 1
+          fi
+
+  web:
+    name: Web lint + build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: apps/web
+    env:
+      # Build-time placeholders (inlined into the bundle); no service is called.
+      NEXT_PUBLIC_SUPABASE_URL: http://127.0.0.1:54321
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ci-placeholder-anon-key
+      NEXT_PUBLIC_API_URL: http://127.0.0.1:8000
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm exec tsc --noEmit
+
+      - name: Build
+        run: pnpm build

@@ -92,7 +92,7 @@ cd apps/web && pnpm build               # production build — runs ESLint as a 
 
 - Backend integration tests talk to the local Supabase stack, and conftest points the app at it automatically. If the stack isn't running they **skip** rather than fail, so a green run without `supabase start` is not full coverage.
 - E2E tests need local Supabase **and** the API running (terminal 1 above), with migrations applied. They create and delete their own throwaway users.
-- Backend tests fake Voyage/Gemini by default. A few live-API tests are opt-in via `RUN_REAL_*=1` env vars (see the `skipif` markers in `tests/`). E2E chat and upload tests go through the real running API, so they **do** use Voyage/Gemini free-tier quota (Voyage allows ~3 requests/minute).
+- Backend tests fake Voyage/Gemini by default. A few live-API tests are opt-in via `RUN_REAL_*=1` env vars (see the `skipif` markers in `tests/`). Tests that need the public internet (e.g. the Voyage tokenizer download) carry the `network` marker and are deselected by default; run them with `uv run pytest -m network`. E2E chat and upload tests go through the real running API, so they **do** use Voyage/Gemini free-tier quota (Voyage allows ~3 requests/minute).
 - Before calling a multi-file change done, verify from a fresh clone (`git stash -u` or a new `git clone`). The working tree can hide files you never committed (STANDARDS.md §Testing).
 
 ## Contributing
@@ -100,4 +100,4 @@ cd apps/web && pnpm build               # production build — runs ESLint as a 
 - Branch from `master` using `feat/FEAT-NNN-…`, `fix/…`, `docs/…` (STANDARDS.md §Git); never commit to `master` directly.
 - Commit format: `<type>(<scope>): <summary> [<agent-tag>]`.
 - A PR that changes behaviour updates `CHANGELOG.md`; schema changes add a migration plus a row in SCHEMA.md's migration log; API changes update `.agent/API_CONTRACT.md` and `apps/web/lib/types/` together.
-- There is no CI yet, so run the commands in step 5 before opening a PR.
+- CI (`.github/workflows/ci.yml`) runs the backend suite against a fresh local Supabase stack, plus web lint, typecheck and build, on every PR. Run the commands in step 5 locally first. CI doesn't run the Playwright e2e suite.

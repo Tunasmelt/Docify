@@ -114,7 +114,7 @@ Source of truth for what is and is not in scope, per phase. Check here before de
 - [ ] Demo video/GIF and a "try with a sample document" flow on the landing page
 - [x] README at repo root: overview, screenshots, tech stack, quick start
 - [ ] Custom domain (if one is available)
-- [ ] CI: run `pytest`, `next lint`, and `next build` on every PR (GitHub Actions). No CI exists today
+- [x] CI: `pytest` (against a local Supabase stack), `next lint`, `tsc` and `next build` on every PR (`.github/workflows/ci.yml`). Playwright e2e is not run in CI
 - [ ] Error tracking (Sentry free tier, FEAT-025)
 - [ ] Uptime monitor (UptimeRobot free) against `GET /health`
 - [ ] **Production job execution for `/ingest`.** FastAPI `BackgroundTasks` is not a job system. Status of each facet:

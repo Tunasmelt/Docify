@@ -6,6 +6,21 @@ Entry types: `feature` · `fix` · `decision` · `refactor` · `test` · `infra`
 
 ---
 
+## 2026-10-06 — infra: CI on every PR, deterministic RRF ties, network-only test marker
+
+**Phase:** 5
+**Feature:** n/a
+**Changed:**
+- **CI** (`.github/workflows/ci.yml`). Runs on every PR and on pushes to `master`, as two jobs. `api`: `uv sync --locked`, `supabase start`, every migration in filename order plus the verify script, then the full `pytest` suite. The job fails if the integration tests were skipped for lack of Supabase, since they otherwise skip silently. `web`: `pnpm install --frozen-lockfile`, `pnpm lint`, `tsc --noEmit`, `pnpm build`, with placeholder `NEXT_PUBLIC_*` values.
+- **RRF ties** (`services/retriever.py`). Two chunks that are each rank 1 in a different provider's list tie exactly on score. Their order came from iterating a `set` of provider names, which is hash-randomized per process, so the same query could rank differently on each server restart and `test_mixed_provider_scope_…` failed about 3 runs in 10. Ties now break by chunk id, and providers are searched in sorted order. The test had relied on that tie, so it now checks what its docstring claims: the gemini partition's own ranking keeps the relevant gemini chunk and drops an irrelevant one. Resolves the 2026-08-02 MEMORY.md open question.
+- **`network` pytest marker** (`pyproject.toml`). `test_real_voyage_tokenizer_is_available_without_an_api_call` downloads from Hugging Face, so it is deselected by default and runs with `pytest -m network`.
+**Verified:**
+- On the old code the mixed-provider test failed under 3 of 10 `PYTHONHASHSEED` values; on the new code it passed under 20 of 20. A new unit test checks that tie order does not depend on list order.
+- The CI steps were run locally: fresh `supabase db reset`, all migrations, the verify script all OK; `pytest` 459 passed, 18 skipped (opt-in live-API tests), 1 deselected (`network`); `pnpm lint` (warnings only), `tsc`, `pnpm build` pass without `.env.local`.
+**Deploy:** no migrations.
+
+---
+
 ## 2026-10-06 — feature: two-column PDFs, highlighted page preview, follow-up query rewriting, batched verification
 
 **Phase:** 5

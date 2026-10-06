@@ -55,6 +55,10 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+# Tests that need the public internet (not just local Supabase) are skipped
+# unless selected explicitly: `pytest -m network`.
+markers = ["network: needs outbound internet access (e.g. a Hugging Face download)"]
+addopts = "-m 'not network'"
 
 [tool.uv]
 # langsmith is transitive only (voyageai -> langchain-text-splitters ->
