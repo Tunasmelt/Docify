@@ -1210,3 +1210,7 @@ Final checks: 50 focused backend tests passed; three corrected contract regressi
 ## 2026-10-07 — infra: verify feature branches in GitHub CI
 
 CI now runs on pushes to feat/** and fix/** as well as master and pull requests, so the completed Cohere/workspace feature receives GitHub verification before merging. Ignored .claude/data/ because it contains generated local SQLite runtime state. Commit includes all implementation, tests and documentation from the resumed task; local environment files and runtime databases remain outside version control.
+
+## 2026-10-07 — infra: remove deprecated CI action runtimes and floating runners
+
+Updated checkout, setup-node, setup-uv and pnpm/action-setup to verified Node 24 releases and Supabase setup-cli to its current composite release. Pinned both jobs to ubuntu-24.04 to avoid the announced ubuntu-latest migration notice and unexpected OS changes. Application Node remains 22; Python remains 3.12. Release action manifests were checked before editing; GitHub CI validates the resulting workflow.

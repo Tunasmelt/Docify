@@ -12,7 +12,7 @@ concurrency:
 jobs:
   api:
     name: API tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
       run:
@@ -23,12 +23,12 @@ jobs:
       VOYAGE_API_KEY: dummy
       LOCAL_DB: postgresql://postgres:postgres@127.0.0.1:54322/postgres
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Install Tesseract and psql
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tesseract-ocr postgresql-client
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           python-version: "3.12"
           enable-cache: true
@@ -37,7 +37,7 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
-      - uses: supabase/setup-cli@v1
+      - uses: supabase/setup-cli@v3.0.1
         with:
           version: latest
 
@@ -67,7 +67,7 @@ jobs:
 
   web:
     name: Web lint + build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     defaults:
       run:
@@ -79,13 +79,13 @@ jobs:
       NEXT_PUBLIC_API_URL: http://127.0.0.1:8000
       NEXT_TELEMETRY_DISABLED: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6.1.0
         with:
           version: 10
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: 22
           cache: pnpm
