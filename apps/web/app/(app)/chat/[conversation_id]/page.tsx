@@ -4,6 +4,7 @@ import * as React from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Pencil, Trash2 } from "lucide-react";
 
+import { useWorkspace } from "@/components/layout/workspace-provider";
 import { Sidebar } from "@/components/layout/sidebar";
 import { Topbar, WorkspaceBadge, MobileMenuButton } from "@/components/layout/topbar";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -47,6 +48,7 @@ function truncateTitle(text: string): string {
 
 export default function ChatPage({ params }: { params: { conversation_id: string } }) {
   const router = useRouter();
+  const { active: workspace, select: selectWorkspace } = useWorkspace();
   const currentUser = useCurrentUser();
   const [preferences] = usePreferences();
   const searchParams = useSearchParams();
@@ -151,6 +153,10 @@ export default function ChatPage({ params }: { params: { conversation_id: string
     getConversationMessages(params.conversation_id)
       .then((result) => {
         if (cancelled) return;
+        if (result.conversation.workspace_id !== workspace.id) {
+          selectWorkspace(result.conversation.workspace_id);
+          return;
+        }
         setMessages(result.messages);
         setDocumentIds(result.conversation.document_ids);
         setTitle(result.conversation.title);
@@ -169,14 +175,14 @@ export default function ChatPage({ params }: { params: { conversation_id: string
     return () => {
       cancelled = true;
     };
-  }, [isNew, params.conversation_id]);
+  }, [isNew, params.conversation_id, workspace.id, selectWorkspace]);
 
   // The sidebar's "Recent" list — independent of which conversation is
   // currently open, so a stale list here never blocks the main thread of
   // reading/asking questions.
   React.useEffect(() => {
     let cancelled = false;
-    listConversations()
+    listConversations(workspace.id)
       .then((result) => {
         if (!cancelled) setRecentConversations(result.conversations);
       })
@@ -186,7 +192,7 @@ export default function ChatPage({ params }: { params: { conversation_id: string
     return () => {
       cancelled = true;
     };
-  }, [conversationId]);
+  }, [conversationId, workspace.id]);
 
   // Batch 1, item 6: document-scope chips need document_ids -> filename,
   // and GET /conversations/{id}/messages doesn't return names itself —
@@ -196,7 +202,7 @@ export default function ChatPage({ params }: { params: { conversation_id: string
   // conversation is open, same as the "Recent" list above.
   React.useEffect(() => {
     let cancelled = false;
-    listDocuments()
+    listDocuments(workspace.id)
       .then((result) => {
         if (!cancelled) setDocNamesById(new Map(result.documents.map((d) => [d.id, d.filename])));
       })
@@ -208,7 +214,7 @@ export default function ChatPage({ params }: { params: { conversation_id: string
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [workspace.id]);
 
   async function ask(question: string) {
     if (documentIds.length === 0) {

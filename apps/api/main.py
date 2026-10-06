@@ -12,7 +12,7 @@ from slowapi.middleware import SlowAPIMiddleware
 
 from middleware.auth import JWTAuthMiddleware
 from rate_limit import limiter, rate_limit_exceeded_handler
-from routes import account, conversations, documents, export, health, ingest, query
+from routes import account, conversations, documents, export, health, ingest, query, workspaces
 from services import ingest_queue
 from services.observability import init_sentry
 
@@ -69,3 +69,4 @@ app.include_router(query.router)
 app.include_router(conversations.router)
 app.include_router(export.router)
 app.include_router(account.router)
+app.include_router(workspaces.router)

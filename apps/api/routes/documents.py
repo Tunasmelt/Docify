@@ -3,6 +3,7 @@ import threading
 import uuid
 from collections import OrderedDict
 from io import BytesIO
+from uuid import UUID
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, Response
@@ -19,7 +20,7 @@ from models.documents import (
 )
 from services.figure_fetcher import signed_figure_url
 from routes._pagination import decode_cursor, encode_cursor
-from routes.ingest import STUCK_DOCUMENT_THRESHOLD_SECONDS
+from routes.ingest import STUCK_DOCUMENT_THRESHOLD_SECONDS, StoragePathError, validate_storage_path
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,7 @@ _VALID_STATUSES = {"uploaded", "parsing", "embedded", "ready", "failed"}
 def list_documents(
     request: Request,
     status: str | None = None,
+    workspace_id: UUID | None = None,  # omitted: documents from every workspace
     limit: int = Query(50, ge=1, le=200),
     cursor: str | None = None,
 ):
@@ -70,7 +72,14 @@ def list_documents(
     if reaped:
         logger.warning("reaped %d stale document(s) for user %s: %s", len(reaped), user_id, reaped)
 
-    rows = queries.list_documents(client, user_id=user_id, status=status, limit=limit, cursor_created_at=cursor_created_at)
+    rows = queries.list_documents(
+        client,
+        user_id=user_id,
+        status=status,
+        limit=limit,
+        cursor_created_at=cursor_created_at,
+        workspace_id=str(workspace_id) if workspace_id else None,
+    )
 
     # Fetched limit + 1 to detect whether another page exists without a
     # separate count query — the probe row itself is never returned.
@@ -95,6 +104,28 @@ def get_document(document_id: str, request: Request):
         return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "document not found"))
 
     return DocumentResponse(**row)
+
+
+@router.get("/documents/{document_id}/file")
+def get_document_file(document_id: UUID, request: Request):
+    user_id = request.state.user_id
+    client = get_service_role_client()
+    row = queries.get_document_file(client, document_id=str(document_id), user_id=user_id)
+    if row is None:
+        return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "document not found"))
+    try:
+        path = validate_storage_path(row["storage_path"], user_id).removeprefix("uploads/")
+    except StoragePathError:
+        return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "document not found"))
+    try:
+        signed = client.storage.from_("uploads").create_signed_url(path, 600)
+        url = signed.get("signedURL") or signed.get("signedUrl")
+        if not url:
+            raise ValueError("missing signed URL")
+    except Exception:
+        logger.warning("could not sign original file for document %s", document_id)
+        return JSONResponse(status_code=500, content=error_envelope("STORAGE_ERROR", "Couldn't open this document. Try again."))
+    return JSONResponse(content={"url": url, "mime_type": row["mime_type"]}, headers={"Cache-Control": "no-store"})
 
 
 # Same bound as the filenames real file systems allow.

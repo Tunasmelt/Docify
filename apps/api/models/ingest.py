@@ -1,3 +1,5 @@
+from uuid import UUID
+
 from pydantic import BaseModel, Field
 
 
@@ -6,6 +8,8 @@ class IngestRequest(BaseModel):
     filename: str
     mime_type: str
     size_bytes: int = Field(gt=0)
+    # Omitted: the user's default workspace.
+    workspace_id: UUID | None = None
 
 
 class IngestResponse(BaseModel):

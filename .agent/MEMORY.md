@@ -275,3 +275,11 @@ Explicit assumptions made without confirmation. Flag before acting on them.
 ## §Agent identity log
 
 Not maintained separately — authorship is recorded by the `[agent-tag]` at the end of every commit message (`git log --format='%h %s'`).
+
+## 2026-10-06 [codex] — resumed implementation decisions
+
+Cohere text fallback follows Gemini; embedding order remains Voyage, Gemini, Cohere with independent vector spaces. Personal workspaces are private per user. Retain user-scoped Storage paths. Workspace switches remount page state to avoid stale document selections and pending fetches. Direct conversation links select their stored workspace. Run browser tests with local Supabase environment overrides: the developer's .env.local points Auth at production. Do not overwrite it. Existing interrupted migrations retain their 20261007 filenames; apply in filename order after 20261006 migrations. Keep Cohere credentials in runtime environment only.
+
+### 2026-10-06 [codex] — test cleanup must match the returned identity
+
+Local GoTrue may ignore GET /auth/v1/admin/users?email=... and return all users. The old e2e cleanup loop deleted every returned account, including concurrent backend test users. It now verifies user.email exactly before deleting. A two-user real-Auth regression test verifies other accounts survive. Never rely on a vendor list filter as the sole deletion boundary.

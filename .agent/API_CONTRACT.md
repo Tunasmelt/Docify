@@ -586,3 +586,15 @@ Deleting the auth user first would make an interrupted cleanup unrecoverable —
 ## Contract version
 
 - Current: `v0.1`. The original plan was to freeze at `v1.0` once the frontend shipped; that milestone has passed (frontend deployed 2026-08-09) but the version has not been bumped. Until it is, breaking changes are still allowed but must update `apps/web/lib/types/` in the same PR and get a CHANGELOG entry.
+
+## Personal workspaces (2026-10-06)
+
+Authenticated endpoints: `GET /workspaces` returns `{workspaces: [{id, name, created_at, document_count}]}`. `POST /workspaces` with `{name}` creates one (201); `PATCH /workspaces/{id}` renames it; `DELETE /workspaces/{id}` returns 204. Names are trimmed, 1–60 characters, without control characters, unique per user ignoring case. Maximum 20 workspaces. A missing/foreign workspace returns 404. Delete returns 409 for the only workspace or a workspace with documents; an empty workspace's conversations cascade.
+
+`POST /ingest` accepts optional `workspace_id`, defaulting to the user's oldest workspace. `GET /documents` and `GET /conversations` accept optional UUID `workspace_id`; omitted means all owned workspaces, preserving existing clients. Document, conversation list and conversation detail responses include `workspace_id`.
+
+Both query endpoints reject document sets spanning workspaces, or documents outside an existing conversation's workspace, with 422. Retrieval stays scoped by authenticated user and explicit document IDs. Workspaces are private per user; no team membership or invitations.
+
+## Original document viewing (2026-10-07)
+
+Authenticated GET /documents/{id}/file returns {url, mime_type} with Cache-Control: no-store. The URL expires in 600 seconds. Lookup filters by authenticated user; missing and foreign documents return the same 404, malformed UUIDs return 422. Stored paths are validated before signing; Storage failure returns 500 STORAGE_ERROR.

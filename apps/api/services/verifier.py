@@ -13,7 +13,8 @@ from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 
-from services.gemini_retry import call_with_retry
+from services import cohere_client
+from services.gemini_retry import call_with_retry, can_fall_back_to_cohere
 
 from services.generator import GeneratorChunk
 
@@ -74,6 +75,32 @@ class _BatchVerdictItem(pydantic.BaseModel):
     verdict: VerdictLabel
     quote: str | None = None
 
+
+class _CohereBatchResponse(pydantic.BaseModel):
+    # Cohere's JSON mode needs an object at the root, so the batch is wrapped.
+    results: list[_BatchVerdictItem]
+
+
+_VERDICT_ENUM = {"type": "string", "enum": ["supported", "partial", "unsupported"]}
+_COHERE_VERDICT_SCHEMA = {
+    "type": "object",
+    "properties": {"verdict": _VERDICT_ENUM, "quote": {"type": "string"}},
+    "required": ["verdict"],
+}
+_COHERE_BATCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "results": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"item": {"type": "integer"}, "verdict": _VERDICT_ENUM, "quote": {"type": "string"}},
+                "required": ["item", "verdict"],
+            },
+        }
+    },
+    "required": ["results"],
+}
 
 BATCH_SIZE = 12
 
@@ -142,6 +169,19 @@ def _build_contents(claim_text: str, chunk: GeneratorChunk) -> list[types.Part]:
         parts.append(types.Part.from_bytes(data=chunk.image, mime_type="image/png"))
     parts.append(types.Part.from_text(text=f"\nCLAIM: {claim_text}"))
     return parts
+
+
+def _build_text_prompt(claim_text: str, chunk: GeneratorChunk) -> str:
+    header = f"SOURCE (page {chunk.page_number}, {chunk.element_type}, from {chunk.document_name}):"
+    return f"{header}\n{chunk.content}\n\nCLAIM: {claim_text}"
+
+
+def _build_batch_text_prompt(pairs: list[tuple[str, GeneratorChunk]]) -> str:
+    blocks = []
+    for index, (claim_text, chunk) in enumerate(pairs, start=1):
+        header = f"ITEM {index}\nSOURCE (page {chunk.page_number}, {chunk.element_type}, from {chunk.document_name}):"
+        blocks.append(f"{header}\n{chunk.content}\nCLAIM {index}: {claim_text}\n")
+    return "\n".join(blocks)
 
 
 _WHITESPACE = re.compile(r"\s+")
@@ -234,6 +274,9 @@ class Verifier:
                 sleep_fn=self._retry_sleep,
             )
         except APIError as exc:
+            fallback = self._verify_with_cohere(claim_text, chunk, exc)
+            if fallback is not None:
+                return fallback
             latency_ms = (time.perf_counter() - started) * 1000
             logger.warning("verifier: Gemini call failed — failing safe to UNVERIFIED: %s", exc)
             return _fail_safe_verdict(VerdictLabel.UNVERIFIED, MODEL, f"Gemini API error: {exc}", latency_ms)
@@ -248,6 +291,9 @@ class Verifier:
             # transport failures (timeout, connection refused, DNS) and
             # HTTP status errors, so this closes that gap the same
             # fail-safe way as an APIError.
+            fallback = self._verify_with_cohere(claim_text, chunk, exc)
+            if fallback is not None:
+                return fallback
             latency_ms = (time.perf_counter() - started) * 1000
             logger.warning("verifier: Gemini call failed at the transport layer — failing safe to UNVERIFIED: %s", exc)
             return _fail_safe_verdict(VerdictLabel.UNVERIFIED, MODEL, f"transport error: {exc}", latency_ms)
@@ -280,6 +326,61 @@ class Verifier:
             input_tokens=usage.prompt_token_count if usage and usage.prompt_token_count is not None else 0,
             output_tokens=usage.candidates_token_count if usage and usage.candidates_token_count is not None else 0,
             latency_ms=latency_ms,
+        )
+
+    def _verify_with_cohere(self, claim_text: str, chunk: GeneratorChunk, gemini_exc: Exception) -> Verdict | None:
+        """The Cohere fallback for one claim, or None when it doesn't apply
+        (Gemini's failure wasn't transient, no key, a figure image Cohere
+        can't see) or itself fails — the caller then keeps its fail-safe."""
+        if not can_fall_back_to_cohere(gemini_exc) or chunk.image is not None:
+            return None
+        logger.warning("verifier: Gemini failed transiently (%s) — verifying with Cohere instead", gemini_exc)
+        started = time.perf_counter()
+        try:
+            result = cohere_client.chat(
+                SYSTEM_INSTRUCTION,
+                _build_text_prompt(claim_text, chunk),
+                json_schema=_COHERE_VERDICT_SCHEMA,
+                temperature=0.0,
+                sleep_fn=self._retry_sleep,
+            )
+            parsed = _VerdictResponse.model_validate_json(result.text)
+        except (cohere_client.CohereError, pydantic.ValidationError) as exc:
+            logger.warning("verifier: Cohere fallback failed (%s) — failing safe to UNVERIFIED", exc)
+            return None
+        return _finalize(
+            parsed.verdict,
+            parsed.quote,
+            chunk,
+            model=result.model,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            latency_ms=(time.perf_counter() - started) * 1000,
+        )
+
+    def _verify_group_with_cohere(
+        self, pairs: list[tuple[str, GeneratorChunk]], gemini_exc: Exception
+    ) -> list[Verdict] | None:
+        """Cohere fallback for a whole group in one call, or None (the caller
+        then verifies each claim on its own, as it does for any group failure)."""
+        if not can_fall_back_to_cohere(gemini_exc) or any(chunk.image is not None for _claim, chunk in pairs):
+            return None
+        logger.warning("verifier: Gemini batch failed transiently (%s) — verifying the group with Cohere", gemini_exc)
+        started = time.perf_counter()
+        try:
+            result = cohere_client.chat(
+                BATCH_SYSTEM_INSTRUCTION,
+                _build_batch_text_prompt(pairs),
+                json_schema=_COHERE_BATCH_SCHEMA,
+                temperature=0.0,
+                sleep_fn=self._retry_sleep,
+            )
+            parsed = _CohereBatchResponse.model_validate_json(result.text).results
+        except (cohere_client.CohereError, pydantic.ValidationError) as exc:
+            logger.warning("verifier: Cohere batch fallback failed (%s) — verifying each claim separately", exc)
+            return None
+        return self._group_verdicts(
+            pairs, parsed, result.model, result.input_tokens, result.output_tokens, (time.perf_counter() - started) * 1000
         )
 
     def verify_batch(self, pairs: list[tuple[str, GeneratorChunk]]) -> list[Verdict]:
@@ -337,7 +438,7 @@ class Verifier:
             )
         except (APIError, httpx.HTTPError) as exc:
             logger.warning("verifier: batch call failed (%s) — verifying each claim separately", type(exc).__name__)
-            return None
+            return self._verify_group_with_cohere(pairs, exc)
         latency_ms = (time.perf_counter() - started) * 1000
 
         parsed = getattr(response, "parsed", None)
@@ -345,14 +446,30 @@ class Verifier:
             logger.warning("verifier: batch response did not match the schema — verifying each claim separately")
             return None
 
+        usage = response.usage_metadata
+        return self._group_verdicts(
+            pairs,
+            parsed,
+            response.model_version or MODEL,
+            usage.prompt_token_count if usage and usage.prompt_token_count is not None else 0,
+            usage.candidates_token_count if usage and usage.candidates_token_count is not None else 0,
+            latency_ms,
+        )
+
+    def _group_verdicts(
+        self,
+        pairs: list[tuple[str, GeneratorChunk]],
+        parsed: list[_BatchVerdictItem],
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        latency_ms: float,
+    ) -> list[Verdict]:
+        """Turns one batch response (Gemini's or Cohere's) into a verdict per pair."""
         by_item: dict[int, _BatchVerdictItem] = {}
         for item in parsed:
             if 1 <= item.item <= len(pairs) and item.item not in by_item:
                 by_item[item.item] = item
-        usage = response.usage_metadata
-        model = response.model_version or MODEL
-        input_tokens = usage.prompt_token_count if usage and usage.prompt_token_count is not None else 0
-        output_tokens = usage.candidates_token_count if usage and usage.candidates_token_count is not None else 0
         share = max(1, len(pairs))
 
         verdicts: list[Verdict] = []

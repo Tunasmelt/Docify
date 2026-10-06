@@ -16,7 +16,8 @@ import time
 from google import genai
 from google.genai import types
 
-from services.gemini_retry import call_with_retry
+from services import cohere_client
+from services.gemini_retry import call_with_retry, can_fall_back_to_cohere
 
 logger = logging.getLogger(__name__)
 
@@ -80,12 +81,27 @@ class QueryRewriter:
             )
             rewritten = (response.text or "").strip().strip('"').strip()
         except Exception as exc:
-            logger.warning("query rewriter failed (%s) — searching with the original question", type(exc).__name__)
-            return question
+            rewritten = self._rewrite_with_cohere(question, history, exc)
+            if rewritten is None:
+                logger.warning("query rewriter failed (%s) — searching with the original question", type(exc).__name__)
+                return question
         # An empty or runaway answer isn't a usable query.
         if not rewritten or len(rewritten) > 4 * len(question) + 300:
             return question
         return rewritten
+
+
+    def _rewrite_with_cohere(self, question: str, history: list[dict], gemini_exc: Exception) -> str | None:
+        if not can_fall_back_to_cohere(gemini_exc):
+            return None
+        try:
+            result = cohere_client.chat(
+                SYSTEM_INSTRUCTION, _build_prompt(question, history), temperature=0.0, sleep_fn=self._retry_sleep
+            )
+        except cohere_client.CohereError as exc:
+            logger.warning("query rewriter: Cohere fallback failed (%s)", exc)
+            return None
+        return result.text.strip().strip('"').strip()
 
 
 def _build_prompt(question: str, history: list[dict]) -> str:

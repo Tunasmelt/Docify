@@ -18,10 +18,11 @@ export interface UploadedDocument {
 }
 
 export interface UploadZoneProps {
+  workspaceId: string;
   onUploadComplete: (doc: UploadedDocument) => void;
 }
 
-export function UploadZone({ onUploadComplete }: UploadZoneProps) {
+export function UploadZone({ onUploadComplete, workspaceId }: UploadZoneProps) {
   const [uploading, setUploading] = React.useState(false);
   const [name, setName] = React.useState("");
   const [error, setError] = React.useState<string | null>(null);
@@ -34,7 +35,7 @@ export function UploadZone({ onUploadComplete }: UploadZoneProps) {
     setName(file.name);
 
     try {
-      const result = await uploadDocument(file);
+      const result = await uploadDocument(file, workspaceId);
       onUploadComplete({
         id: result.document_id,
         filename: file.name,

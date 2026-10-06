@@ -3,11 +3,13 @@
 import * as React from "react";
 import { useRouter } from "next/navigation";
 
+import { useWorkspace } from "@/components/layout/workspace-provider";
 import { Sidebar } from "@/components/layout/sidebar";
 import { Topbar, WorkspaceBadge, MobileMenuButton } from "@/components/layout/topbar";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { Button } from "@/components/ui/button";
 import { UploadZone, type UploadedDocument } from "@/components/documents/upload-zone";
+import { DocumentActionsDialog } from "@/components/documents/document-actions-dialog";
 import { DocumentCard, type DocumentCardData } from "@/components/documents/document-card";
 import { DeleteConfirmDialog } from "@/components/documents/delete-confirm-dialog";
 import { RenameDocumentDialog, type RenameDocumentTarget } from "@/components/documents/rename-document-dialog";
@@ -56,6 +58,7 @@ function toCardData(doc: ApiDocument): DocumentCardData {
 
 export default function DocumentsPage() {
   const router = useRouter();
+  const { active: workspace } = useWorkspace();
   const currentUser = useCurrentUser();
   const supabase = React.useMemo(() => createClient(), []);
   const [docs, setDocs] = React.useState<ApiDocument[]>([]);
@@ -70,6 +73,7 @@ export default function DocumentsPage() {
   const [renameError, setRenameError] = React.useState<string | null>(null);
   const [renaming, setRenaming] = React.useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = React.useState(false);
+  const [openId, setOpenId] = React.useState<string | null>(null);
   const [selectedIds, setSelectedIds] = React.useState<string[]>([]);
 
   const pollTimeoutRef = React.useRef<ReturnType<typeof setTimeout>>();
@@ -95,7 +99,7 @@ export default function DocumentsPage() {
   const pollTick = React.useCallback(async () => {
     const myGeneration = docsGenerationRef.current;
     try {
-      const result = await listDocuments();
+      const result = await listDocuments(workspace.id);
       if (docsGenerationRef.current !== myGeneration) {
         // A delete/upload/retry committed newer state while this request
         // was in flight — do not resurrect what it just changed.
@@ -114,7 +118,7 @@ export default function DocumentsPage() {
     } catch {
       // A network hiccup mid-poll shouldn't silently give up forever —
       // keep polling, just back off same as a slow-to-finish document.
-      // (A real 401 mid-poll is handled inside listDocuments()'s own
+      // (A real 401 mid-poll is handled inside listDocuments(workspace.id)'s own
       // apiFetch, which force-redirects before this catch ever runs.)
       pollIntervalRef.current = Math.min(
         pollIntervalRef.current * POLL_BACKOFF_FACTOR,
@@ -122,7 +126,7 @@ export default function DocumentsPage() {
       );
     }
     pollTimeoutRef.current = setTimeout(pollTick, pollIntervalRef.current);
-  }, []);
+  }, [workspace.id]);
 
   const startPolling = React.useCallback(() => {
     clearTimeout(pollTimeoutRef.current);
@@ -135,7 +139,7 @@ export default function DocumentsPage() {
 
     (async () => {
       try {
-        const result = await listDocuments();
+        const result = await listDocuments(workspace.id);
         if (cancelled) return;
         commitDocs(result.documents);
         setLoadError(null);
@@ -155,7 +159,7 @@ export default function DocumentsPage() {
       clearTimeout(pollTimeoutRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [workspace.id]);
 
   // A selected document can stop being valid to select without the user
   // touching the checkbox themselves — deleted by this same session, or
@@ -184,6 +188,7 @@ export default function DocumentsPage() {
     commitDocs([
       {
         id: doc.id,
+        workspace_id: workspace.id,
         filename: doc.filename,
         page_count: null,
         status: doc.status,
@@ -270,7 +275,7 @@ export default function DocumentsPage() {
     setLoading(true);
     setLoadError(null);
     try {
-      const result = await listDocuments();
+      const result = await listDocuments(workspace.id);
       commitDocs(result.documents);
       if (result.documents.some((d) => NON_TERMINAL_STATUSES.includes(d.status))) {
         startPolling();
@@ -296,12 +301,14 @@ export default function DocumentsPage() {
       ) : (
         <div className="flex flex-col gap-px px-3">
           {cardDocs.map((doc) => (
-            <div
+            <button
+              type="button"
+              onClick={() => { setOpenId(doc.id); setMobileMenuOpen(false); }}
               key={doc.id}
               className="cursor-pointer truncate rounded-md px-2.5 py-1.5 text-[12.5px] text-muted hover:bg-panel-hover hover:text-ink"
             >
               {doc.filename}
-            </div>
+            </button>
           ))}
         </div>
       )}
@@ -323,7 +330,7 @@ export default function DocumentsPage() {
             <>
               <MobileMenuButton onClick={() => setMobileMenuOpen(true)} />
               <span className="truncate text-sm font-semibold">Acme Legal</span>
-              <WorkspaceBadge>WORKSPACE</WorkspaceBadge>
+              <WorkspaceBadge>{workspace.name}</WorkspaceBadge>
             </>
           }
           right={
@@ -352,7 +359,7 @@ export default function DocumentsPage() {
               </span>
             </div>
 
-            <UploadZone onUploadComplete={handleUploadComplete} />
+            <UploadZone workspaceId={workspace.id} onUploadComplete={handleUploadComplete} />
 
             {loading ? (
               <div className="mt-10">
@@ -404,6 +411,7 @@ export default function DocumentsPage() {
                     <DocumentCard
                       key={doc.id}
                       doc={doc}
+                      onOpen={setOpenId}
                       onDelete={setDeleteId}
                       onRename={openRenameDialog}
                       selected={selectedIds.includes(doc.id)}
@@ -442,6 +450,8 @@ export default function DocumentsPage() {
           setDeleteError(null);
         }}
       />
+
+      <DocumentActionsDialog doc={docs.find((doc) => doc.id === openId) ?? null} onClose={() => setOpenId(null)} />
 
       {selectedIds.length > 0 ? (
         <div className="pointer-events-none fixed inset-x-0 bottom-6 z-40 flex justify-center">

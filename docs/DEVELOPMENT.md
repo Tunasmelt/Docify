@@ -109,3 +109,7 @@ cd apps/web && pnpm build               # production build — runs ESLint as a 
 - Commit format: `<type>(<scope>): <summary> [<agent-tag>]`.
 - A PR that changes behaviour updates `CHANGELOG.md`; schema changes add a migration plus a row in SCHEMA.md's migration log; API changes update `.agent/API_CONTRACT.md` and `apps/web/lib/types/` together.
 - CI (`.github/workflows/ci.yml`) runs the backend suite against a fresh local Supabase stack, plus web lint, typecheck and build, on every PR. Run the commands in step 5 locally first. CI doesn't run the Playwright e2e suite.
+
+## Cohere and personal workspaces
+
+Set COHERE_API_KEY in the API runtime environment to enable fallback. Apply migrations 20261007_001 and 20261007_002 before starting the updated API. Existing documents and chats go into My workspace. The sidebar creates, renames, switches and deletes private workspaces. Remove documents before deleting a workspace.

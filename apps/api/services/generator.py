@@ -10,7 +10,8 @@ from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 
-from services.gemini_retry import call_with_retry, call_with_retry_async
+from services import cohere_client
+from services.gemini_retry import call_with_retry, call_with_retry_async, can_fall_back_to_cohere
 
 logger = logging.getLogger(__name__)
 
@@ -199,28 +200,47 @@ def _strip_citation_markers(text: str) -> str:
     return stripped.strip()
 
 
-def _build_history_parts(history: list[dict]) -> list[types.Part]:
+def _history_text(history: list[dict]) -> str | None:
     if not history:
-        return []
+        return None
     lines = [_HISTORY_HEADER]
     for message in history:
         if message["role"] == "user":
             lines.append(f"User: {message['content']}")
         else:
             lines.append(f"Assistant: {_strip_citation_markers(message['content'])}")
-    return [types.Part.from_text(text="\n".join(lines))]
+    return "\n".join(lines)
+
+
+def _build_history_parts(history: list[dict]) -> list[types.Part]:
+    text = _history_text(history)
+    return [types.Part.from_text(text=text)] if text else []
+
+
+def _chunk_text(index: int, chunk: GeneratorChunk) -> str:
+    header = f"[{index}] (page {chunk.page_number}, {chunk.element_type}, from {chunk.document_name}):"
+    return f"{header}\n{chunk.content}"
 
 
 def _build_contents(question: str, chunks: list[GeneratorChunk], history: list[dict] | None = None) -> list[types.Part]:
     parts: list[types.Part] = []
     parts.extend(_build_history_parts(history or []))
     for i, chunk in enumerate(chunks, start=1):
-        header = f"[{i}] (page {chunk.page_number}, {chunk.element_type}, from {chunk.document_name}):"
-        parts.append(types.Part.from_text(text=f"{header}\n{chunk.content}"))
+        parts.append(types.Part.from_text(text=_chunk_text(i, chunk)))
         if chunk.image is not None:
             parts.append(types.Part.from_bytes(data=chunk.image, mime_type="image/png"))
     parts.append(types.Part.from_text(text=f"\nQuestion: {question}"))
     return parts
+
+
+def _build_text_prompt(question: str, chunks: list[GeneratorChunk], history: list[dict] | None) -> str:
+    """The same prompt as _build_contents, as one string for the Cohere
+    fallback. Figure images are not sent (Command A is text-only); a figure
+    chunk's caption text still is."""
+    blocks = [_history_text(history or [])]
+    blocks.extend(_chunk_text(i, chunk) for i, chunk in enumerate(chunks, start=1))
+    blocks.append(f"\nQuestion: {question}")
+    return "\n".join(block for block in blocks if block)
 
 
 def _parse_citations(answer: str, num_chunks: int) -> tuple[list[int], list[int]]:
@@ -297,6 +317,8 @@ class Generator:
                 sleep_fn=self._retry_sleep,
             )
         except (APIError, httpx.TransportError) as exc:
+            if can_fall_back_to_cohere(exc):
+                return self._generate_with_cohere(question, chunks, history, exc, started)
             raise GenerationError(f"Gemini generation failed: {exc}") from exc
         latency_ms = (time.perf_counter() - started) * 1000
 
@@ -315,6 +337,27 @@ class Generator:
             input_tokens=usage.prompt_token_count if usage and usage.prompt_token_count is not None else 0,
             output_tokens=usage.candidates_token_count if usage and usage.candidates_token_count is not None else 0,
             latency_ms=latency_ms,
+        )
+
+    def _generate_with_cohere(
+        self, question: str, chunks: list[GeneratorChunk], history: list[dict] | None, gemini_exc: Exception, started: float
+    ) -> GenerateResult:
+        logger.warning("generator: Gemini failed transiently (%s) — answering with Cohere instead", gemini_exc)
+        try:
+            result = cohere_client.chat(
+                SYSTEM_INSTRUCTION, _build_text_prompt(question, chunks, history), sleep_fn=self._retry_sleep
+            )
+        except cohere_client.CohereError as exc:
+            raise GenerationError(f"Gemini generation failed ({gemini_exc}) and the Cohere fallback also failed: {exc}") from exc
+        cited_indices, hallucinated_markers = _parse_citations(result.text, len(chunks))
+        return GenerateResult(
+            answer=result.text,
+            cited_indices=cited_indices,
+            hallucinated_markers=hallucinated_markers,
+            model=result.model,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            latency_ms=(time.perf_counter() - started) * 1000,
         )
 
     async def generate_stream(
@@ -377,7 +420,38 @@ class Generator:
                         answer_parts.append(delta)
                         yield delta
         except (APIError, httpx.TransportError) as exc:
-            raise GenerationError(f"Gemini streaming generation failed: {exc}") from exc
+            # Only before any text has reached the client: a Cohere answer
+            # appended to a half-streamed Gemini one would be garbled.
+            if answer_parts or not can_fall_back_to_cohere(exc):
+                raise GenerationError(f"Gemini streaming generation failed: {exc}") from exc
+            gemini_exc = exc
+        else:
+            gemini_exc = None
+
+        if gemini_exc is not None:
+            logger.warning("generator: Gemini streaming failed transiently (%s) — answering with Cohere instead", gemini_exc)
+            try:
+                async for item in cohere_client.chat_stream(
+                    SYSTEM_INSTRUCTION, _build_text_prompt(question, chunks, history), sleep_fn=self._async_retry_sleep
+                ):
+                    if isinstance(item, str):
+                        yield item
+                    else:
+                        cited_indices, hallucinated_markers = _parse_citations(item.text, len(chunks))
+                        yield GenerateStreamResult(
+                            answer=item.text,
+                            cited_indices=cited_indices,
+                            hallucinated_markers=hallucinated_markers,
+                            model=item.model,
+                            input_tokens=item.input_tokens,
+                            output_tokens=item.output_tokens,
+                            latency_ms=(time.perf_counter() - started) * 1000,
+                        )
+            except cohere_client.CohereError as exc:
+                raise GenerationError(
+                    f"Gemini streaming generation failed ({gemini_exc}) and the Cohere fallback also failed: {exc}"
+                ) from exc
+            return
         latency_ms = (time.perf_counter() - started) * 1000
 
         answer = "".join(answer_parts)

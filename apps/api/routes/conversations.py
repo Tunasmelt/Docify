@@ -1,4 +1,5 @@
 import logging
+from uuid import UUID
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, Response
@@ -32,6 +33,7 @@ TITLE_MAX_LENGTH = 200
 @router.get("/conversations", response_model=ConversationListResponse)
 def list_conversations(
     request: Request,
+    workspace_id: UUID | None = None,  # omitted: conversations from every workspace
     limit: int = Query(50, ge=1, le=200),
     cursor: str | None = None,
 ):
@@ -44,7 +46,13 @@ def list_conversations(
 
     user_id = request.state.user_id
     client = get_service_role_client()
-    rows = queries.list_conversations(client, user_id=user_id, limit=limit, cursor_updated_at=cursor_updated_at)
+    rows = queries.list_conversations(
+        client,
+        user_id=user_id,
+        limit=limit,
+        cursor_updated_at=cursor_updated_at,
+        workspace_id=str(workspace_id) if workspace_id else None,
+    )
 
     # Same +1-row has-more-page pattern as GET /documents (FEAT-008).
     has_more = len(rows) > limit
@@ -54,6 +62,7 @@ def list_conversations(
     conversations = [
         ConversationResponse(
             id=row["id"],
+            workspace_id=row["workspace_id"],
             title=row["title"],
             document_ids=row["document_ids"],
             # PostgREST's embedded count comes back nested as

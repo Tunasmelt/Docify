@@ -352,3 +352,7 @@ Migrations up to `20260804_001` are applied to the production project; later one
 | `20261006_002_vector_search_iterative_scan.sql` | Fix | `match_chunks_by_vector` runs with `hnsw.iterative_scan = strict_order` so the tenant/document/provider filters can't leave a user with fewer results than exist (the HNSW index returned ~40 nearest chunks across all tenants before filtering) |
 
 Account deletion (FEAT-035) needed no migration: all 6 user-scoped tables already cascade on `auth.users` deletion, and Storage cleanup is done in application code.
+
+## Personal workspaces migrations (2026-10-06)
+
+20261007_001 adds cohere to embedding_provider without changing vector dimensions. 20261007_002 creates private workspaces(id, user_id, name, created_at), owner RLS and per-user case-insensitive unique names. Adds non-null workspace_id to documents/conversations and backfills legacy rows into My workspace. Default triggers support older inserts and enforce ownership and conversation document scope. Documents prevent deleting nonempty workspaces; conversations cascade. Storage paths remain user-scoped; auth.users deletion cascades workspaces.

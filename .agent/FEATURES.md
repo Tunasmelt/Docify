@@ -1280,3 +1280,38 @@ Promoted from HANDOFF.md `## Agent Suggestions` inbox after review. Not yet sche
 - **Parser process-lifetime singleton** — originally proposed to amortize Docling's model loading. FEAT-027's parser has no expensive model state (~17MB import), so the payoff is now small; keep only if profiling shows `Parser()` construction matters.
 - **Known gap, stated not hidden: chat UI modernization batch 2's "regenerate" APPENDS rather than replaces in place.** Investigated during that batch: the backend has no endpoint to delete or update an existing message (`GET /conversations` and `GET /conversations/{id}/messages` are the only conversation routes today), and `create_query_turn` always inserts one new user + one new assistant message pair per call — so a true in-place "replace the last answer, no duplicate question" regenerate is not achievable without a new backend endpoint. Current behavior: clicking regenerate re-asks the original question as a new, appended turn (`apps/web/app/(app)/chat/[conversation_id]/page.tsx`'s `regenerate()`), so a conversation legitimately grows a duplicate-text user message per regenerate click, both live and after reload. Revisit if/when a message-mutation endpoint is added (would also unblock batch 3's rename/delete work).
 - Both currently unimplemented — pick up opportunistically if/when this area is next touched, not urgent standalone work.
+
+## Resumed features — 2026-10-06
+
+### [FEAT-036] Cohere provider fallback
+**Phase:** 4
+**Owner:** codex
+**Tests:** `apps/api/tests/test_cohere_fallback.py`; existing generator, embedder, verifier, rewrite and retrieval tests.
+**Status:** complete
+**Files:**
+- `apps/api/services/cohere_client.py`
+- `apps/api/migrations/20261007_001_cohere_embedding_provider.sql`
+**Acceptance criteria:**
+- [x] Gemini text generation, rewriting and verification can fall back to Cohere on transient failures.
+- [x] Embeddings fall back Voyage → Gemini → Cohere, with separate provider spaces and keyword retrieval on embedding failures.
+- [x] Streaming never restarts after output; truncated Cohere streams and invalid vectors fail explicitly.
+**Changelog:** 2026-10-06, Cohere fallback and personal workspaces.
+
+### [FEAT-037] Personal workspaces
+**Phase:** 4
+**Owner:** codex
+**Tests:** `apps/api/tests/test_workspaces.py`, document/conversation regressions, `apps/web/e2e/workspaces.e2e.ts`.
+**Status:** complete
+**Files:**
+- `apps/api/routes/workspaces.py`
+- `apps/api/models/workspaces.py`
+- `apps/api/migrations/20261007_002_workspaces.sql`
+- `apps/web/components/layout/workspace-provider.tsx`
+- `apps/web/components/layout/workspace-switcher.tsx`
+- `apps/web/lib/api/workspaces.ts`
+**Acceptance criteria:**
+- [x] Create, rename, switch and delete private workspaces; selection persists per tab.
+- [x] Documents, uploads and chats use selected workspace; existing data gets a default workspace.
+- [x] API and database refuse cross-owner workspaces and cross-workspace conversation documents.
+- [x] Delete requires an empty workspace and retains at least one workspace through the API.
+**Changelog:** 2026-10-06, Cohere fallback and personal workspaces.

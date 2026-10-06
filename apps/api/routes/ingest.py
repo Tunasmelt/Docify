@@ -365,6 +365,12 @@ def post_ingest(
     except DailyLimitExceeded:
         return daily_limit_exceeded_response()
 
+    workspace_id = queries.resolve_workspace_id(
+        client, user_id=user_id, workspace_id=str(payload.workspace_id) if payload.workspace_id else None
+    )
+    if workspace_id is None:
+        return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "workspace not found"))
+
     document = queries.create_document(
         client,
         user_id=user_id,
@@ -372,6 +378,7 @@ def post_ingest(
         storage_path=payload.storage_path,
         mime_type=payload.mime_type,
         size_bytes=payload.size_bytes,
+        workspace_id=workspace_id,
     )
 
     # Queued, not run here: the ingest worker processes jobs one at a time
