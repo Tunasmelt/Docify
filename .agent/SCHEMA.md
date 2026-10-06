@@ -224,7 +224,8 @@ PostgREST cannot express vector/FTS ranking or multi-table transactions, so thes
 | Function | Purpose | Defined / last changed |
 |---|---|---|
 | `match_chunks_by_vector(query_embedding, match_user_id, match_document_ids, match_limit, match_provider)` | Cosine search within one embedding provider; returns chunk + filename, mime type, association_method | `20260724_001`, `20260727_001`, `20260731_001`, `20260802_002` |
-| `match_chunks_by_fts(query_text, match_user_id, match_document_ids, match_limit)` | Postgres FTS search | `20260724_001`, `20260727_001`, `20260802_002` |
+| `match_chunks_by_fts(query_text, match_user_id, match_document_ids, match_limit)` | Postgres FTS search; **any** question term matches, chunks matching more terms rank higher | `20260724_001`, `20260727_001`, `20260802_002`, `20261006_001` |
+| `fts_any_term_query(query_text)` | Builds an OR `tsquery` from the question's english-normalized lexemes; NULL (matches nothing) if the question is all stopwords | `20261006_001` |
 | `distinct_embedding_providers(match_user_id, match_document_ids)` | Which providers have chunks in a document scope | `20260731_001` |
 | `create_query_turn(p_user_id, ...)` | Atomically writes conversation (if new) + 2 messages + citations; a malformed citation is skipped with a warning rather than rolling back the turn | `20260724_002`, `20260725_002`, `20260731_002` |
 | `increment_usage_counter(p_user_id, p_route, p_day)` | Atomic upsert-and-increment for daily rate limits; executable by `service_role` only | `20260802_001` |
@@ -305,7 +306,7 @@ create policy avatars_select on storage.objects for select
 
 ## Migration log
 
-All migrations below are applied to the production project. Full reasoning for each is in the file's header comment and the matching CHANGELOG entry.
+Migrations up to `20260804_001` are applied to the production project; later ones must be applied before deploying the code that ships with them (docs/DEPLOYMENT.md). Full reasoning for each is in the file's header comment and the matching CHANGELOG entry.
 
 | Migration | Feature | Summary |
 |---|---|---|
@@ -322,5 +323,6 @@ All migrations below are applied to the production project. Full reasoning for e
 | `20260802_002_citation_association_method.sql` | Fix | Retrieval functions return `association_method` |
 | `20260803_001_citation_verdict_unverified.sql` | FEAT-028 | Adds `'unverified'` to the `verdict` enum |
 | `20260804_001_avatars_bucket.sql` | FEAT-032 | Public-read `avatars` bucket with owner-scoped write policies |
+| `20261006_001_fts_any_term_matching.sql` | Fix | `match_chunks_by_fts` matches any question term instead of requiring all of them (`websearch_to_tsquery` ANDed every term, so natural-language questions rarely matched); adds `fts_any_term_query` |
 
 Account deletion (FEAT-035) needed no migration: all 6 user-scoped tables already cascade on `auth.users` deletion, and Storage cleanup is done in application code.

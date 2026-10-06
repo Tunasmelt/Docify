@@ -30,7 +30,7 @@ TITLE_MAX_LENGTH = 200
 
 
 @router.get("/conversations", response_model=ConversationListResponse)
-async def list_conversations(
+def list_conversations(
     request: Request,
     limit: int = Query(50, ge=1, le=200),
     cursor: str | None = None,
@@ -101,7 +101,7 @@ def _citation_response(client, row: dict) -> CitationResponse:
     response_model=ConversationMessagesResponse,
     response_model_exclude_none=True,
 )
-async def get_conversation_messages(conversation_id: str, request: Request):
+def get_conversation_messages(conversation_id: str, request: Request):
     user_id = request.state.user_id
     client = get_service_role_client()
 
@@ -149,7 +149,7 @@ async def get_conversation_messages(conversation_id: str, request: Request):
 # project's existing action-route precedent (POST /reindex/{document_id})
 # rather than introducing this API's first PATCH verb for one endpoint.
 @router.post("/conversations/{conversation_id}/rename", response_model=ConversationDetail)
-async def rename_conversation(conversation_id: str, payload: RenameConversationRequest, request: Request):
+def rename_conversation(conversation_id: str, payload: RenameConversationRequest, request: Request):
     title = payload.title.strip()
     if not title:
         return JSONResponse(status_code=422, content=error_envelope("VALIDATION_ERROR", "title must not be empty"))
@@ -174,7 +174,7 @@ async def rename_conversation(conversation_id: str, payload: RenameConversationR
 
 
 @router.delete("/conversations/{conversation_id}", status_code=204)
-async def delete_conversation(conversation_id: str, request: Request):
+def delete_conversation(conversation_id: str, request: Request):
     user_id = request.state.user_id
     client = get_service_role_client()
 

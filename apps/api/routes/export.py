@@ -219,7 +219,7 @@ def _render_markdown(payload: ExportPayload) -> str:
 
 
 @router.get("/export/conversations")
-async def export_conversations(request: Request, format: str = Query("json", pattern="^(json|markdown)$")):
+def export_conversations(request: Request, format: str = Query("json", pattern="^(json|markdown)$")):
     user_id = request.state.user_id
     client = get_service_role_client()
 

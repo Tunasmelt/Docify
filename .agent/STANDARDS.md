@@ -94,6 +94,7 @@ apps/api/
 ### Backend
 - **Every route wraps errors in the standard envelope** (see API_CONTRACT.md)
 - **Every service-role query is scoped by the JWT-derived `user_id`.** The service role bypasses RLS, so this filter is the tenant boundary for FastAPI — a query without it is a cross-tenant leak (SCHEMA.md §Service-role client discipline)
+- **Route handlers that call the Supabase client or any vendor SDK are plain `def`, never `async def`.** Those clients block; in an `async def` handler they freeze the event loop for every user. An `async def` route must `await asyncio.to_thread(...)` for each blocking call (`tests/test_event_loop.py` enforces this)
 - Use FastAPI's exception handlers, not per-route try/except
 - Custom exceptions live in `apps/api/errors.py` with codes matching the API contract
 - Never leak stack traces or `str(exception)` to the client

@@ -1250,3 +1250,58 @@ def test_real_mixed_provider_retrieval_surfaces_chunks_from_either_provider(admi
     admin.table("documents").delete().eq("id", document_id).execute()
 
     assert all_passed
+
+
+# --- FTS term matching (2026-10-06, migration 20261006_001) -------------------
+# websearch_to_tsquery ANDs every term, so a natural-language question only
+# matched chunks containing ALL of its words — in practice, almost none.
+# Any term now matches, and chunks matching more terms rank higher.
+
+
+def _fts(admin, question: str, user_id: str, document_id: str) -> list[dict]:
+    return admin.rpc(
+        "match_chunks_by_fts",
+        {"query_text": question, "match_user_id": user_id, "match_document_ids": [document_id], "match_limit": 10},
+    ).execute().data
+
+
+def test_fts_matches_a_natural_question_when_only_some_terms_appear(admin, user_a):
+    user_id, _token = user_a
+    document_id = _create_document(admin, user_id, "fts-any-term.pdf")
+    chunk_id = _insert_chunk(
+        admin, document_id=document_id, user_id=user_id, chunk_index=0,
+        content="Third-quarter revenue totaled 4.2 million dollars.", embedding=_vector_along_dimension(0),
+    )
+
+    rows = _fts(admin, "How much revenue did the company make, and what drove the growth?", user_id, document_id)
+
+    assert [row["id"] for row in rows] == [chunk_id]
+
+
+def test_fts_ranks_chunks_matching_more_terms_higher(admin, user_a):
+    user_id, _token = user_a
+    document_id = _create_document(admin, user_id, "fts-rank.pdf")
+    one_term = _insert_chunk(
+        admin, document_id=document_id, user_id=user_id, chunk_index=0,
+        content="Revenue is discussed in a later section.", embedding=_vector_along_dimension(0),
+    )
+    two_terms = _insert_chunk(
+        admin, document_id=document_id, user_id=user_id, chunk_index=1,
+        content="Revenue growth in the third quarter was strong.", embedding=_vector_along_dimension(1),
+    )
+
+    rows = _fts(admin, "revenue growth", user_id, document_id)
+
+    assert [row["id"] for row in rows] == [two_terms, one_term]
+
+
+def test_fts_question_of_only_stopwords_or_punctuation_matches_nothing_without_erroring(admin, user_a):
+    user_id, _token = user_a
+    document_id = _create_document(admin, user_id, "fts-stopwords.pdf")
+    _insert_chunk(
+        admin, document_id=document_id, user_id=user_id, chunk_index=0,
+        content="What is this about?", embedding=_vector_along_dimension(0),
+    )
+
+    assert _fts(admin, "what is it?", user_id, document_id) == []
+    assert _fts(admin, "!!! ' \\ ''", user_id, document_id) == []

@@ -1000,3 +1000,68 @@ def test_html_elements_get_sentinel_page_number_and_zero_bbox():
     for element in doc.elements:
         assert element.page_number == 1
         assert element.bbox == BBox(x0=0.0, y0=0.0, x1=0.0, y1=0.0)
+
+
+# ── Reading order (2026-10-06): HTML and DOCX elements must come out in
+# document order. Before this fix, HTML emitted every heading first (CSS
+# selector-group order, not DOM order) and DOCX emitted all paragraphs, then
+# all tables, then all images — detaching every section/table/figure from
+# its surrounding text before chunking ever saw it.
+
+def _contents(doc) -> list[str]:
+    return [e.content if isinstance(e.content, str) else "<figure>" for e in doc.elements]
+
+
+def _index_of(contents: list[str], needle: str) -> int:
+    return next(i for i, c in enumerate(contents) if needle in c)
+
+
+def test_html_elements_come_out_in_document_order():
+    contents = _contents(Parser().parse(load("page.html"), filename="page.html"))
+
+    order = [
+        _index_of(contents, "Docify HTML Fixture"),
+        _index_of(contents, "This is a real HTML page"),
+        _index_of(contents, "Quarterly Results"),
+        _index_of(contents, "Table 1 below shows"),
+        _index_of(contents, "| Quarter |"),
+        _index_of(contents, "Table 1: Quarterly revenue"),
+        _index_of(contents, "Conclusion"),
+        _index_of(contents, "Revenue grew steadily"),
+    ]
+    assert order == sorted(order)
+
+
+def test_html_nested_matching_tags_are_not_emitted_twice():
+    html = (
+        b"<html><body><ul><li><p>Outer item text</p></li></ul>"
+        b"<table><caption>Table 9: nested caption</caption>"
+        b"<tr><th>A</th></tr><tr><td>1</td></tr></table></body></html>"
+    )
+    doc = Parser().parse(html, filename="nested.html")
+    contents = _contents(doc)
+
+    assert sum("Outer item text" in c for c in contents) == 1
+    assert sum("Table 9: nested caption" in c for c in contents) == 1
+    caption_idx = _index_of(contents, "Table 9: nested caption")
+    table_idx = _index_of(contents, "| A |")
+    assert caption_idx < table_idx
+    assert doc.elements[caption_idx].element_type == ElementType.CAPTION
+
+
+def test_docx_tables_and_figures_stay_in_document_order():
+    doc = Parser().parse(load("table.docx"), filename="table.docx")
+    contents = _contents(doc)
+
+    order = [
+        _index_of(contents, "Quarterly Results"),
+        _index_of(contents, "Table 1 below shows"),
+        _index_of(contents, "| Quarter |"),
+        _index_of(contents, "Revenue Chart"),
+        _index_of(contents, "<figure>"),
+        _index_of(contents, "Conclusion"),
+    ]
+    assert order == sorted(order)
+    for element in doc.elements:
+        if element.element_type == ElementType.FIGURE:
+            element.content.close()

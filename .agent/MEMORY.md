@@ -108,6 +108,10 @@ Things tried and failed, or explicitly rejected during design. Do not retry with
 **Closed permanently, not worked around once:** `GET /health` now returns a `commit` field sourced from Render's own auto-injected `RENDER_GIT_COMMIT` env var (confirmed against Render's real docs — available at both build time and runtime for every deploy, no Dockerfile change needed; `"unknown"` outside Render). A single `curl` now answers "is the code I think is deployed actually what's running" directly, permanently, without SSH or a paid plan.
 **Why this generalizes the same way the 2026-08-07 entry does:** that entry found working-tree checks can't distinguish "file exists on disk" from "file is in git" — a proxy signal mistaken for the real one. This is the identical failure shape one layer further along the pipeline: "I ran `git commit`" is not "I ran `git push`," and "the platform's dashboard/API says live" is not "the code I'm thinking of is what's executing." Every step in code-reaches-production (committed → pushed → built → deployed → actually running) has its own proxy signals that can each individually look fine while an earlier step silently didn't happen — checking the outcome directly (here: `/health`'s real `commit` field) beats trusting any single intermediate status report.
 
+### 2026-10-06 [claude-code] — `async def` route handlers calling synchronous clients froze the whole server
+**Context:** Every route was `async def` while calling the synchronous Supabase client, and `POST /query` also called the synchronous retriever, Gemini, and verifier. An `async def` handler runs on the event loop, so one `/query` (5–10s) stalled every other request on the single worker, including `/health` and other users' SSE streams and their keepalives. Measured: `/health` waited 1.76s behind a 2s blocking `/query`.
+**Rule:** Handlers that touch blocking clients are plain `def`. An `async def` route must route each blocking call through `asyncio.to_thread`. `tests/test_event_loop.py` fails if a new route breaks this.
+
 ---
 
 ## §Open questions

@@ -130,7 +130,8 @@ The browser talks to FastAPI directly (`NEXT_PUBLIC_API_URL`, `apps/web/lib/api/
    b. Embeds the question once PER provider present and runs that provider's own vector
       search (filtered by user_id, document_ids, embedding_provider). Vectors from
       different providers are never compared — see MEMORY.md §Anti-patterns 2026-07-31
-   c. Runs one Postgres FTS search in parallel
+   c. Runs one Postgres FTS search in parallel — any question term matches; chunks
+      matching more terms rank higher (fts_any_term_query)
    d. Reciprocal Rank Fusion merges all lists purely by rank → top-k
    e. If rerank=true, Voyage rerank-2.5 reorders the candidate pool; any failure falls
       back to RRF's order
@@ -245,6 +246,7 @@ docs/                             screenshots used by the root README; developer
 - **Pydantic contract mirroring.** Models in `apps/api/models/` are the source; matching TS types in `apps/web/lib/types/` are hand-mirrored. API_CONTRACT.md is the specification both sides read.
 - **Status-transition documents.** `documents.status` moves uploaded → parsing → embedded → ready | failed. The frontend polls `GET /documents`; it never assumes ready.
 - **Storage before DB on delete.** `DELETE /documents/{id}` and `DELETE /account` remove Storage objects first and DB rows last, so a mid-sequence failure leaves the resource intact and the call retry-safe (Storage objects do not cascade on user deletion).
+- **Blocking work never runs on the event loop.** The Supabase, Voyage, and Gemini clients are synchronous, so route handlers are plain `def` (FastAPI runs them in its threadpool). The only `async def` routes are `/health` (no I/O) and `/query/stream`, which wraps every blocking call in `asyncio.to_thread`. Enforced by `tests/test_event_loop.py`.
 - **Atomic multi-table writes via RPC.** A query turn (conversation + 2 messages + N citations) is written by one plpgsql function, `create_query_turn`, because PostgREST has no client-side transaction.
 
 ---

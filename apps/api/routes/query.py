@@ -351,7 +351,7 @@ def _load_history(client, payload: QueryRequest, user_id: str) -> tuple[list[dic
 @router.post("/query", response_model=QueryResponse, response_model_exclude_none=True)
 @limiter.shared_limit(QUERY_MINUTE_LIMIT, scope=QUERY_RATE_LIMIT_SCOPE)
 @limiter.shared_limit(QUERY_DAY_LIMIT, scope=QUERY_RATE_LIMIT_SCOPE)
-async def post_query(
+def post_query(
     payload: QueryRequest,
     request: Request,
     response: Response,
@@ -1103,10 +1103,12 @@ async def post_query_stream(
     error = _validate_payload(payload)
     if error is not None:
         return error
-    error = _check_ownership(client, payload, user_id)
+    # Both are blocking Supabase calls — off the event loop, same as every
+    # call inside the stream itself.
+    error = await asyncio.to_thread(_check_ownership, client, payload, user_id)
     if error is not None:
         return error
-    prior_messages, error = _load_history(client, payload, user_id)
+    prior_messages, error = await asyncio.to_thread(_load_history, client, payload, user_id)
     if error is not None:
         return error
 

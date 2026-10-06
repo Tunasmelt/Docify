@@ -7,6 +7,7 @@ from enum import Enum
 from io import BytesIO
 
 import docx
+from docx.table import Table as DocxTable
 import httpx
 import pdfplumber
 import pptx
@@ -731,9 +732,8 @@ _DOCX_LIST_STYLE_RE = re.compile(r"^List\b", re.IGNORECASE)
 _SENTINEL_BBOX = BBox(x0=0.0, y0=0.0, x1=0.0, y1=0.0)
 
 
-def _docx_image_bytes(document, inline_shape) -> bytes | None:
+def _docx_image_bytes_by_rid(document, rid: str) -> bytes | None:
     try:
-        rid = inline_shape._inline.graphic.graphicData.pic.blipFill.blip.embed
         return document.part.related_parts[rid].blob
     except Exception:
         return None
@@ -749,70 +749,78 @@ def _parse_docx(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
     dropped = 0
     counter = 0
 
+    def add_figure(image_bytes: bytes | None) -> None:
+        nonlocal counter, dropped
+        if image_bytes is None:
+            dropped += 1
+            logger.warning("parser: dropped a DOCX figure — could not resolve its image bytes")
+            return
+        try:
+            pil_image = Image.open(BytesIO(image_bytes)).convert("RGB")
+            pil_image.load()  # force decode now, while the source bytes are still in scope
+        except Exception:
+            dropped += 1
+            logger.warning("parser: dropped a DOCX figure — image bytes failed to decode", exc_info=True)
+            return
+        counter += 1
+        elements.append(
+            ParsedElement(
+                element_type=ElementType.FIGURE,
+                page_number=1,
+                bbox=_SENTINEL_BBOX,
+                content=pil_image,
+                element_id=f"docx-fig{counter}",
+            )
+        )
+
     try:
-        for paragraph in document.paragraphs:
+        # Body order, not "all paragraphs, then all tables, then all images":
+        # the chunker groups adjacent elements and matches captions by
+        # proximity, so a table or figure must stay where it sits in the text.
+        for block in document.iter_inner_content():
+            if isinstance(block, DocxTable):
+                rows = [[cell.text for cell in row.cells] for row in block.rows]
+                if len(rows) < _MIN_TABLE_ROWS:
+                    continue
+                counter += 1
+                elements.append(
+                    ParsedElement(
+                        element_type=ElementType.TABLE,
+                        page_number=1,
+                        bbox=_SENTINEL_BBOX,
+                        content=_rows_to_markdown(rows),
+                        element_id=f"docx-table{counter}",
+                    )
+                )
+                continue
+
+            paragraph = block
             text = paragraph.text.strip()
-            if not text:
-                continue
-            style_name = paragraph.style.name if paragraph.style else ""
-            if style_name.lower() == "caption" or _CAPTION_PREFIX_RE.match(text):
-                element_type = ElementType.CAPTION
-            elif _DOCX_HEADING_STYLE_RE.match(style_name):
-                element_type = ElementType.HEADING
-            elif _DOCX_LIST_STYLE_RE.match(style_name) or _BULLET_PREFIX_RE.match(text):
-                element_type = ElementType.LIST
-            else:
-                element_type = ElementType.TEXT
-
-            counter += 1
-            elements.append(
-                ParsedElement(
-                    element_type=element_type,
-                    page_number=1,
-                    bbox=_SENTINEL_BBOX,
-                    content=text,
-                    element_id=f"docx-p{counter}",
+            if text:
+                style_name = paragraph.style.name if paragraph.style else ""
+                if style_name.lower() == "caption" or _CAPTION_PREFIX_RE.match(text):
+                    element_type = ElementType.CAPTION
+                elif _DOCX_HEADING_STYLE_RE.match(style_name):
+                    element_type = ElementType.HEADING
+                elif _DOCX_LIST_STYLE_RE.match(style_name) or _BULLET_PREFIX_RE.match(text):
+                    element_type = ElementType.LIST
+                else:
+                    element_type = ElementType.TEXT
+                counter += 1
+                elements.append(
+                    ParsedElement(
+                        element_type=element_type,
+                        page_number=1,
+                        bbox=_SENTINEL_BBOX,
+                        content=text,
+                        element_id=f"docx-p{counter}",
+                    )
                 )
-            )
 
-        for table in document.tables:
-            rows = [[cell.text for cell in row.cells] for row in table.rows]
-            if len(rows) < _MIN_TABLE_ROWS:
-                continue
-            counter += 1
-            elements.append(
-                ParsedElement(
-                    element_type=ElementType.TABLE,
-                    page_number=1,
-                    bbox=_SENTINEL_BBOX,
-                    content=_rows_to_markdown(rows),
-                    element_id=f"docx-table{counter}",
-                )
-            )
-
-        for shape in document.inline_shapes:
-            image_bytes = _docx_image_bytes(document, shape)
-            if image_bytes is None:
-                dropped += 1
-                logger.warning("parser: dropped a DOCX figure — could not resolve its image bytes")
-                continue
-            try:
-                pil_image = Image.open(BytesIO(image_bytes)).convert("RGB")
-                pil_image.load()  # force decode now, while the source bytes are still in scope
-            except Exception:
-                dropped += 1
-                logger.warning("parser: dropped a DOCX figure — image bytes failed to decode", exc_info=True)
-                continue
-            counter += 1
-            elements.append(
-                ParsedElement(
-                    element_type=ElementType.FIGURE,
-                    page_number=1,
-                    bbox=_SENTINEL_BBOX,
-                    content=pil_image,
-                    element_id=f"docx-fig{counter}",
-                )
-            )
+            # Inline images live inside paragraph runs — same scope as the
+            # old document.inline_shapes (floating/anchored images excluded).
+            for rid in paragraph._element.xpath(".//wp:inline//a:blip/@r:embed"):
+                add_figure(_docx_image_bytes_by_rid(document, rid))
     except ParseError:
         raise
     except Exception as exc:
@@ -958,6 +966,33 @@ def _parse_pptx(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
 # reasoning as DOCX — HTML has no page/coordinate concept either.
 
 _HTML_HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+_HTML_BLOCK_TAGS = _HTML_HEADING_TAGS | {"p", "li", "table", "figcaption", "caption"}
+_HTML_SKIP_TAGS = {"script", "style", "noscript", "template", "head"}
+
+
+def _iter_html_blocks(root):
+    """Yields block elements in document order. A matched block is not
+    descended into, so nested matches (a <p> inside an <li>, a <caption>
+    inside a <table>) are never emitted twice — the outer block's own text
+    already includes them. (`tree.css("h1, …, p")` returns nodes grouped by
+    selector, not in document order, which detached every heading from its
+    section.)"""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        tag = node.tag
+        if tag in _HTML_BLOCK_TAGS and node is not root:
+            yield node
+            continue
+        if tag in _HTML_SKIP_TAGS:
+            continue
+        children = []
+        child = node.child
+        while child is not None:
+            if child.tag != "-text":
+                children.append(child)
+            child = child.next
+        stack.extend(reversed(children))
 
 
 def _parse_html(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
@@ -970,10 +1005,38 @@ def _parse_html(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
     dropped = 0
     counter = 0
 
+    def emit_text(node, tag: str) -> None:
+        nonlocal counter
+        text = node.text(deep=True, separator=" ").strip()
+        if not text:
+            return
+        if tag in _HTML_HEADING_TAGS:
+            element_type = ElementType.HEADING
+        elif tag == "li":
+            element_type = ElementType.LIST
+        elif tag in ("figcaption", "caption") or _CAPTION_PREFIX_RE.match(text):
+            element_type = ElementType.CAPTION
+        else:
+            element_type = ElementType.TEXT
+        counter += 1
+        elements.append(
+            ParsedElement(
+                element_type=element_type,
+                page_number=1,
+                bbox=_SENTINEL_BBOX,
+                content=text,
+                element_id=f"html-el{counter}",
+            )
+        )
+
     try:
-        for node in tree.css("h1, h2, h3, h4, h5, h6, p, li, table, figcaption, caption"):
+        for node in _iter_html_blocks(tree.body or tree.root):
             tag = node.tag
             if tag == "table":
+                # A <caption> belongs to its table but precedes it in the DOM
+                # — emit it first so it stays adjacent, as the chunker expects.
+                for caption in node.css("caption"):
+                    emit_text(caption, "caption")
                 rows = []
                 for tr in node.css("tr"):
                     cells = [c.text(deep=True, separator=" ").strip() for c in tr.css("td, th")]
@@ -993,29 +1056,7 @@ def _parse_html(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
                 )
                 continue
 
-            text = node.text(deep=True, separator=" ").strip()
-            if not text:
-                continue
-
-            if tag in _HTML_HEADING_TAGS:
-                element_type = ElementType.HEADING
-            elif tag == "li":
-                element_type = ElementType.LIST
-            elif tag in ("figcaption", "caption") or _CAPTION_PREFIX_RE.match(text):
-                element_type = ElementType.CAPTION
-            else:
-                element_type = ElementType.TEXT
-
-            counter += 1
-            elements.append(
-                ParsedElement(
-                    element_type=element_type,
-                    page_number=1,
-                    bbox=_SENTINEL_BBOX,
-                    content=text,
-                    element_id=f"html-el{counter}",
-                )
-            )
+            emit_text(node, tag)
 
         # HTML figure extraction (img tags): confirmed real gap during the
         # original FEAT-020 investigation (Docling itself never resolved

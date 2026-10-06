@@ -800,3 +800,53 @@ def test_verifies_a_real_generated_answers_citation_end_to_end(admin, user_a):
 
     assert verdict_result.verdict in (VerdictLabel.SUPPORTED, VerdictLabel.PARTIAL)
     assert verdict_result.quote is not None
+
+
+# --- Quote grounding for tables, figures, and typography (2026-10-06) ---------
+# The grounding check required the quote to appear verbatim in the chunk text.
+# Table chunks are markdown, so a correct quote like "Q3 $4.20M" never matched
+# "| Q3 | $4.20M |"; figure chunks' text is only the caption, so a quote read off
+# the image never matched either. Both were dropped as UNSUPPORTED.
+
+_TABLE = "Table 1: Revenue\n\n| Quarter | Revenue |\n|---|---|\n| Q2 | $3.56M |\n| Q3 | $4.20M |"
+
+
+def _verify_with_quote(chunk, verdict, quote):
+    client = FakeClient(response=FakeResponse(parsed=_VerdictResponse(verdict=verdict, quote=quote)))
+    return Verifier(client=client).verify("Q3 revenue was $4.2M", chunk)
+
+
+def test_table_quote_without_markdown_pipes_is_grounded():
+    result = _verify_with_quote(_chunk(content=_TABLE, element_type="table"), VerdictLabel.SUPPORTED, "Q3 $4.20M")
+
+    assert result.verdict == VerdictLabel.SUPPORTED
+    assert result.quote == "Q3 $4.20M"
+
+
+def test_table_quote_that_is_not_in_the_table_is_still_rejected():
+    result = _verify_with_quote(_chunk(content=_TABLE, element_type="table"), VerdictLabel.SUPPORTED, "Q4 $9.99M")
+
+    assert result.verdict == VerdictLabel.UNSUPPORTED
+
+
+def test_quote_differing_only_in_case_and_typographic_punctuation_is_grounded():
+    chunk = _chunk(content="The board said: “Growth was strong” — especially in Q3.")
+    result = _verify_with_quote(chunk, VerdictLabel.SUPPORTED, '"growth was strong" - especially in q3')
+
+    assert result.verdict == VerdictLabel.SUPPORTED
+
+
+def test_figure_quote_read_from_the_image_keeps_the_verdict_but_not_the_unverifiable_quote():
+    chunk = _chunk(content="Figure 1: Quarterly revenue chart", element_type="figure", image=b"png-bytes")
+    result = _verify_with_quote(chunk, VerdictLabel.SUPPORTED, "Q3: $4.2M")
+
+    assert result.verdict == VerdictLabel.SUPPORTED
+    assert result.quote is None
+
+
+def test_figure_quote_found_in_the_caption_is_kept():
+    chunk = _chunk(content="Figure 1: Quarterly revenue chart", element_type="figure", image=b"png-bytes")
+    result = _verify_with_quote(chunk, VerdictLabel.PARTIAL, "Quarterly revenue chart")
+
+    assert result.verdict == VerdictLabel.PARTIAL
+    assert result.quote == "Quarterly revenue chart"

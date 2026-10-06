@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
@@ -115,22 +116,34 @@ def _build_contents(claim_text: str, chunk: GeneratorChunk) -> list[types.Part]:
 
 
 _WHITESPACE = re.compile(r"\s+")
+_TABLE_SEPARATOR_CELL = re.compile(r"(?<![\w-])-{3,}(?![\w-])")
+_TYPOGRAPHY = str.maketrans(
+    {
+        "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'",
+        "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"',
+        "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-", "\u2014": "-", "\u2212": "-",
+        "|": " ",
+    }
+)
 
 
-def _normalize_whitespace(text: str) -> str:
-    return _WHITESPACE.sub(" ", text).strip()
+def _normalize_for_grounding(text: str) -> str:
+    """Normalizes away differences that don't change what a quote says:
+    Unicode compatibility forms, curly quotes and dash variants, case,
+    markdown table syntax (cell pipes and `---` separator rows — table
+    chunks are stored as markdown, so "Q3 $4.20M" must match
+    "| Q3 | $4.20M |"), and runs of whitespace."""
+    text = unicodedata.normalize("NFKC", text).translate(_TYPOGRAPHY)
+    text = _TABLE_SEPARATOR_CELL.sub(" ", text)
+    return _WHITESPACE.sub(" ", text).strip().casefold()
 
 
 def _quote_is_grounded(quote: str, content: str) -> bool:
-    # A self-audit found the model's returned quote was trusted as-is,
-    # with no check it actually appears anywhere in the source — a
-    # verifier whose entire job is catching plausible-sounding
-    # falsehoods was itself trusting one. Whitespace is normalized
-    # (collapsed runs of whitespace, not exact byte-for-byte) rather than
-    # requiring a strict substring match, since real chunk content (e.g.
-    # markdown tables with padding) can differ from the model's
-    # reproduction by whitespace alone without the quote being fabricated.
-    return _normalize_whitespace(quote) in _normalize_whitespace(content)
+    # The model's quote must actually appear in the source — a verifier
+    # whose job is catching plausible-sounding falsehoods can't trust one
+    # itself. Formatting-only differences are normalized away (see
+    # _normalize_for_grounding); the words themselves must match.
+    return _normalize_for_grounding(quote) in _normalize_for_grounding(content)
 
 
 def _fail_safe_verdict(verdict_label: VerdictLabel, model: str, error: str, latency_ms: float) -> Verdict:
@@ -240,6 +253,13 @@ class Verifier:
         # existed). If the quote isn't grounded in the chunk, the verdict
         # that depends on it can't be trusted either — fail safe exactly
         # like a broken API call, not just the quote field.
+        if quote is not None and chunk.image is not None and not _quote_is_grounded(quote, chunk.content):
+            # A figure chunk's text is only its caption; the model also saw
+            # the image and may legitimately quote text read off it, which
+            # can't be checked against stored text. Keep the verdict, but
+            # don't display a quote nothing on our side can confirm.
+            logger.info("verifier: figure quote not in caption text — keeping verdict, omitting quote. quote=%r", quote)
+            quote = None
         if quote is not None and not _quote_is_grounded(quote, chunk.content):
             logger.warning(
                 "verifier: model returned verdict=%s with a quote not found in the source — "

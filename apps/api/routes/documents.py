@@ -23,7 +23,7 @@ _VALID_STATUSES = {"uploaded", "parsing", "embedded", "ready", "failed"}
 
 
 @router.get("/documents", response_model=DocumentListResponse)
-async def list_documents(
+def list_documents(
     request: Request,
     status: str | None = None,
     limit: int = Query(50, ge=1, le=200),
@@ -71,7 +71,7 @@ async def list_documents(
 
 
 @router.get("/documents/{document_id}", response_model=DocumentResponse)
-async def get_document(document_id: str, request: Request):
+def get_document(document_id: str, request: Request):
     user_id = request.state.user_id
     client = get_service_role_client()
 
@@ -110,7 +110,7 @@ def _storage_deletion_failed(document_id: str, user_id: str, *, bucket: str) -> 
 
 
 @router.delete("/documents/{document_id}", status_code=204)
-async def delete_document(document_id: str, request: Request):
+def delete_document(document_id: str, request: Request):
     user_id = request.state.user_id
     client = get_service_role_client()
 

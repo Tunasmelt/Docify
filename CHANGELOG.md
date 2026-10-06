@@ -6,6 +6,22 @@ Entry types: `feature` · `fix` · `decision` · `refactor` · `test` · `infra`
 
 ---
 
+## 2026-10-06 — fix: event-loop blocking, HTML/DOCX reading order, FTS any-term matching, table/figure quote grounding
+
+**Phase:** 5
+**Feature:** n/a (fixes from the 2026-10-06 code review, "Now" group)
+**Changed:**
+- **Server no longer freezes during a query.** Every route was `async def` but called the synchronous Supabase client, and `/query` also called the synchronous retriever, Gemini, and verifier, so one question blocked the single worker for its full duration. Blocking handlers are now plain `def` (FastAPI's threadpool), and `/query/stream`'s pre-stream ownership and history checks use `asyncio.to_thread`. Measured with a live server: `/health` waited 1.76s behind a 2s `/query` before, and under 0.5s after. `routes/*.py`, `tests/test_event_loop.py` (structural guard + live-server test).
+- **HTML reading order.** `tree.css("h1, …, p, li, …")` returns nodes grouped by selector, so every heading came out before every paragraph and tables landed after the text around them. The DOM is now walked in order. Nested matches (`<p>` in `<li>`, `<caption>` in `<table>`) are no longer emitted twice, and a table's `<caption>` is emitted just before the table. `services/parser.py` (`_iter_html_blocks`).
+- **DOCX reading order.** Paragraphs, then all tables, then all images became body order (`Document.iter_inner_content()`), with inline images emitted at the paragraph that contains them.
+- **Full-text search matches any term.** `websearch_to_tsquery` ANDed every question term, so natural-language questions rarely matched and hybrid search was effectively vector-only. Migration `20261006_001_fts_any_term_matching.sql` ORs the question's normalized lexemes (`fts_any_term_query`), and `ts_rank` puts chunks matching more terms first.
+- **Table and figure citations are no longer wrongly dropped.** Quote grounding now ignores markdown table syntax, case, Unicode compatibility forms, and curly-quote/dash variants, so `"Q3 $4.20M"` matches `| Q3 | $4.20M |`. Fabricated quotes are still rejected. For figure chunks, a quote that isn't in the caption (it was read off the image, which can't be checked against stored text) keeps the verdict but isn't displayed. `services/verifier.py`.
+**Verified:** New regression tests fail on the old code and pass on the new (3 parser, 2 event-loop, 3 FTS, 5 verifier). Full backend suite against a local Supabase stack: 389 passed. All 12 failures also fail on the unmodified code and are environmental (no Gemini/OCR.space keys, no `tesseract`, no network for the Voyage tokenizer), plus the known flaky RRF tie-break test (MEMORY.md §Open questions 2026-08-02). With placeholder API keys, the `/query`, `/query/stream`, rate-limit, and event-loop suites pass in full (73 passed).
+**Deploy:** apply `20261006_001_fts_any_term_matching.sql` to production before deploying this code.
+**Rollback:** revert the commit. The migration's `-- ROLLBACK` block restores the previous `match_chunks_by_fts`.
+
+---
+
 ## 2026-10-06 — docs: documentation accuracy pass across .agent/, AGENT.md, and new developer/deploy guides
 
 **Phase:** 5

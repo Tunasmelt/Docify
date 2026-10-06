@@ -239,7 +239,7 @@ def get_pipeline_runner():
 @router.post("/ingest", status_code=202, response_model=IngestResponse)
 @limiter.shared_limit(INGEST_MINUTE_LIMIT, scope=INGEST_RATE_LIMIT_SCOPE)
 @limiter.shared_limit(INGEST_GLOBAL_MINUTE_LIMIT, scope=INGEST_GLOBAL_RATE_LIMIT_SCOPE, key_func=global_key)
-async def post_ingest(
+def post_ingest(
     payload: IngestRequest,
     request: Request,
     response: Response,
@@ -321,7 +321,7 @@ async def post_ingest(
 @router.post("/reindex/{document_id}", status_code=202, response_model=IngestResponse)
 @limiter.shared_limit(INGEST_MINUTE_LIMIT, scope=INGEST_RATE_LIMIT_SCOPE)
 @limiter.shared_limit(INGEST_GLOBAL_MINUTE_LIMIT, scope=INGEST_GLOBAL_RATE_LIMIT_SCOPE, key_func=global_key)
-async def post_reindex(
+def post_reindex(
     document_id: str,
     request: Request,
     response: Response,
