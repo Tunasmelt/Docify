@@ -310,7 +310,10 @@ def test_delete_account_auth_failure_reports_storage_was_removed_and_retry_succe
     user_id, token = user_a
     seeded = _seed_full_account(app_client, admin, user_id, token)
 
-    with patch.object(admin.auth.admin, "delete_user", side_effect=RuntimeError("simulated auth outage")):
+    # Route builds its own client via get_service_role_client(); route it to `admin` so the patch applies.
+    with patch.object(account_module, "get_service_role_client", return_value=admin), patch.object(
+        admin.auth.admin, "delete_user", side_effect=RuntimeError("simulated auth outage")
+    ):
         response = app_client.delete("/account", headers={"Authorization": f"Bearer {token}"})
 
     assert response.status_code == 500
