@@ -1,6 +1,7 @@
 import logging
 import posixpath
 import re
+import uuid
 from io import BytesIO
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Request, Response
@@ -11,8 +12,21 @@ from db.client import get_service_role_client
 from errors import error_envelope
 from models.ingest import IngestRequest, IngestResponse
 from rate_limit import DailyLimitExceeded, check_daily_limit, daily_limit_exceeded_response, global_key, limiter
+from services import ingest_queue
 from services.chunker import Chunker
+from services.document_model import (
+    DocumentLimitError,
+    IngestTimeoutError,
+    MissingSourceFileError,
+    ParseError,
+    check_deadline,
+)
 from services.embedder import Embedder
+from services.ingest_queue import JOB_TIME_LIMIT_SECONDS, TransientIngestError
+
+JOB_TIME_LIMIT_MINUTES = JOB_TIME_LIMIT_SECONDS / 60
+# Matches the upload UI's stated limit and the Storage bucket's file_size_limit.
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 
 logger = logging.getLogger(__name__)
 
@@ -255,6 +269,14 @@ def validate_storage_path(storage_path: str, user_id: str) -> str:
     return storage_path
 
 
+def get_job_dispatcher():
+    """FastAPI dependency returning what to call after a job is enqueued.
+    In production that wakes the worker thread (main.py starts it); tests
+    override it to drain the queue synchronously with the overridden
+    pipeline runner, so they exercise the real enqueue/claim/finish path."""
+    return lambda _runner: ingest_queue.wake_worker()
+
+
 def get_pipeline_runner():
     """FastAPI dependency returning the background-pipeline callable.
     Indirection exists purely so tests can override it via
@@ -273,6 +295,7 @@ def post_ingest(
     response: Response,
     background_tasks: BackgroundTasks,
     pipeline_runner=Depends(get_pipeline_runner),
+    dispatch=Depends(get_job_dispatcher),
 ):
     # `response` is never touched directly below — it exists purely so
     # FastAPI injects an empty Response object for @limiter.limit(...) to
@@ -319,6 +342,14 @@ def post_ingest(
             ),
         )
 
+    if payload.size_bytes > MAX_UPLOAD_BYTES:
+        return JSONResponse(
+            status_code=422,
+            content=error_envelope(
+                "VALIDATION_ERROR", f"file is larger than the {MAX_UPLOAD_BYTES // 1024 // 1024} MB limit"
+            ),
+        )
+
     client = get_service_role_client()
 
     # Before the daily limit, so a refused request doesn't use up a daily slot.
@@ -343,9 +374,10 @@ def post_ingest(
         size_bytes=payload.size_bytes,
     )
 
-    background_tasks.add_task(
-        pipeline_runner, document_id=document["id"], user_id=user_id, storage_path=payload.storage_path
-    )
+    # Queued, not run here: the ingest worker processes jobs one at a time
+    # (services/ingest_queue.py). The document stays 'uploaded' until claimed.
+    ingest_queue.enqueue(client, document_id=document["id"], user_id=user_id, storage_path=payload.storage_path)
+    background_tasks.add_task(dispatch, pipeline_runner)
 
     return IngestResponse(document_id=document["id"], status=document["status"], created_at=document["created_at"])
 
@@ -359,6 +391,7 @@ def post_reindex(
     response: Response,
     background_tasks: BackgroundTasks,
     pipeline_runner=Depends(get_pipeline_runner),
+    dispatch=Depends(get_job_dispatcher),
 ):
     """Re-runs the full ingest pipeline for an EXISTING document, from the
     file already sitting in Storage — no new upload. Real use cases this
@@ -398,11 +431,8 @@ def post_reindex(
         # /documents/{id}), so there's nothing here to accidentally leak.
         return JSONResponse(status_code=404, content=error_envelope("NOT_FOUND", "document not found"))
 
-    if document["status"] in ("parsing", "embedded"):
-        # Same real conflict DELETE /documents/{id} already guards
-        # against (routes/documents.py) — a still-running background
-        # task's later insert_chunks() call would otherwise race a
-        # reindex's own delete_chunks_for_document() below.
+    if document["status"] in ("parsing", "embedded") or ingest_queue.has_active_job(client, document_id):
+        # Already queued or running: a second job would race the first.
         return JSONResponse(
             status_code=409,
             content=error_envelope("CONFLICT", "document is currently being processed"),
@@ -416,44 +446,14 @@ def post_reindex(
     except DailyLimitExceeded:
         return daily_limit_exceeded_response()
 
-    # Existing chunks must go before the pipeline re-runs — chunks.
-    # (document_id, chunk_index) is unique (SCHEMA.md), so a fresh bulk
-    # insert_chunks() would otherwise fail outright on the very first
-    # overlapping index. Done synchronously, before the background task
-    # is even queued, not inside run_ingest_pipeline() itself — keeps
-    # that function's own logic completely untouched (task's explicit
-    # "matching run_ingest_pipeline's existing logic as closely as
-    # possible rather than duplicating it").
-    #
-    # Known, accepted gap (matches this project's existing SCOPE.md
-    # pattern for the figure-upload-before-later-failure gap): old
-    # figure Storage objects are not explicitly deleted here. In the
-    # common case a re-parse produces the same or more figures, and
-    # _upload_figures() reuses the identical {user_id}/{document_id}/
-    # {chunk_index}.png path convention, so the old object is simply
-    # overwritten, not orphaned. A re-parse that produces FEWER figures
-    # than before could leave a stale, unreferenced object at a
-    # higher chunk_index — not cleaned up here, not a correctness bug
-    # (nothing in `chunks` points at it after this reindex), just a
-    # storage-bytes gap, same class of accepted tradeoff as the existing
-    # SCOPE.md entry.
-    queries.delete_chunks_for_document(client, document_id)
+    # The existing chunks stay live: the job stages new ones and swaps them in
+    # atomically (run_ingest_pipeline), so the document keeps answering while
+    # it's reprocessed and keeps its old chunks if reprocessing fails.
+    queries.mark_queued(client, document_id)
+    ingest_queue.enqueue(client, document_id=document_id, user_id=user_id, storage_path=document["storage_path"])
+    background_tasks.add_task(dispatch, pipeline_runner)
 
-    # Synchronous, not left for run_ingest_pipeline()'s own internal
-    # mark_parsing() call — guarantees the response body below reports
-    # the real DB status at the moment it's built (same discipline
-    # POST /ingest's create-then-report already uses), and immediately
-    # signals any concurrent GET /documents call that this document is
-    # back in flight, not still sitting at 'failed'. run_ingest_pipeline()
-    # calling mark_parsing() again internally is a harmless, idempotent
-    # re-set of the same value — not a duplicated side effect.
-    queries.mark_parsing(client, document_id)
-
-    background_tasks.add_task(
-        pipeline_runner, document_id=document_id, user_id=user_id, storage_path=document["storage_path"]
-    )
-
-    return IngestResponse(document_id=document_id, status="parsing", created_at=document["created_at"])
+    return IngestResponse(document_id=document_id, status="uploaded", created_at=document["created_at"])
 
 
 def run_ingest_pipeline(
@@ -465,19 +465,27 @@ def run_ingest_pipeline(
     parser=None,
     chunker=None,
     embedder=None,
-) -> None:
-    """download -> parse -> chunk -> embed -> upload figures -> insert
-    chunks -> mark ready. Every stage dependency is injectable so tests
-    exercise this exact function with fakes, not a copy of its logic.
+    deadline: float | None = None,
+    final_attempt: bool = True,
+) -> bool:
+    """download -> parse -> chunk -> embed -> upload figures -> stage
+    chunks -> swap them live -> mark ready. Every stage dependency is
+    injectable so tests exercise this exact function with fakes, not a copy
+    of its logic. Run by the ingest queue's worker (services/ingest_queue.py).
 
-    No-partial-chunk-data guarantee (SCOPE.md): all chunk rows for this
-    document are written in exactly one bulk INSERT, which Postgres runs
-    as a single atomic statement — every row lands or none do. Every
-    stage that can fail (download, parse, chunk, embed, figure upload)
-    happens strictly before that call, so a failure anywhere before it
-    means the insert is never attempted. The best-effort delete in
-    `_fail_document` below is defense-in-depth for future changes to
-    this function, not the primary guarantee.
+    Returns True when the document is ready, False when it was marked
+    failed. A transient failure (anything but a parse/limit/timeout/path
+    error) on a non-final attempt raises TransientIngestError instead, so
+    the queue retries it; on the final attempt it marks the document failed.
+
+    `deadline` (a time.monotonic() value) is the job's time limit, checked
+    between stages and between OCR'd pages.
+
+    Chunk swap (2026-10-06): new chunks are written to chunks_staging in one
+    bulk INSERT and moved into chunks by swap_document_chunks() in one
+    transaction. A reindexed document keeps answering from its old chunks
+    until the swap, and a failure at any stage leaves them untouched (it
+    used to leave the document with no chunks at all).
 
     Figure uploads landing in storage before a later stage fails are a
     known, accepted gap: SCOPE.md's no-partial-data requirement is
@@ -491,6 +499,7 @@ def run_ingest_pipeline(
     message, since it happened before there was anything to catch it.
     """
     opened_images: list = []
+    new_figure_paths: list[str] = []
     resolved_client = client
     try:
         validate_storage_path(storage_path, user_id)
@@ -509,18 +518,29 @@ def run_ingest_pipeline(
             # sys.modules once this import is deferred here too.
             from services.parser import Parser
 
-            parser = Parser()
+            parser = Parser(deadline=deadline)
         chunker = chunker or Chunker()
         embedder = embedder or Embedder()
 
         queries.mark_parsing(resolved_client, document_id)
+        queries.delete_staged_chunks(resolved_client, document_id)  # leftovers of an interrupted attempt
 
         # storage_path is "uploads/{user_id}/{filename}" (API_CONTRACT.md) —
         # includes the bucket name itself, but .from_("uploads") already
         # scopes to that bucket, so the prefix must be stripped here or the
         # SDK requests "uploads/uploads/..." and 404s.
         in_bucket_path = storage_path.removeprefix("uploads/")
-        file_bytes = resolved_client.storage.from_("uploads").download(in_bucket_path)
+        try:
+            file_bytes = resolved_client.storage.from_("uploads").download(in_bucket_path)
+        except Exception as exc:
+            if "not_found" in str(exc) or "Object not found" in str(exc):
+                raise MissingSourceFileError("The uploaded file is missing from storage. Upload it again.") from exc
+            raise  # other storage errors are worth retrying
+        # The size the browser reported at /ingest isn't trusted; this is the real one.
+        if len(file_bytes) > MAX_UPLOAD_BYTES:
+            raise DocumentLimitError(
+                f"This file is {len(file_bytes) / 1024 / 1024:.0f} MB; the limit is {MAX_UPLOAD_BYTES // 1024 // 1024} MB."
+            )
         # FEAT-020: Parser.parse() needs the real filename/extension to
         # tell Docling which format this actually is (it inspects the
         # extension, no content-sniffing — confirmed against the
@@ -539,6 +559,7 @@ def run_ingest_pipeline(
 
         chunks = chunker.chunk(parsed)
         opened_images = [c.image for c in chunks if c.image is not None]
+        check_deadline(deadline, JOB_TIME_LIMIT_MINUTES)
 
         # [] chunks -> [] embedded_chunks; raises EmbedError only once BOTH
         # Voyage (its own exhausted retries) and, for the affected batch,
@@ -547,9 +568,12 @@ def run_ingest_pipeline(
         # can end up with a mix of "voyage" and "gemini" rows if only some
         # batches hit the fallback.
         embedded_chunks = embedder.embed(chunks)
+        check_deadline(deadline, JOB_TIME_LIMIT_MINUTES)
         queries.mark_embedded(resolved_client, document_id)
 
-        figure_paths = _upload_figures(resolved_client, user_id, document_id, chunks)
+        # A fresh prefix per run, so the old chunks' figures stay valid until
+        # the swap; the old objects are removed after it.
+        figure_paths = _upload_figures(resolved_client, user_id, document_id, chunks, new_figure_paths)
 
         rows = queries.build_chunk_rows(
             document_id=document_id,
@@ -559,9 +583,16 @@ def run_ingest_pipeline(
             figure_paths=figure_paths,
             elements=parsed.elements,
         )
-        queries.insert_chunks(resolved_client, rows)
-
+        queries.insert_staged_chunks(resolved_client, rows)
+        old_figure_paths = queries.list_figure_paths_for_document(resolved_client, document_id)
+        queries.swap_document_chunks(resolved_client, document_id=document_id, user_id=user_id)
+        # The new figures are referenced by live chunks now: a failure after
+        # this point (e.g. in mark_ready) must not clean them up.
+        live_figures = set(new_figure_paths)
+        new_figure_paths.clear()
         queries.mark_ready(resolved_client, document_id)
+        _remove_figures(resolved_client, [p for p in old_figure_paths if p not in live_figures])
+        return True
     except StoragePathError as exc:
         # Deliberately not logger.exception() here — that would dump a
         # traceback whose exception message still contains the raw
@@ -576,9 +607,21 @@ def run_ingest_pipeline(
             exc.reason,
         )
         _fail_document(resolved_client, document_id, exc)
+        return False
+    except (ParseError, IngestTimeoutError, MissingSourceFileError) as exc:
+        # Permanent: the same file fails the same way next time. Includes
+        # DocumentLimitError (too large, too many pages / OCR pages).
+        logger.warning("ingest pipeline failed for document %s: %s", document_id, exc)
+        _fail_document(resolved_client, document_id, exc, new_figure_paths)
+        return False
     except Exception as exc:
+        if not final_attempt:
+            # Rate limits, network or storage errors: let the queue retry.
+            _discard_attempt(resolved_client, document_id, new_figure_paths)
+            raise TransientIngestError(f"{type(exc).__name__}: {exc}") from exc
         logger.exception("ingest pipeline failed for document %s", document_id)
-        _fail_document(resolved_client, document_id, exc)
+        _fail_document(resolved_client, document_id, exc, new_figure_paths)
+        return False
     finally:
         # FEAT-004's image ownership contract: Chunk images are the
         # caller's to close after use. This pipeline is the final caller.
@@ -586,7 +629,28 @@ def run_ingest_pipeline(
             image.close()
 
 
-def _fail_document(client, document_id: str, exc: Exception) -> None:
+def _remove_figures(client, paths: list[str]) -> None:
+    """Best-effort: an orphaned figure costs storage bytes, never correctness."""
+    if not paths:
+        return
+    try:
+        client.storage.from_("figures").remove(paths)
+    except Exception:
+        logger.warning("ingest: couldn't remove %d figure object(s)", len(paths), exc_info=True)
+
+
+def _discard_attempt(client, document_id: str, new_figure_paths: list[str]) -> None:
+    """Removes what a failed attempt staged; the live chunks are untouched."""
+    if client is None:
+        return
+    try:
+        queries.delete_staged_chunks(client, document_id)
+    except Exception:
+        logger.warning("ingest: couldn't clear staged chunks for document %s", document_id, exc_info=True)
+    _remove_figures(client, new_figure_paths)
+
+
+def _fail_document(client, document_id: str, exc: Exception, new_figure_paths: list[str] | None = None) -> None:
     """Best-effort failure handling (Codex review, 2026-07-23). If
     `client` never got constructed, there is no client to write with —
     log at ERROR and stop; the document stays at whatever status it
@@ -604,16 +668,19 @@ def _fail_document(client, document_id: str, exc: Exception) -> None:
         )
         return
 
+    # Only this attempt's staged chunks: a reindexed document's live chunks
+    # stay searchable after a failure (2026-10-06).
     try:
-        queries.delete_chunks_for_document(client, document_id)
+        queries.delete_staged_chunks(client, document_id)
     except Exception:
         logger.error(
-            "ingest pipeline failure-cleanup: delete_chunks_for_document itself failed for "
+            "ingest pipeline failure-cleanup: delete_staged_chunks itself failed for "
             "document %s (original pipeline error: %s)",
             document_id,
             exc,
             exc_info=True,
         )
+    _remove_figures(client, new_figure_paths or [])
 
     try:
         queries.mark_failed(client, document_id, error=str(exc))
@@ -628,14 +695,18 @@ def _fail_document(client, document_id: str, exc: Exception) -> None:
         )
 
 
-def _upload_figures(client, user_id: str, document_id: str, chunks) -> dict[int, str]:
+def _upload_figures(client, user_id: str, document_id: str, chunks, uploaded: list[str]) -> dict[int, str]:
+    """Uploads under a fresh per-run prefix and appends each path to
+    `uploaded` as it lands, so a failure part-way can clean up."""
+    run_id = uuid.uuid4().hex[:12]
     figure_paths: dict[int, str] = {}
     for chunk in chunks:
         if chunk.image is None:
             continue
-        path = f"{user_id}/{document_id}/{chunk.chunk_index}.png"
+        path = f"{user_id}/{document_id}/{run_id}/{chunk.chunk_index}.png"
         buffer = BytesIO()
         chunk.image.save(buffer, format="PNG")
         client.storage.from_("figures").upload(path, buffer.getvalue(), file_options={"content-type": "image/png"})
+        uploaded.append(path)
         figure_paths[chunk.chunk_index] = path
     return figure_paths

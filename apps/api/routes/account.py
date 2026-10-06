@@ -35,7 +35,9 @@ router = APIRouter()
 #   for a virtual folder, verified against this project's own real
 #   figures/ nesting before writing the walk below):
 #     uploads  — {user_id}/{filename}                    (flat)
-#     figures  — {user_id}/{document_id}/{chunk_index}.png (one level nested)
+#     figures  — {user_id}/{document_id}/{run_id}/{chunk_index}.png
+#                (two levels; documents ingested before 2026-10-06 have
+#                {user_id}/{document_id}/{chunk_index}.png)
 #     avatars  — {user_id}/avatar                          (flat)
 #   -> storage.objects has NO real FK to auth.users (it's Supabase
 #      Storage's own extension schema), so none of these cascade —
@@ -102,23 +104,28 @@ router = APIRouter()
 _USER_SCOPED_BUCKETS = ("uploads", "figures", "avatars")
 
 
+# Deeper than any real layout (figures/ is the deepest, at two levels), so a
+# future layout change can't silently leave objects behind.
+_MAX_FOLDER_DEPTH = 4
+
+
 def _list_all_object_paths(client, bucket: str, user_id: str) -> list[str]:
-    """Every real object path under {user_id}/ in `bucket` — walks one
-    level of subfolders (this project's real max nesting depth; figures/
-    is the only bucket with any subfolder structure at all). Supabase
-    Storage's list() returns a real, non-None `id` for an actual object
-    and `id: None` for a virtual folder entry — confirmed live against
-    this project's own real figures/ path shape before relying on it
-    here, not assumed from generic Storage API docs."""
+    """Every real object path under {user_id}/ in `bucket`, walking
+    subfolders recursively (Storage's list() isn't recursive). list()
+    returns a real, non-None `id` for an actual object and `id: None` for a
+    virtual folder entry — confirmed live against this project's own real
+    figures/ path shape before relying on it here."""
     paths: list[str] = []
-    for entry in client.storage.from_(bucket).list(user_id):
-        if entry.get("id") is None:
-            sub_prefix = f"{user_id}/{entry['name']}"
-            for sub_entry in client.storage.from_(bucket).list(sub_prefix):
-                if sub_entry.get("id") is not None:
-                    paths.append(f"{sub_prefix}/{sub_entry['name']}")
-        else:
-            paths.append(f"{user_id}/{entry['name']}")
+
+    def walk(prefix: str, depth: int) -> None:
+        for entry in client.storage.from_(bucket).list(prefix):
+            path = f"{prefix}/{entry['name']}"
+            if entry.get("id") is not None:
+                paths.append(path)
+            elif depth < _MAX_FOLDER_DEPTH:
+                walk(path, depth + 1)
+
+    walk(user_id, 1)
     return paths
 
 

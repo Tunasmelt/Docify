@@ -83,6 +83,14 @@ def count_processing_documents(client, *, user_id: str, started_within_seconds: 
     return result.count or 0
 
 
+def mark_queued(client, document_id: str) -> None:
+    """Back to 'uploaded' (waiting in the ingest queue) for an automatic
+    retry. The live chunks of a reindexed document are untouched."""
+    client.table("documents").update({"status": "uploaded", "error": None, "updated_at": _now_iso()}).eq(
+        "id", document_id
+    ).execute()
+
+
 def mark_parsed(client, document_id: str, *, page_count: int | None) -> None:
     client.table("documents").update({"page_count": page_count, "parsed_at": _now_iso()}).eq("id", document_id).execute()
 
@@ -174,6 +182,22 @@ def build_chunk_rows(
             }
         )
     return rows
+
+
+def insert_staged_chunks(client, rows: list[dict]) -> None:
+    """New chunks wait in chunks_staging until swap_document_chunks()."""
+    if rows:
+        client.table("chunks_staging").insert(rows).execute()
+
+
+def delete_staged_chunks(client, document_id: str) -> None:
+    client.table("chunks_staging").delete().eq("document_id", document_id).execute()
+
+
+def swap_document_chunks(client, *, document_id: str, user_id: str) -> int:
+    """Replaces the document's live chunks with its staged ones in one
+    transaction (migration 20261006_003). Returns the live chunk count."""
+    return client.rpc("swap_document_chunks", {"p_document_id": document_id, "p_user_id": user_id}).execute().data
 
 
 def insert_chunks(client, rows: list[dict]) -> list[dict]:
@@ -299,13 +323,14 @@ def reap_stale_documents(client, *, user_id: str, threshold_seconds: int) -> lis
     and its justification, and .agent/SCOPE.md for why this reactive
     approach is an accepted tradeoff rather than a real job-queue fix).
 
-    Two separate status-specific checks, not one: 'parsing' has no
-    dedicated "started" timestamp of its own (created_at doubles as the
-    reference point, since parsing begins immediately after creation in
-    the real pipeline), while 'embedded' has a real, reliably-set
-    embedded_at (mark_embedded, routes/ingest.py) that's a tighter, more
-    accurate reference than created_at would be for a document that
-    already made it that far. Scoped to user_id — this fires
+    Two separate status-specific checks, not one: 'parsing' is measured
+    from updated_at, which mark_parsing() sets when each processing attempt
+    starts (2026-10-06; it used created_at, which reaped any reindex of an
+    old document immediately), while 'embedded' has a real, reliably-set
+    embedded_at (mark_embedded, routes/ingest.py). With the ingest queue
+    (services/ingest_queue.py) a dead worker's job is reclaimed within
+    minutes, so this mostly catches documents that predate the queue.
+    Scoped to user_id — this fires
     opportunistically from one user's own GET /documents call and has no
     reason to touch any other user's rows.
 
@@ -317,12 +342,14 @@ def reap_stale_documents(client, *, user_id: str, threshold_seconds: int) -> lis
 
     reaped_ids: list[str] = []
 
+    # updated_at is when the current processing attempt started (mark_parsing
+    # sets it); created_at would reap a reindex of an old document at once.
     stuck_parsing = (
         client.table("documents")
         .update({"status": "failed", "error": error_message})
         .eq("user_id", user_id)
         .eq("status", "parsing")
-        .lt("created_at", cutoff)
+        .lt("updated_at", cutoff)
         .execute()
     )
     reaped_ids.extend(row["id"] for row in stuck_parsing.data)

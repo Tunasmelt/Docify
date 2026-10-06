@@ -200,6 +200,8 @@ def _default_ocr_tiers() -> list[tuple[str, object]]:
 from services.document_model import (  # noqa: E402
     _TEXTUAL_ELEMENT_TYPES,
     BBox,
+    DocumentLimitError,
+    check_deadline,
     ElementType,
     ParsedDocument,
     ParsedElement,
@@ -1335,6 +1337,29 @@ def _largest_image_coverage(page) -> float:
     return largest
 
 
+# Per-document limits (2026-10-06). One worker processes documents one at a
+# time on a 512MB instance, so a single huge or fully scanned file must not
+# hold it for hours. Each OCR'd page can take up to ~3 minutes when every
+# tier times out, and Gemini's OCR tier allows ~20 requests a day in total.
+MAX_PAGES = 300  # PDF pages or PPTX slides
+MAX_OCR_PAGES = 30
+
+
+def _page_count(fmt: str, file_bytes: bytes) -> int | None:
+    """Pages (PDF) or slides (PPTX), read without parsing content; None for
+    formats with no pages. A file these libraries can't even open is left
+    for the real parse to report."""
+    try:
+        if fmt == "pdf":
+            with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+                return len(pdf.pages)
+        if fmt == "pptx":
+            return len(pptx.Presentation(BytesIO(file_bytes)).slides)
+    except Exception:
+        return None
+    return None
+
+
 _EXTENSION_TO_FORMAT = {
     "pdf": "pdf",
     "docx": "docx",
@@ -1345,13 +1370,16 @@ _EXTENSION_TO_FORMAT = {
 
 
 class Parser:
-    def __init__(self, ocr_tiers: list[tuple[str, object]] | None = None):
+    def __init__(self, ocr_tiers: list[tuple[str, object]] | None = None, *, deadline: float | None = None):
         # Real 3-tier chain by default — OCR fallback is production
         # behavior, not an opt-in extra a caller has to remember to wire
         # up. routes/ingest.py constructs Parser() with no arguments and
         # gets all three tiers automatically. Tests that don't want real
         # calls inject their own (name, fake) tier list.
         self._ocr_tiers = ocr_tiers if ocr_tiers is not None else _default_ocr_tiers()
+        # time.monotonic() value after which OCR stops (the ingest job's time
+        # limit); checked between OCR'd pages, the only long-running step.
+        self._deadline = deadline
 
     def parse(self, file_bytes: bytes, filename: str = "document.pdf") -> ParsedDocument:
         """filename drives format detection (extension-based — this parser
@@ -1361,6 +1389,11 @@ class Parser:
         fmt = _EXTENSION_TO_FORMAT.get(ext)
         if fmt is None:
             raise ParseError(f"Unsupported file format: {filename!r}")
+
+        pages = _page_count(fmt, file_bytes)
+        if pages is not None and pages > MAX_PAGES:
+            unit = "slides" if fmt == "pptx" else "pages"
+            raise DocumentLimitError(f"This document has {pages} {unit}; the limit is {MAX_PAGES}.")
 
         if fmt == "pdf":
             elements, dropped = _parse_pdf(file_bytes)
@@ -1400,12 +1433,27 @@ class Parser:
             if e.element_type in _TEXTUAL_ELEMENT_TYPES and isinstance(e.content, str):
                 textual_chars_by_page[e.page_number] = textual_chars_by_page.get(e.page_number, 0) + len(e.content)
 
-        for page_number, (width, height, image_coverage) in page_info.items():
+        pages_needing_ocr = [
+            page_number
+            for page_number, (_w, _h, image_coverage) in page_info.items()
+            if textual_chars_by_page.get(page_number) is None
+            or (
+                textual_chars_by_page[page_number] < _LOW_YIELD_MAX_CHARS
+                and image_coverage >= _SCANNED_PAGE_MIN_IMAGE_COVERAGE
+            )
+        ]
+        # Decided before any OCR call, so an over-budget document fails in
+        # seconds instead of after hours of OCR.
+        if self._ocr_tiers and len(pages_needing_ocr) > MAX_OCR_PAGES:
+            raise DocumentLimitError(
+                f"{len(pages_needing_ocr)} pages of this document are scanned images that need text "
+                f"recognition (OCR); the limit is {MAX_OCR_PAGES} pages per document."
+            )
+
+        for page_number in pages_needing_ocr:
+            width, height, _coverage = page_info[page_number]
             textual_chars = textual_chars_by_page.get(page_number)
-            if textual_chars is not None and not (
-                textual_chars < _LOW_YIELD_MAX_CHARS and image_coverage >= _SCANNED_PAGE_MIN_IMAGE_COVERAGE
-            ):
-                continue  # a real text layer — no OCR needed
+            check_deadline(self._deadline)
 
             page_image = _render_pdf_page_image(file_bytes, page_number)
             if page_image is None:

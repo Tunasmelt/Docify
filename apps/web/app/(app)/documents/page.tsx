@@ -246,8 +246,8 @@ export default function DocumentsPage() {
     setRetryError(null);
     setRetryingId(id);
     try {
-      await reindexDocument(id);
-      commitDocs(docs.map((d) => (d.id === id ? { ...d, status: "parsing", error: null } : d)));
+      const queued = await reindexDocument(id);
+      commitDocs(docs.map((d) => (d.id === id ? { ...d, status: queued.status, error: null } : d)));
       startPolling();
     } catch (err) {
       if (err instanceof ApiError && err.code === "TOO_MANY_PROCESSING") {

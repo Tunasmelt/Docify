@@ -244,6 +244,11 @@ Every fork, what was chosen, why. Append-only.
 **Chosen:** One structured-output call per group of up to 12 claims, numbered ITEMs, list response; each item gets the same quote-grounding checks as before. A failed or malformed batch falls back to per-claim calls; missing items are verified individually.
 **Reasoning:** Cuts verification requests per answer to one in the common case without weakening any per-claim check.
 
+### 2026-10-06 [claude-code] — Ingest runs from a Postgres job queue, in the API process
+**Alternatives considered:** Keep FastAPI BackgroundTasks (no global cap, lost on restart, no retry); Redis/RQ or Celery (new paid or extra infrastructure, against SCOPE.md's free-infra rule); a separate Render worker service (a second always-on free service exceeds the free hours); a subprocess per job (hard timeout and OOM isolation, but each spawn re-imports the parser stack, costing ~100MB+ on a 512MB instance).
+**Chosen:** `ingest_jobs` table claimed with `FOR UPDATE SKIP LOCKED` behind an advisory lock (`claim_ingest_job`), one worker thread per API process, heartbeat leases for crash recovery, bounded retries for transient errors, a cooperative 20-minute time limit, and up-front size/page/OCR limits. Chunks are staged and swapped atomically.
+**Reasoning:** No new infrastructure, survives restarts, and the global cap is enforced in the database, so it holds across instances. The cost is that a runaway job can't be killed mid-call and an OOM still takes the API down with it; the up-front limits make both much less likely, and moving the worker to its own process stays possible without changing the queue.
+
 ---
 
 ## §Assumptions

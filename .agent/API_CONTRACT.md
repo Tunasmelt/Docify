@@ -58,7 +58,7 @@ Two exceptions, both from the framework rather than route code: a request body/q
 | `DELETE_FAILED` | 500 | `DELETE /account` cleaned Storage but the final auth-user deletion failed; DB rows are untouched and retrying is safe |
 | `RETRIEVE_FAILED` / `VERIFY_FAILED` / `PERSIST_FAILED` | — | Only sent as SSE `error` events on `/query/stream` (the HTTP status is already 200 by then) |
 
-Ingest failures (parse, OCR, embedding) happen in a background task after `202` has been returned, so they never surface as HTTP errors: the document moves to `status: "failed"` with a human-readable `error` string.
+Ingest failures (parse, OCR, embedding) happen in the ingest worker after `202` has been returned, so they never surface as HTTP errors: the document moves to `status: "failed"` with a human-readable `error` string.
 
 ---
 
@@ -101,14 +101,16 @@ Supported `mime_type`s: PDF, DOCX, PPTX, HTML.
 ```
 
 **Behaviour:**
-- Creates the `documents` row with `status='uploaded'` and returns `202` immediately.
-- A background task then downloads, parses (with the OCR fallback for low-yield PDF pages), chunks, embeds, uploads figures, and inserts chunks. Status moves `uploaded` → `parsing` → `embedded` → `ready`, or `failed` at any stage with `documents.error` set. `parsed_at`/`embedded_at` are milestone timestamps.
+- Creates the `documents` row with `status='uploaded'` (queued), enqueues an ingest job, and returns `202` immediately.
+- The ingest worker processes jobs one at a time across all users: it downloads, parses (with the OCR fallback for low-yield PDF pages), chunks, embeds, uploads figures, and swaps the new chunks in. Status moves `uploaded` → `parsing` → `embedded` → `ready`, or `failed` with `documents.error` set. `parsed_at`/`embedded_at` are milestone timestamps.
+- **Retries:** a transient failure (rate limit, network, storage error) puts the document back to `uploaded` and retries after 60s, then 300s, up to 3 attempts in all; the last failure marks it `failed`. A job interrupted by a restart resumes within about 2 minutes.
+- **Limits** (the document fails with a message saying which): over 50 MB (real size, after download), over 300 pages or slides, more than 30 pages needing OCR, or processing past 20 minutes. A missing upload fails at once.
 - **Embedding fallback:** a batch whose Voyage retries are exhausted is embedded with Gemini `gemini-embedding-2` instead; `chunks.embedding_provider` records which. This is invisible to the client. A document only fails at this stage if both providers fail for the same batch.
 - Clients poll `GET /documents` (or `GET /documents/{id}`) to observe status.
 
 **Errors:**
 - `403 FORBIDDEN` — `storage_path` is not under `uploads/{jwt.user_id}/`
-- `422 VALIDATION_ERROR` — unsupported `mime_type`
+- `422 VALIDATION_ERROR` — unsupported `mime_type`, or `size_bytes` over 50 MB
 - `429 RATE_LIMITED` — any of:
   - **2/minute per user** (in memory)
   - **3/minute globally**, across all users (in memory) — keeps the whole app under Voyage's shared 3 RPM free-tier ceiling
@@ -128,11 +130,11 @@ Re-runs the full ingest pipeline for an existing document: re-downloads the stor
 ```json
 {
   "document_id": "3f9e...",
-  "status": "parsing",
+  "status": "uploaded",
   "created_at": "2026-07-22T14:30:00Z"
 }
 ```
-Reports `parsing` (not `uploaded`) because the route resets the document to `parsing` before returning.
+Reports `uploaded` (queued): the route resets the document to `uploaded` and enqueues an ingest job.
 
 **Use cases:**
 1. Recovering a document the stuck-document reaper marked `failed` (see `GET /documents`).
@@ -140,12 +142,12 @@ Reports `parsing` (not `uploaded`) because the route resets the document to `par
 3. Re-running the current parser (including OCR) on an older or previously failed document.
 
 **Behaviour:**
-- Deletes the document's existing chunks, clears `documents.error`, then runs the same background pipeline as `/ingest` (`parsing` → `embedded` → `ready` | `failed`).
-- Old figure objects are overwritten at the same paths; if the new parse produces fewer figures, higher-index objects are left orphaned in Storage (unreferenced, a storage-bytes cost only).
+- Clears `documents.error` and queues the same job as `/ingest` (`uploaded` → `parsing` → `embedded` → `ready` | `failed`), with the same retries and limits.
+- **The existing chunks stay live** while it runs: new chunks are staged and swapped in atomically when it finishes, and old figure objects are removed after the swap. If reprocessing fails, the old chunks are kept. Citations that pointed at the old chunks are removed with them (`citations.chunk_id` cascades).
 
 **Errors:**
 - `404 NOT_FOUND`
-- `409 CONFLICT` — the document is still processing (`status in ('parsing', 'embedded')`)
+- `409 CONFLICT` — the document is still processing (`status in ('parsing', 'embedded')`, or it already has a queued or running job)
 - `429 RATE_LIMITED` — shares all of `/ingest`'s counters (one combined 10/day budget)
 - `429 TOO_MANY_PROCESSING` — same 2-document cap as `/ingest`
 

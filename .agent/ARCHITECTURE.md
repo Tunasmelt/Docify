@@ -102,23 +102,33 @@ The browser talks to FastAPI directly (`NEXT_PUBLIC_API_URL`, `apps/web/lib/api/
 3. Browser POSTs to FastAPI POST /ingest { storage_path, filename, mime_type, size_bytes }
    with Bearer <supabase_jwt>. JWTAuthMiddleware verifies the JWT and attaches user_id.
    FastAPI validates storage_path is under the caller's own uploads/{user_id}/ prefix.
-4. FastAPI creates the documents row (status='uploaded'), returns 202, and continues in a
-   BackgroundTask:
-   a. Downloads the file from Storage (service-role client)
-   b. Parses → typed elements (text, tables, figures, headings) with page/slide + bbox,
+4. FastAPI checks the declared size (50 MB max), creates the documents row
+   (status='uploaded', shown as "Queued"), inserts an ingest_jobs row and returns 202.
+   The ingest worker (services/ingest_queue.py, one thread per API process) claims jobs
+   via claim_ingest_job(): at most INGEST_MAX_CONCURRENT_JOBS (default 1) run at once
+   across all users and instances. A running job heartbeats every 30s; a job whose lease
+   (2 min) lapses is claimed again, so a restart resumes it. Transient failures (rate
+   limits, network, storage) retry after 60s then 300s, up to 3 attempts; parse errors,
+   limit violations, a missing file and the 20-minute time limit fail at once. Each job:
+   a. Downloads the file from Storage (service-role client) and checks its real size
+   b. Refuses documents over 300 pages/slides or with more than 30 pages needing OCR
+      (both checked before any parsing or OCR), then parses → typed elements (text, tables, figures, headings) with page/slide + bbox,
       in document order — two-column PDF pages are read column by column (status='parsing'). A PDF page goes through the OCR fallback
       chain if it has no text, or under 200 characters of text over a scan image covering
       half the page or more; the OCR text then replaces that page's thin text layer
-   c. Uploads cropped figures to Storage: figures/{user_id}/{document_id}/{figure}.png
+   c. Uploads cropped figures to Storage: figures/{user_id}/{document_id}/{run_id}/{chunk}.png
    d. Chunks elements (services/chunker.py — see Locked decisions)
    e. Embeds chunks with Voyage; a batch whose Voyage retries are exhausted falls back to
       Gemini embedding-2. Both honor the provider's server-supplied retry delay.
       chunks.embedding_provider records which provider produced each vector (status='embedded')
-   f. Bulk-inserts chunk rows with user_id, then sets status='ready'
-   Any failure → status='failed' with documents.error set, no partial chunks left behind.
+   f. Bulk-inserts chunk rows into chunks_staging, then swap_document_chunks() replaces
+      the document's live chunks in one transaction and status='ready'; old figures are
+      removed. A reindexed document answers from its old chunks until the swap.
+   A permanent failure → status='failed' with documents.error set; staged chunks are
+   discarded and the live chunks (if any) are kept.
 5. Frontend polls GET /documents for status transitions. A document stuck in
-   parsing/embedded for 30+ minutes (e.g. the process was killed) is reaped to 'failed'
-   on the next GET /documents; POST /reindex/{id} re-runs the pipeline.
+   parsing/embedded for 30+ minutes with no job to resume it (pre-queue documents) is
+   reaped to 'failed' on the next GET /documents; POST /reindex/{id} queues it again.
 ```
 
 ### Query flow

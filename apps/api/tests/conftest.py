@@ -41,6 +41,26 @@ from tests._local_supabase import LOCAL_POSTGRES_DSN, admin_client, create_test_
 # several real requests per session.
 app.state.limiter.enabled = False
 
+# Ingest jobs (services/ingest_queue.py): production wakes a worker thread
+# that TestClient never starts (no lifespan without `with`). Instead each
+# /ingest or /reindex drains the queue synchronously with whatever pipeline
+# runner the test installed, going through the real enqueue -> claim ->
+# finish path. max_running is lifted so a job a test deliberately left
+# 'running' (a simulated crash) can't block later tests for its lease.
+from services import ingest_queue  # noqa: E402
+
+
+def _drain_synchronously(runner):
+    ingest_queue.drain(runner, max_running=1000)
+
+
+@pytest.fixture(autouse=True)
+def drain_ingest_jobs_synchronously():
+    # Installed before every test, not once at import: several test modules
+    # call app.dependency_overrides.clear() in their teardown.
+    app.dependency_overrides[ingest.get_job_dispatcher] = lambda: _drain_synchronously
+    yield
+
 
 def _local_supabase_reachable() -> bool:
     try:

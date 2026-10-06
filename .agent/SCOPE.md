@@ -117,11 +117,13 @@ Source of truth for what is and is not in scope, per phase. Check here before de
 - [x] CI: `pytest` (against a local Supabase stack), `next lint`, `tsc` and `next build` on every PR (`.github/workflows/ci.yml`). Playwright e2e is not run in CI
 - [ ] Error tracking (Sentry free tier, FEAT-025). **Code done** 2026-10-06 (API + web, inactive until a DSN is set); still needs the Sentry projects created and DSNs added on Render/Vercel (docs/DEPLOYMENT.md §Monitoring)
 - [ ] Uptime monitor (UptimeRobot free) against `GET /health`. Setup steps in docs/DEPLOYMENT.md §Monitoring; needs an UptimeRobot account (no code change)
-- [ ] **Production job execution for `/ingest`.** FastAPI `BackgroundTasks` is not a job system. Status of each facet:
-  - [x] **Durability** — a lazy reaper in `GET /documents` marks documents stuck in `parsing`/`embedded` for 30+ minutes as `failed`, and `POST /reindex` recovers them. Not a real crash-recovery system: no automatic retry, and detection only happens when the user lists documents.
+- [x] **Production job execution for `/ingest`** (2026-10-06: Postgres job queue, services/ingest_queue.py). Status of each facet:
+  - [x] **Durability** — running jobs heartbeat; a job whose worker died is claimed again within ~2 minutes and resumes. Transient failures retry automatically (60s, then 300s; 3 attempts). The `GET /documents` reaper remains for documents with no job (pre-queue).
   - [x] **Rate limiting** — per-user and global per-minute limits (in memory), daily limits in Postgres (FEAT-024). In-memory counters are only correct while the API runs as a single instance; move to a shared store (Redis via slowapi `storage_uri=`) before scaling out. There is no single budget spanning both `/ingest` and `/query`.
   - [x] **Per-user concurrency cap** (2026-10-06) — at most 2 documents processing per user (`MAX_CONCURRENT_INGESTS_PER_USER`); `/ingest` and `/reindex` return `429 TOO_MANY_PROCESSING` beyond that. Counted in Postgres, so it holds across restarts and instances.
-  - [ ] **Worker pool / queue / job-level timeout** — still open. Ingest still runs on the request-serving process; there is no global (all-users) cap. Each OCR call has a 60s timeout, but one page that exhausts all three OCR tiers can take ~3 minutes.
+  - [x] **Queue, global cap, time limit, document limits** — one worker thread per API process; at most `INGEST_MAX_CONCURRENT_JOBS` (default 1) jobs run across all users and instances. 20-minute time limit per attempt, checked between stages and OCR'd pages (cooperative: an OCR call in flight can overrun by its own timeout). Documents over 50 MB, 300 pages/slides, or 30 pages needing OCR are refused before the expensive work starts.
+  - [x] **Reindex keeps old chunks** — new chunks are staged and swapped in atomically; a failed reindex leaves the old ones live.
+  - [ ] Still open: the worker shares the API process (a hard kill on timeout, or OOM isolation, would need a subprocess or separate worker service), and a reindex still cascades away citations that pointed at the old chunks.
 
 ### Explicitly out of scope
 - Marketing site beyond the landing page
