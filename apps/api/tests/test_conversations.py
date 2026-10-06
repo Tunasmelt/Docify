@@ -138,8 +138,9 @@ def test_get_conversations_returns_paginated_list_scoped_to_jwt_user(app_client,
 
     # user B's conversation must never appear in user A's list.
     conv_row = next(c for c in body["conversations"] if c["id"] == conv_id)
+    assert conv_row["workspace_id"] == admin.table("documents").select("workspace_id").eq("id", document_id).execute().data[0]["workspace_id"]
     assert conv_row["message_count"] == 4  # 2 turns x (user question + assistant answer)
-    assert set(conv_row.keys()) == {"id", "title", "document_ids", "message_count", "updated_at"}
+    assert set(conv_row.keys()) == {"id", "workspace_id", "title", "document_ids", "message_count", "updated_at"}
 
     list_as_b = app_client.get("/conversations", headers={"Authorization": f"Bearer {token_b}"}).json()
     assert conv_id not in {c["id"] for c in list_as_b["conversations"]}
@@ -168,7 +169,7 @@ def test_get_conversation_messages_returns_full_history_with_citations(app_clien
     body = response.json()
 
     assert body["conversation"]["id"] == conv_id
-    assert set(body["conversation"].keys()) == {"id", "title", "document_ids", "created_at", "updated_at"}
+    assert set(body["conversation"].keys()) == {"id", "workspace_id", "title", "document_ids", "created_at", "updated_at"}
 
     assert len(body["messages"]) == 2
     user_msg, assistant_msg = body["messages"]

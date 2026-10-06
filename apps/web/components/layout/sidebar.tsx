@@ -5,6 +5,8 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { LogOut, X } from "lucide-react";
 
+import { WorkspaceSwitcher } from "@/components/layout/workspace-switcher";
+
 import { cn } from "@/lib/utils";
 
 function DocumentsIcon() {
@@ -97,6 +99,7 @@ export function Sidebar({ librarySection, user, mobileOpen, onMobileClose, onSig
             <X size={18} strokeWidth={2} />
           </button>
         </div>
+        <WorkspaceSwitcher />
         <nav className="flex flex-col gap-0.5 px-3">
           {NAV_ITEMS.map((item) => {
             const isActive = pathname?.startsWith(item.href);

@@ -27,21 +27,19 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-def create_document(client, *, user_id: str, filename: str, storage_path: str, mime_type: str, size_bytes: int) -> dict:
-    result = (
-        client.table("documents")
-        .insert(
-            {
-                "user_id": user_id,
-                "filename": filename,
-                "storage_path": storage_path,
-                "mime_type": mime_type,
-                "size_bytes": size_bytes,
-            }
-        )
-        .execute()
-    )
-    return result.data[0]
+def create_document(
+    client, *, user_id: str, filename: str, storage_path: str, mime_type: str, size_bytes: int, workspace_id: str | None = None
+) -> dict:
+    row = {
+        "user_id": user_id,
+        "filename": filename,
+        "storage_path": storage_path,
+        "mime_type": mime_type,
+        "size_bytes": size_bytes,
+    }
+    if workspace_id is not None:
+        row["workspace_id"] = workspace_id  # omitted: the database puts it in the user's default workspace
+    return client.table("documents").insert(row).execute().data[0]
 
 
 # documents.status only models coarse phases (uploaded/parsing/embedded/
@@ -211,7 +209,7 @@ def delete_chunks_for_document(client, document_id: str) -> None:
     client.table("chunks").delete().eq("document_id", document_id).execute()
 
 
-DOCUMENT_RESPONSE_COLUMNS = "id,filename,page_count,status,error,created_at,parsed_at,embedded_at"
+DOCUMENT_RESPONSE_COLUMNS = "id,workspace_id,filename,page_count,status,error,created_at,parsed_at,embedded_at"
 
 
 def get_document(client, *, document_id: str, user_id: str) -> dict | None:
@@ -368,7 +366,13 @@ def reap_stale_documents(client, *, user_id: str, threshold_seconds: int) -> lis
 
 
 def list_documents(
-    client, *, user_id: str, status: str | None, limit: int, cursor_created_at: str | None
+    client,
+    *,
+    user_id: str,
+    status: str | None,
+    limit: int,
+    cursor_created_at: str | None,
+    workspace_id: str | None = None,
 ) -> list[dict]:
     """Keyset pagination on created_at desc (documents_user_idx already
     indexes (user_id, created_at desc) — see SCHEMA.md). Fetches
@@ -384,6 +388,8 @@ def list_documents(
     simplification, not an oversight.
     """
     query = client.table("documents").select(DOCUMENT_RESPONSE_COLUMNS).eq("user_id", user_id)
+    if workspace_id is not None:
+        query = query.eq("workspace_id", workspace_id)
     if status is not None:
         query = query.eq("status", status)
     if cursor_created_at is not None:
@@ -445,13 +451,18 @@ def documents_owned_by_user(client, *, document_ids: list[str], user_id: str) ->
     return {row["id"] for row in rows}
 
 
+def document_workspace_ids(client, *, document_ids: list[str], user_id: str) -> set[str]:
+    rows = client.table("documents").select("workspace_id").in_("id", document_ids).eq("user_id", user_id).execute().data
+    return {row["workspace_id"] for row in rows}
+
+
 def get_conversation(client, *, conversation_id: str, user_id: str) -> dict | None:
     """Scoped to user_id in the query itself — same pattern as
     get_document(). /query pre-checks conversation ownership with this
     before calling create_query_turn() so an invalid conversation_id
     gets a clean 404 without needing to inspect a Postgres exception
     raised from inside the RPC function."""
-    rows = client.table("conversations").select("id,document_ids").eq("id", conversation_id).eq("user_id", user_id).execute().data
+    rows = client.table("conversations").select("id,workspace_id,document_ids").eq("id", conversation_id).eq("user_id", user_id).execute().data
     return rows[0] if rows else None
 
 
@@ -501,10 +512,12 @@ def create_query_turn(
 
 # FEAT-026: GET /conversations, GET /conversations/{id}/messages
 
-CONVERSATION_LIST_COLUMNS = "id,title,document_ids,updated_at,messages(count)"
+CONVERSATION_LIST_COLUMNS = "id,workspace_id,title,document_ids,updated_at,messages(count)"
 
 
-def list_conversations(client, *, user_id: str, limit: int, cursor_updated_at: str | None) -> list[dict]:
+def list_conversations(
+    client, *, user_id: str, limit: int, cursor_updated_at: str | None, workspace_id: str | None = None
+) -> list[dict]:
     """Keyset pagination on updated_at desc (conversations_user_idx already
     indexes (user_id, updated_at desc) — SCHEMA.md), same +1-row
     has-more-page pattern as list_documents(). message_count comes from
@@ -514,6 +527,8 @@ def list_conversations(client, *, user_id: str, limit: int, cursor_updated_at: s
     (routes/conversations.py) flattens that, since Pydantic can't consume
     the nested shape directly as a plain int field."""
     query = client.table("conversations").select(CONVERSATION_LIST_COLUMNS).eq("user_id", user_id)
+    if workspace_id is not None:
+        query = query.eq("workspace_id", workspace_id)
     if cursor_updated_at is not None:
         query = query.lt("updated_at", cursor_updated_at)
     return query.order("updated_at", desc=True).limit(limit + 1).execute().data
@@ -527,7 +542,7 @@ def get_conversation_detail(client, *, conversation_id: str, user_id: str) -> di
     `conversation` object, which also needs title/created_at/updated_at."""
     rows = (
         client.table("conversations")
-        .select("id,title,document_ids,created_at,updated_at")
+        .select("id,workspace_id,title,document_ids,created_at,updated_at")
         .eq("id", conversation_id)
         .eq("user_id", user_id)
         .execute()
@@ -693,7 +708,7 @@ def list_all_conversations_for_export(client, *, user_id: str) -> list[dict]:
     something to revisit without real evidence usage has grown past it."""
     return (
         client.table("conversations")
-        .select("id,title,document_ids,created_at,updated_at")
+        .select("id,workspace_id,title,document_ids,created_at,updated_at")
         .eq("user_id", user_id)
         .order("created_at")
         .execute()
@@ -764,3 +779,48 @@ def get_document_filenames(client, *, document_ids: list[str], user_id: str) -> 
         .data
     )
     return {row["id"]: row["filename"] for row in rows}
+
+
+# ── Workspaces (migrations/20261007_002) ──────────────────────────────────
+
+WORKSPACE_COLUMNS = "id,name,created_at,documents(count)"
+
+
+def resolve_workspace_id(client, *, user_id: str, workspace_id: str | None) -> str | None:
+    """The workspace to use for a new document: the one asked for, if it is
+    this user's (None if it isn't), else their default (created on first need)."""
+    if workspace_id is None:
+        return client.rpc("default_workspace_id", {"p_user_id": user_id}).execute().data
+    rows = client.table("workspaces").select("id").eq("id", workspace_id).eq("user_id", user_id).execute().data
+    return rows[0]["id"] if rows else None
+
+
+def list_workspaces(client, *, user_id: str) -> list[dict]:
+    client.rpc("default_workspace_id", {"p_user_id": user_id}).execute()  # a user always has at least one
+    return client.table("workspaces").select(WORKSPACE_COLUMNS).eq("user_id", user_id).order("created_at").execute().data
+
+
+def get_workspace(client, *, workspace_id: str, user_id: str) -> dict | None:
+    rows = client.table("workspaces").select(WORKSPACE_COLUMNS).eq("id", workspace_id).eq("user_id", user_id).execute().data
+    return rows[0] if rows else None
+
+
+def workspace_name_taken(client, *, user_id: str, name: str, excluding_id: str | None = None) -> bool:
+    # A user has at most a few dozen workspaces, so compare in Python: exact
+    # case-insensitive equality, matching the unique index on lower(name).
+    rows = client.table("workspaces").select("id,name").eq("user_id", user_id).execute().data
+    return any(row["name"].lower() == name.lower() and row["id"] != excluding_id for row in rows)
+
+
+def create_workspace(client, *, user_id: str, name: str) -> dict:
+    created = client.table("workspaces").insert({"user_id": user_id, "name": name}).execute().data[0]
+    return get_workspace(client, workspace_id=created["id"], user_id=user_id)
+
+
+def rename_workspace(client, *, workspace_id: str, user_id: str, name: str) -> dict | None:
+    client.table("workspaces").update({"name": name}).eq("id", workspace_id).eq("user_id", user_id).execute()
+    return get_workspace(client, workspace_id=workspace_id, user_id=user_id)
+
+
+def delete_workspace(client, *, workspace_id: str, user_id: str) -> None:
+    client.table("workspaces").delete().eq("id", workspace_id).eq("user_id", user_id).execute()

@@ -3,6 +3,7 @@
 import * as React from "react";
 import { useRouter } from "next/navigation";
 
+import { useWorkspace } from "@/components/layout/workspace-provider";
 import { Sidebar } from "@/components/layout/sidebar";
 import { Topbar, WorkspaceBadge, MobileMenuButton } from "@/components/layout/topbar";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -43,6 +44,7 @@ function toCardData(conv: ApiConversation, docNamesById: Map<string, string>): C
 
 export default function ConversationListPage() {
   const router = useRouter();
+  const { active: workspace } = useWorkspace();
   const currentUser = useCurrentUser();
   const supabase = React.useMemo(() => createClient(), []);
   const [conversations, setConversations] = React.useState<ApiConversation[]>([]);
@@ -64,7 +66,7 @@ export default function ConversationListPage() {
 
   React.useEffect(() => {
     let cancelled = false;
-    Promise.all([listConversations(), listDocuments()])
+    Promise.all([listConversations(workspace.id), listDocuments(workspace.id)])
       .then(([conversationsResult, documentsResult]) => {
         if (cancelled) return;
         setConversations(conversationsResult.conversations);
@@ -81,13 +83,13 @@ export default function ConversationListPage() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [workspace.id]);
 
   async function handleRetryLoad() {
     setLoading(true);
     setLoadError(null);
     try {
-      const [conversationsResult, documentsResult] = await Promise.all([listConversations(), listDocuments()]);
+      const [conversationsResult, documentsResult] = await Promise.all([listConversations(workspace.id), listDocuments(workspace.id)]);
       setConversations(conversationsResult.conversations);
       setDocNamesById(new Map(documentsResult.documents.map((d) => [d.id, d.filename])));
     } catch (err) {
@@ -161,7 +163,7 @@ export default function ConversationListPage() {
             <>
               <MobileMenuButton onClick={() => setMobileMenuOpen(true)} />
               <span className="truncate text-sm font-semibold">Acme Legal</span>
-              <WorkspaceBadge>WORKSPACE</WorkspaceBadge>
+              <WorkspaceBadge>{workspace.name}</WorkspaceBadge>
             </>
           }
           right={<ThemeToggle />}

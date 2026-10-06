@@ -3,6 +3,7 @@ import threading
 import uuid
 from collections import OrderedDict
 from io import BytesIO
+from uuid import UUID
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, Response
@@ -37,6 +38,7 @@ _VALID_STATUSES = {"uploaded", "parsing", "embedded", "ready", "failed"}
 def list_documents(
     request: Request,
     status: str | None = None,
+    workspace_id: UUID | None = None,  # omitted: documents from every workspace
     limit: int = Query(50, ge=1, le=200),
     cursor: str | None = None,
 ):
@@ -70,7 +72,14 @@ def list_documents(
     if reaped:
         logger.warning("reaped %d stale document(s) for user %s: %s", len(reaped), user_id, reaped)
 
-    rows = queries.list_documents(client, user_id=user_id, status=status, limit=limit, cursor_created_at=cursor_created_at)
+    rows = queries.list_documents(
+        client,
+        user_id=user_id,
+        status=status,
+        limit=limit,
+        cursor_created_at=cursor_created_at,
+        workspace_id=str(workspace_id) if workspace_id else None,
+    )
 
     # Fetched limit + 1 to detect whether another page exists without a
     # separate count query — the probe row itself is never returned.

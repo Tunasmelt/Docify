@@ -39,7 +39,7 @@ def test_get_documents_returns_paginated_list_scoped_to_jwt_user(app_client, adm
     # Response shape matches API_CONTRACT.md's GET /documents/{id} shape.
     sample = body["documents"][0]
     assert set(sample.keys()) == {
-        "id", "filename", "page_count", "status", "error", "created_at", "parsed_at", "embedded_at"
+        "id", "workspace_id", "filename", "page_count", "status", "error", "created_at", "parsed_at", "embedded_at"
     }
 
     # Pagination: limit=2 across 3+ documents must page correctly with no

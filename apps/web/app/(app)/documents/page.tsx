@@ -3,6 +3,7 @@
 import * as React from "react";
 import { useRouter } from "next/navigation";
 
+import { useWorkspace } from "@/components/layout/workspace-provider";
 import { Sidebar } from "@/components/layout/sidebar";
 import { Topbar, WorkspaceBadge, MobileMenuButton } from "@/components/layout/topbar";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -56,6 +57,7 @@ function toCardData(doc: ApiDocument): DocumentCardData {
 
 export default function DocumentsPage() {
   const router = useRouter();
+  const { active: workspace } = useWorkspace();
   const currentUser = useCurrentUser();
   const supabase = React.useMemo(() => createClient(), []);
   const [docs, setDocs] = React.useState<ApiDocument[]>([]);
@@ -95,7 +97,7 @@ export default function DocumentsPage() {
   const pollTick = React.useCallback(async () => {
     const myGeneration = docsGenerationRef.current;
     try {
-      const result = await listDocuments();
+      const result = await listDocuments(workspace.id);
       if (docsGenerationRef.current !== myGeneration) {
         // A delete/upload/retry committed newer state while this request
         // was in flight — do not resurrect what it just changed.
@@ -114,7 +116,7 @@ export default function DocumentsPage() {
     } catch {
       // A network hiccup mid-poll shouldn't silently give up forever —
       // keep polling, just back off same as a slow-to-finish document.
-      // (A real 401 mid-poll is handled inside listDocuments()'s own
+      // (A real 401 mid-poll is handled inside listDocuments(workspace.id)'s own
       // apiFetch, which force-redirects before this catch ever runs.)
       pollIntervalRef.current = Math.min(
         pollIntervalRef.current * POLL_BACKOFF_FACTOR,
@@ -122,7 +124,7 @@ export default function DocumentsPage() {
       );
     }
     pollTimeoutRef.current = setTimeout(pollTick, pollIntervalRef.current);
-  }, []);
+  }, [workspace.id]);
 
   const startPolling = React.useCallback(() => {
     clearTimeout(pollTimeoutRef.current);
@@ -135,7 +137,7 @@ export default function DocumentsPage() {
 
     (async () => {
       try {
-        const result = await listDocuments();
+        const result = await listDocuments(workspace.id);
         if (cancelled) return;
         commitDocs(result.documents);
         setLoadError(null);
@@ -155,7 +157,7 @@ export default function DocumentsPage() {
       clearTimeout(pollTimeoutRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [workspace.id]);
 
   // A selected document can stop being valid to select without the user
   // touching the checkbox themselves — deleted by this same session, or
@@ -184,6 +186,7 @@ export default function DocumentsPage() {
     commitDocs([
       {
         id: doc.id,
+        workspace_id: workspace.id,
         filename: doc.filename,
         page_count: null,
         status: doc.status,
@@ -270,7 +273,7 @@ export default function DocumentsPage() {
     setLoading(true);
     setLoadError(null);
     try {
-      const result = await listDocuments();
+      const result = await listDocuments(workspace.id);
       commitDocs(result.documents);
       if (result.documents.some((d) => NON_TERMINAL_STATUSES.includes(d.status))) {
         startPolling();
@@ -323,7 +326,7 @@ export default function DocumentsPage() {
             <>
               <MobileMenuButton onClick={() => setMobileMenuOpen(true)} />
               <span className="truncate text-sm font-semibold">Acme Legal</span>
-              <WorkspaceBadge>WORKSPACE</WorkspaceBadge>
+              <WorkspaceBadge>{workspace.name}</WorkspaceBadge>
             </>
           }
           right={
@@ -352,7 +355,7 @@ export default function DocumentsPage() {
               </span>
             </div>
 
-            <UploadZone onUploadComplete={handleUploadComplete} />
+            <UploadZone workspaceId={workspace.id} onUploadComplete={handleUploadComplete} />
 
             {loading ? (
               <div className="mt-10">

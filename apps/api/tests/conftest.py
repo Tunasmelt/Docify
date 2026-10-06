@@ -55,6 +55,13 @@ def _drain_synchronously(runner):
 
 
 @pytest.fixture(autouse=True)
+def cohere_fallback_off_by_default(monkeypatch):
+    # A developer's real COHERE_API_KEY must not turn failure-path tests into
+    # live Cohere calls; tests of the fallback set a fake key themselves.
+    monkeypatch.delenv("COHERE_API_KEY", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def drain_ingest_jobs_synchronously():
     # Installed before every test, not once at import: several test modules
     # call app.dependency_overrides.clear() in their teardown.

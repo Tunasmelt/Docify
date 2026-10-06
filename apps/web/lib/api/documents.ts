@@ -7,6 +7,7 @@ export { ApiError };
 
 export interface ApiDocument {
   id: string;
+  workspace_id: string;
   filename: string;
   page_count: number | null;
   status: DocumentStatus;
@@ -27,8 +28,8 @@ export interface IngestResponse {
   created_at: string;
 }
 
-export async function listDocuments(): Promise<DocumentListResponse> {
-  return apiFetch<DocumentListResponse>("/documents");
+export async function listDocuments(workspaceId?: string): Promise<DocumentListResponse> {
+  return apiFetch<DocumentListResponse>(workspaceId ? `/documents?workspace_id=${encodeURIComponent(workspaceId)}` : "/documents");
 }
 
 export async function getDocument(id: string): Promise<ApiDocument> {
@@ -62,7 +63,7 @@ export async function reindexDocument(id: string): Promise<IngestResponse> {
  * signature), so there is no real byte-level progress to report; callers
  * should show an indeterminate "uploading" state for the duration of
  * this promise rather than a fabricated percentage. */
-export async function uploadDocument(file: File): Promise<IngestResponse> {
+export async function uploadDocument(file: File, workspaceId?: string): Promise<IngestResponse> {
   const supabase = createClient();
   const { data: sessionData } = await supabase.auth.getSession();
   if (!sessionData.session) {
@@ -91,6 +92,7 @@ export async function uploadDocument(file: File): Promise<IngestResponse> {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
+      workspace_id: workspaceId,
       storage_path: storagePath,
       filename: file.name,
       mime_type: file.type || "application/pdf",

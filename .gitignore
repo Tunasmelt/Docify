@@ -2,6 +2,7 @@
 .agent/scope.json
 .agent/logs/
 HANDOFF.md
+.claude/data/
 
 # Node / frontend
 node_modules/

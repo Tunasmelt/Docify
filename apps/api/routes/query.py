@@ -417,6 +417,13 @@ def _check_ownership(client, payload: QueryRequest, user_id: str) -> JSONRespons
         # get_document()'s 404 (API_CONTRACT.md), just a 403 here per
         # this endpoint's own documented contract.
         return JSONResponse(status_code=403, content=error_envelope("FORBIDDEN", "one or more document_ids do not belong to the authenticated user"))
+    workspace_ids = queries.document_workspace_ids(client, document_ids=payload.document_ids, user_id=user_id)
+    if len(workspace_ids) > 1:
+        return JSONResponse(status_code=422, content=error_envelope("VALIDATION_ERROR", "documents must belong to one workspace"))
+    if payload.conversation_id is not None:
+        conversation = queries.get_conversation(client, conversation_id=payload.conversation_id, user_id=user_id)
+        if conversation is not None and conversation["workspace_id"] not in workspace_ids:
+            return JSONResponse(status_code=422, content=error_envelope("VALIDATION_ERROR", "documents must belong to the conversation's workspace"))
     return None
 
 

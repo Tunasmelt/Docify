@@ -14,6 +14,7 @@ from google.genai.errors import APIError as GeminiAPIError
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 from voyageai.error import RateLimitError, ServiceUnavailableError, Timeout, VoyageError
 
+from services import cohere_client
 from services.gemini_retry import retry_info_delay_seconds
 
 # 2026-08-01 (FEAT-027): same fix as db/queries.py — Chunk is used only as a
@@ -148,7 +149,7 @@ Vector = list[float]
 # Matches the chunks.embedding_provider Postgres enum (migrations/
 # 20260731_001_embedding_provider_fallback.sql) literally — these two
 # string literals are the only valid values on either side.
-Provider = str  # "voyage" | "gemini"
+Provider = str  # "voyage" | "gemini" | "cohere"
 
 
 @dataclass
@@ -547,6 +548,18 @@ def _embed_batch_with_gemini_fallback(
     return embedded
 
 
+def _embed_batch_with_cohere(batch: list[Chunk], sleep_fn=time.sleep) -> list[EmbeddedChunk]:
+    """Third and last embedding provider (Cohere embed-v4.0, 1024-d). Its
+    vectors live in their own space, tagged provider="cohere"."""
+    if not cohere_client.is_configured():
+        raise EmbedError("Cohere fallback unavailable: COHERE_API_KEY is not set")
+    try:
+        vectors = cohere_client.embed([_chunk_to_input(c) for c in batch], "search_document", sleep_fn=sleep_fn)
+    except cohere_client.CohereError as exc:
+        raise EmbedError(f"Cohere embedding failed: {exc}") from exc
+    return [EmbeddedChunk(vector=v, provider="cohere") for v in vectors]
+
+
 class Embedder:
     def __init__(
         self,
@@ -648,11 +661,18 @@ class Embedder:
                     )
                     continue
                 except EmbedError as gemini_exc:
-                    raise EmbedError(
-                        f"Voyage embedding failed after {MAX_RETRIES} attempts ({exc}), and the "
-                        f"Gemini fallback also failed ({gemini_exc}) — both providers exhausted "
-                        f"for this batch of {len(batch)} chunk(s)"
-                    ) from gemini_exc
+                    # Last resort: Cohere, a third embedding space. Skipped
+                    # (EmbedError below names all providers) when no key is set.
+                    try:
+                        embedded.extend(_embed_batch_with_cohere(batch, sleep_fn=self._sleep_fn))
+                        continue
+                    except EmbedError as cohere_exc:
+                        raise EmbedError(
+                            f"Voyage embedding failed after {MAX_RETRIES} attempts ({exc}), the "
+                            f"Gemini fallback also failed ({gemini_exc}), and so did Cohere "
+                            f"({cohere_exc}) — all providers exhausted for this batch of "
+                            f"{len(batch)} chunk(s)"
+                        ) from cohere_exc
             except VoyageError as exc:
                 # A genuine misconfiguration (bad/missing VOYAGE_API_KEY,
                 # a malformed request) — not a capacity problem, so NOT a
@@ -693,6 +713,12 @@ class Embedder:
         with no chunks in scope), since a query embedded in Voyage's space
         is meaningless compared against a Gemini-space chunk vector and
         vice versa (.agent/MEMORY.md)."""
+        if provider == "cohere":
+            try:
+                return cohere_client.embed([[text]], "search_query", sleep_fn=self._sleep_fn)[0]
+            except cohere_client.CohereError as exc:
+                raise EmbedError(f"Cohere query embedding failed: {exc}") from exc
+
         if provider == "gemini":
             # Same real 8,192-token limit and silent-truncation risk as
             # the document-side path above applies here too — a query is

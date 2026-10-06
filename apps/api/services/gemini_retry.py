@@ -52,6 +52,15 @@ def is_transient(exc: Exception) -> bool:
     return isinstance(exc, httpx.TransportError)
 
 
+def can_fall_back_to_cohere(exc: Exception) -> bool:
+    """Whether a failed Gemini call should be retried on Cohere: only for the
+    transient failures above (a bad key or request would fail there too and
+    should surface), and only when a Cohere key is configured."""
+    from services import cohere_client
+
+    return is_transient(exc) and cohere_client.is_configured()
+
+
 def _retry_delay(exc: Exception, attempt: int) -> float | None:
     """Seconds to wait before the next attempt, or None to stop retrying."""
     if attempt >= MAX_ATTEMPTS or not is_transient(exc):

@@ -313,3 +313,9 @@ Full standards in STANDARDS.md. Quick reference:
 - **Errors:** FastAPI returns `{ error: { code, message, detail } }` with an HTTP status. Each protected route has an error boundary
 - **Commit format:** `<type>(<scope>): <summary> [<agent-tag>]` — e.g. `feat(api): add /ingest endpoint [claude-code]`
 - **Branch naming:** `feat/FEAT-001-ingest-endpoint`, `fix/parse-error-empty-pdf`, `chore/bump-pdfplumber`
+
+## Personal workspaces and fallback (2026-10-06)
+
+Private workspaces group owned documents and conversations. The authenticated app layout loads workspaces and preserves selection per tab. Switching remounts the page to clear stale selection and requests. Scoped lists/uploads pass workspace_id; a conversation deep link selects its stored workspace. API and database prevent conversations spanning workspaces. User ownership remains the tenant boundary.
+
+Optional Cohere Command A handles transient Gemini text failures. Embeddings use Voyage → Gemini → Cohere, searched in separate provider spaces. Keyword retrieval continues if query embeddings fail. Command A does not replace OCR or receive figure images.

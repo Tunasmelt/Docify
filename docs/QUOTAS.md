@@ -22,3 +22,7 @@ Raising these ceilings requires adding billing or moving provider tier. That is 
 ## Deferred operational work
 
 A durable worker queue, Redis-backed shared rate limiting, generalized metrics platform, and non-PDF source viewers remain deferred until concurrency, restarts, support incidents, or horizontal scaling demonstrate the need.
+
+## Cohere fallback (2026-10-06)
+
+Optional COHERE_API_KEY enables Gemini → Cohere Command A for answers, rewriting and citation verification. Embedding order: Voyage → Gemini → Cohere embed-v4.0 (1024 dimensions). Each provider is searched in its own vector space; failed query embeddings allow keyword search to continue. Streaming switches only before any text is sent. Cohere retries 429/5xx/network failures up to three attempts, with 1s/2s backoff and an 8s maximum accepted Retry-After. Command A receives text evidence, not figure images; OCR retains its existing chain.

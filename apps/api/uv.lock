@@ -274,6 +274,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "fastapi" },
     { name = "google-genai" },
+    { name = "httpx" },
     { name = "pdfplumber" },
     { name = "pillow" },
     { name = "pydantic" },
@@ -305,6 +306,7 @@ dev = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.133,<0.134" },
     { name = "google-genai", specifier = ">=1.7,<1.8" },
+    { name = "httpx", specifier = ">=0.28,<0.29" },
     { name = "pdfplumber", specifier = ">=0.11,<0.12" },
     { name = "pillow", specifier = ">=12.3.0,<12.4" },
     { name = "pydantic", specifier = ">=2.8,<3.0" },

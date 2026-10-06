@@ -24,8 +24,11 @@ export async function deleteTestUserByEmail(email: string): Promise<void> {
     }
   );
   if (!listRes.ok) return;
-  const { users } = (await listRes.json()) as { users: { id: string }[] };
+  const { users } = (await listRes.json()) as { users: { id: string; email?: string }[] };
   for (const user of users) {
+    // GoTrue versions may ignore the email query parameter and return every
+    // user. Never trust that filter as the boundary of a destructive cleanup.
+    if (user.email?.toLowerCase() !== email.toLowerCase()) continue;
     await fetch(`${LOCAL_SUPABASE_URL}/auth/v1/admin/users/${user.id}`, {
       method: "DELETE",
       headers: {

@@ -5,6 +5,7 @@ import type { ChatMessage } from "@/lib/types/chat";
 
 export interface ApiConversation {
   id: string;
+  workspace_id: string;
   title: string | null;
   document_ids: string[];
   message_count: number;
@@ -16,12 +17,13 @@ export interface ConversationListResponse {
   next_cursor: string | null;
 }
 
-export async function listConversations(): Promise<ConversationListResponse> {
-  return apiFetch<ConversationListResponse>("/conversations");
+export async function listConversations(workspaceId?: string): Promise<ConversationListResponse> {
+  return apiFetch<ConversationListResponse>(workspaceId ? `/conversations?workspace_id=${encodeURIComponent(workspaceId)}` : "/conversations");
 }
 
 export interface ApiConversationDetail {
   id: string;
+  workspace_id: string;
   title: string | null;
   document_ids: string[];
   created_at: string;

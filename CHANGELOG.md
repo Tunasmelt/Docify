@@ -1194,3 +1194,19 @@ All 6 pairings were checked by eye against the actual table content (not just "a
 **Changed:** AGENT.md §AGENT ROLES section added. RULE 6 and RULE 7 codified.
 **Impact:** Every agent session reads AGENT.md and stays in lane. Handoff discipline becomes the load-bearing structure.
 **Rollback:** Collapse to single or two-agent workflow — remove role table from AGENT.md, drop agent-tag rule.
+
+## 2026-10-06 — feature: Cohere fallback and personal workspaces
+
+Completed interrupted backend changes; added workspace sidebar selector, create/rename/delete controls, scoped lists/uploads, and conversation deep-link selection. Added database and query-route workspace boundary checks. Cohere rejects truncated streams and invalid vectors. Declared existing httpx as a runtime dependency without upgrading it. Restored locked web dependencies with user approval.
+
+Decisions: private workspaces; Gemini → Cohere for text and Voyage → Gemini → Cohere for embeddings. Keep storage user-scoped; delete documents before deleting a workspace. Preserved prior edits on feat/cohere-workspaces. Applied both migrations only to local Docify Supabase.
+
+**Validation:** Full backend run: 560 passed, 18 skipped, three response-shape assertions failed because workspace_id was newly added. Updated those assertions and all three passed on rerun. Feature tests cover Cohere outage paths, stream truncation, vector validation, workspace owner RLS, document/conversation boundaries and legacy defaults. Production web build passed. Browser flow verified workspace creation, rename/delete, persistence and list isolation against local Auth/API/Postgres.
+
+**Test cleanup correction:** The existing e2e deleteTestUserByEmail helper relied on a GoTrue email query filter that this local server ignored. During concurrent checks it deleted other local users, causing one backend test to fail. Added an exact returned-email check before deletion and a real two-user regression check. This affects only the local test helper; production Auth was not mutated.
+
+Final checks: 50 focused backend tests passed; three corrected contract regressions passed; both browser tests passed. Web build, lint, typecheck, lockfile consistency and gap-check passed. Lint retains three existing image warnings. Temporary local API stopped; developer env files and existing Supabase containers preserved.
+
+## 2026-10-07 — infra: verify feature branches in GitHub CI
+
+CI now runs on pushes to feat/** and fix/** as well as master and pull requests, so the completed Cohere/workspace feature receives GitHub verification before merging. Ignored .claude/data/ because it contains generated local SQLite runtime state. Commit includes all implementation, tests and documentation from the resumed task; local environment files and runtime databases remain outside version control.

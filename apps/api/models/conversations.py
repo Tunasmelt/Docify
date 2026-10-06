@@ -9,6 +9,7 @@ class RenameConversationRequest(BaseModel):
 
 class ConversationResponse(BaseModel):
     id: str
+    workspace_id: str
     title: str | None
     document_ids: list[str]
     message_count: int
@@ -22,6 +23,7 @@ class ConversationListResponse(BaseModel):
 
 class ConversationDetail(BaseModel):
     id: str
+    workspace_id: str
     title: str | None
     document_ids: list[str]
     created_at: str

@@ -6,7 +6,7 @@ import voyageai
 from voyageai.error import VoyageError
 
 from db.client import get_service_role_client
-from services.embedder import Embedder
+from services.embedder import Embedder, EmbedError
 
 logger = logging.getLogger(__name__)
 
@@ -305,7 +305,14 @@ class Retriever:
         """Runs entirely inside one pool.submit task so the real network
         call (embed_query) is genuinely parallelized across providers,
         not serialized on the main thread before submission."""
-        query_vector = self._embedder.embed_query(question, provider=provider)
+        try:
+            query_vector = self._embedder.embed_query(question, provider=provider)
+        except EmbedError as exc:
+            # A query can only be embedded into the space its chunks live in,
+            # so there is no provider to fall back to here. Keyword search
+            # (and any other provider's vectors) still answer the question.
+            logger.warning("retriever: %s query embedding failed (%s) — continuing without that vector search", provider, exc)
+            return []
         return self._vector_search(query_vector, document_ids, user_id, limit, provider)
 
     def _distinct_providers_in_scope(self, document_ids: list[str], user_id: str) -> set[str]:
