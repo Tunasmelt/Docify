@@ -10,10 +10,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from db import queries
 from db.client import get_service_role_client
 from errors import error_envelope
-from models.query import CitationResponse, QueryMetadata, QueryRequest, QueryResponse
+from models.query import CitationResponse, QueryMetadata, QueryRequest, QueryResponse, display_bbox
 from rate_limit import limiter
 from services.figure_fetcher import fetch_generator_chunks, signed_figure_url
 from services.generator import CITATION_BRACKET, CITATION_NUMBER, GenerationError, Generator, GeneratorChunk
+from services.query_rewriter import QueryRewriter
 from services.retriever import Retriever
 from services.verifier import Verdict, VerdictLabel, Verifier
 
@@ -91,6 +92,23 @@ def get_generator() -> Generator:
 
 def get_verifier() -> Verifier:
     return Verifier()
+
+
+def get_query_rewriter() -> QueryRewriter:
+    return QueryRewriter()
+
+
+def _search_question(rewriter: QueryRewriter, payload: QueryRequest, prior_messages: list[dict]) -> str:
+    """The question retrieval searches with: rewritten into a standalone query
+    when the conversation has history (a follow-up like "and for Q2?" names
+    nothing on its own), else the user's own words. Generation always gets
+    the original question."""
+    if not prior_messages:
+        return payload.question
+    rewritten = rewriter.rewrite(payload.question, prior_messages)
+    if rewritten != payload.question:
+        logger.info("query: follow-up rewritten for retrieval (%d -> %d chars)", len(payload.question), len(rewritten))
+    return rewritten
 
 
 # 2026-08-02 — resolution cascade for _extract_claim_spans (Part 3,
@@ -433,6 +451,7 @@ def post_query(
     retriever: Retriever = Depends(get_retriever),
     generator: Generator = Depends(get_generator),
     verifier: Verifier = Depends(get_verifier),
+    rewriter: QueryRewriter = Depends(get_query_rewriter),
 ):
     # `response` is never touched directly below — same reason as
     # routes/ingest.py's post_ingest: this route returns a plain
@@ -466,7 +485,8 @@ def post_query(
 
     started = time.perf_counter()
 
-    retrieved = retriever.retrieve(payload.question, payload.document_ids, user_id, k=payload.k, rerank=payload.rerank)
+    search_question = _search_question(rewriter, payload, prior_messages)
+    retrieved = retriever.retrieve(search_question, payload.document_ids, user_id, k=payload.k, rerank=payload.rerank)
 
     if not retrieved:
         # A legitimate, benign outcome (no matching content) — not an
@@ -639,6 +659,7 @@ def post_query(
                 verdict=verdict.verdict.value,
                 supporting_quote=verdict.quote,
                 figure_url=figure_url,
+                bbox=display_bbox(chunk.bbox),
             )
         )
 
@@ -818,6 +839,7 @@ async def _stream_query_events(
     verifier: Verifier,
     prior_messages: list[dict],
     disconnected: asyncio.Event,
+    rewriter: QueryRewriter,
 ):
     """The actual SSE body for POST /query/stream (FEAT-016). Emits, in
     order: `retrieving` -> `token` (one per Gemini text delta, zero or
@@ -857,9 +879,13 @@ async def _stream_query_events(
         # — real retrieval latency is unbounded (a real Postgres/Voyage
         # call), and this is the very first potentially-long gap in the
         # whole stream, right after only one small event has gone out.
-        retrieve_task = asyncio.ensure_future(
-            asyncio.to_thread(retriever.retrieve, payload.question, payload.document_ids, user_id, k=payload.k, rerank=payload.rerank)
-        )
+        async def search_then_retrieve():
+            search_question = await asyncio.to_thread(_search_question, rewriter, payload, prior_messages)
+            return await asyncio.to_thread(
+                retriever.retrieve, search_question, payload.document_ids, user_id, k=payload.k, rerank=payload.rerank
+            )
+
+        retrieve_task = asyncio.ensure_future(search_then_retrieve())
         async for heartbeat in _yield_heartbeats_until_done(retrieve_task):
             yield heartbeat
         retrieved = retrieve_task.result()
@@ -1068,6 +1094,7 @@ async def _stream_query_events(
                     verdict=verdict.verdict.value,
                     supporting_quote=verdict.quote,
                     figure_url=figure_url,
+                    bbox=display_bbox(chunk.bbox),
                 )
             )
 
@@ -1138,6 +1165,7 @@ async def _stream_query_events_with_disconnect_watch(
     verifier: Verifier,
     prior_messages: list[dict],
     request: Request,
+    rewriter: QueryRewriter,
 ):
     """Thin wrapper — owns the real disconnect-watcher task's lifecycle
     (spawned here, cancelled in `finally` on every exit path: success,
@@ -1150,7 +1178,7 @@ async def _stream_query_events_with_disconnect_watch(
     watch_task = asyncio.ensure_future(_watch_for_disconnect(request, disconnected))
     try:
         async for frame in _stream_query_events(
-            payload, user_id, client, retriever, generator, verifier, prior_messages, disconnected
+            payload, user_id, client, retriever, generator, verifier, prior_messages, disconnected, rewriter
         ):
             yield frame
     finally:
@@ -1166,6 +1194,7 @@ async def post_query_stream(
     retriever: Retriever = Depends(get_retriever),
     generator: Generator = Depends(get_generator),
     verifier: Verifier = Depends(get_verifier),
+    rewriter: QueryRewriter = Depends(get_query_rewriter),
 ):
     """SSE variant of POST /query (FEAT-016) — same auth/ownership/history
     validation, run to completion BEFORE the StreamingResponse is even
@@ -1195,7 +1224,7 @@ async def post_query_stream(
 
     return StreamingResponse(
         _stream_query_events_with_disconnect_watch(
-            payload, user_id, client, retriever, generator, verifier, prior_messages, request
+            payload, user_id, client, retriever, generator, verifier, prior_messages, request, rewriter
         ),
         media_type="text/event-stream",
         headers={

@@ -1087,9 +1087,15 @@ class _FixedTextOcrClient:
         return self._text
 
 
-def _minimal_text_only_pdf(text: str) -> bytes:
-    """A one-page PDF with a single short line of real text and no images."""
-    stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode()
+def _text_pdf(lines: list[tuple[float, float, str]], font_size: float = 10) -> bytes:
+    """A one-page US Letter PDF (Helvetica, no images) with each `(x, y, text)`
+    drawn at PDF coordinates (origin bottom-left)."""
+    def esc(t: str) -> str:
+        return t.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+    stream = "\n".join(
+        f"BT /F1 {font_size} Tf {x} {y} Td ({esc(text)}) Tj ET" for x, y, text in lines
+    ).encode()
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
@@ -1109,6 +1115,11 @@ def _minimal_text_only_pdf(text: str) -> bytes:
         out += f"{off:010d} 00000 n \n".encode()
     out += f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
     return bytes(out)
+
+
+def _minimal_text_only_pdf(text: str) -> bytes:
+    """A one-page PDF with a single short line of real text and no images."""
+    return _text_pdf([(72, 720, text)], font_size=12)
 
 
 def test_partly_scanned_page_is_ocrd_and_replaces_its_thin_text_layer():
@@ -1146,3 +1157,66 @@ def test_short_digital_page_without_a_scan_image_is_not_ocrd():
 
     assert ocr.pages_seen == 0
     assert [e.content for e in doc.elements] == ["Short page"]
+
+
+
+# ── Two-column PDFs (2026-10-06) ──────────────────────────────────────────────
+# Lines used to be grouped purely by vertical position, so text from both
+# columns at the same height merged into one garbled line ("left words right
+# words") and paragraphs interleaved across columns.
+
+
+def _two_column_page() -> bytes:
+    lines = [(72, 740, "A Study of Two Column Layouts In Practice")]  # full-width title
+    left = [f"Left column sentence number {i} continues here." for i in range(1, 9)]
+    right = [f"Right column sentence number {i} goes on." for i in range(1, 9)]
+    for i, (l_text, r_text) in enumerate(zip(left, right)):
+        y = 700 - i * 14
+        lines.append((72, y, l_text))
+        lines.append((320, y, r_text))
+    return _text_pdf(lines)
+
+
+def test_two_column_text_is_read_column_by_column_not_merged_across():
+    doc = Parser(ocr_tiers=[]).parse(_two_column_page(), filename="two-col.pdf")
+    text = "\n".join(e.content for e in doc.elements if isinstance(e.content, str))
+
+    # No line mixes the two columns.
+    for line in text.split("\n"):
+        assert not ("Left column" in line and "Right column" in line), line
+    # Reading order: title, then the whole left column, then the whole right column.
+    order = [
+        text.index("A Study of Two Column"),
+        text.index("Left column sentence number 1 "),
+        text.index("Left column sentence number 8 "),
+        text.index("Right column sentence number 1 "),
+        text.index("Right column sentence number 8 "),
+    ]
+    assert order == sorted(order)
+
+
+def test_two_column_paragraphs_do_not_merge_across_the_gutter():
+    doc = Parser(ocr_tiers=[]).parse(_two_column_page(), filename="two-col.pdf")
+
+    for element in doc.elements:
+        if isinstance(element.content, str):
+            assert not ("Left column" in element.content and "Right column" in element.content)
+
+
+def test_right_column_short_lines_are_not_misread_as_indented_list_items():
+    lines = []
+    for i in range(8):
+        y = 700 - i * 14
+        lines.append((72, y, f"Body text on the left side number {i}."))
+        lines.append((320, y, f"Short right {i}." if i % 2 else f"Longer right column body text {i} here."))
+    doc = Parser(ocr_tiers=[]).parse(_text_pdf(lines), filename="two-col.pdf")
+
+    assert not [e for e in doc.elements if e.element_type == ElementType.LIST]
+
+
+def test_single_column_page_with_short_lines_is_unaffected():
+    lines = [(72, 700 - i * 14, f"Short line {i}") for i in range(10)]
+    doc = Parser(ocr_tiers=[]).parse(_text_pdf(lines), filename="one-col.pdf")
+    text = "\n".join(e.content for e in doc.elements if isinstance(e.content, str))
+
+    assert [ln for ln in text.split("\n") if ln] == [f"Short line {i}" for i in range(10)]

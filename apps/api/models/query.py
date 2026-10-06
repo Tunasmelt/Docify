@@ -18,6 +18,27 @@ class QueryRequest(BaseModel):
     rerank: bool = False
 
 
+class CitationBBox(BaseModel):
+    """Where the cited chunk sits on its page, in PDF points from the page's
+    top-left corner (pdfplumber's coordinate space)."""
+
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+
+def display_bbox(raw: dict | None) -> CitationBBox | None:
+    """A chunk's stored bbox, or None when it has no real location (DOCX/HTML
+    store an all-zero sentinel box)."""
+    if not raw:
+        return None
+    box = CitationBBox(**{k: float(raw[k]) for k in ("x0", "y0", "x1", "y1")})
+    if box.x1 <= box.x0 or box.y1 <= box.y0:
+        return None
+    return box
+
+
 class CitationResponse(BaseModel):
     marker: int
     chunk_id: str
@@ -54,6 +75,9 @@ class CitationResponse(BaseModel):
     # is the less surprising, more standard REST shape for "not
     # applicable" versus "applicable but empty").
     figure_url: str | None = None
+    # Omitted (response_model_exclude_none) when the source has no real
+    # location — DOCX/HTML, or a chunk stored before positions were recorded.
+    bbox: CitationBBox | None = None
 
 
 class QueryMetadata(BaseModel):

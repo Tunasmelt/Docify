@@ -68,7 +68,7 @@ create table chunks (
   chunk_index        int not null,              -- ordinal position within document
   element_type       element_type not null,
   page_number        int not null,
-  bbox               jsonb,                     -- {x0,y0,x1,y1} on the source page
+  bbox               jsonb,                     -- {x0,y0,x1,y1}: union of the chunk's elements on its page
   content            text not null,             -- the extracted text
   figure_path        text,                      -- storage path if element_type='figure'
   embedding          vector(1024) not null,

@@ -56,6 +56,7 @@ def _override(retriever, generator, verifier):
     app.dependency_overrides[query.get_retriever] = lambda: retriever
     app.dependency_overrides[query.get_generator] = lambda: generator
     app.dependency_overrides[query.get_verifier] = lambda: verifier
+    app.dependency_overrides[query.get_query_rewriter] = lambda: _PassthroughRewriter()
 
 
 @pytest.fixture(autouse=True)
@@ -344,3 +345,11 @@ def test_export_rejects_invalid_format(app_client, admin, user_a):
 def test_export_requires_auth(app_client):
     response = app_client.get("/export/conversations")
     assert response.status_code == 401
+
+
+class _PassthroughRewriter:
+    """Follow-up questions are searched unchanged — no real Gemini rewrite call."""
+
+    def rewrite(self, question, history):
+        return question
+

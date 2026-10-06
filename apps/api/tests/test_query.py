@@ -103,7 +103,21 @@ def _verdict(label: VerdictLabel, quote: str | None = "a quote") -> Verdict:
     )
 
 
-def _override(retriever=None, generator=None, verifier=None):
+class PassthroughRewriter:
+    """Default in tests: searches with the question unchanged and records
+    calls, so no test makes a real Gemini rewrite call by accident."""
+
+    def __init__(self, rewritten: str | None = None):
+        self._rewritten = rewritten
+        self.calls: list[dict] = []
+
+    def rewrite(self, question, history):
+        self.calls.append({"question": question, "history": history})
+        return self._rewritten if self._rewritten is not None else question
+
+
+def _override(retriever=None, generator=None, verifier=None, rewriter=None):
+    app.dependency_overrides[query.get_query_rewriter] = lambda: rewriter or PassthroughRewriter()
     if retriever is not None:
         app.dependency_overrides[query.get_retriever] = lambda: retriever
     if generator is not None:
@@ -116,6 +130,7 @@ def _clear_overrides():
     app.dependency_overrides.pop(query.get_retriever, None)
     app.dependency_overrides.pop(query.get_generator, None)
     app.dependency_overrides.pop(query.get_verifier, None)
+    app.dependency_overrides.pop(query.get_query_rewriter, None)
 
 
 _DUMMY_EMBEDDING = [0.0] * 1024
@@ -1800,3 +1815,102 @@ def test_note_alone_when_every_statement_was_removed():
     answer, removed = _remove_unsupported_claims("Only claim [2].", {2})
     assert _note_removed_claims(answer, removed) == "_1 statement was removed because the cited source did not support it._"
     assert _note_removed_claims("Kept [1].", 2).endswith("\n\n_2 statements were removed because the cited source did not support them._")
+
+
+# --- Citation bbox, for the highlighted page preview (2026-10-06) ------------
+
+from db.queries import _chunk_bbox  # noqa: E402
+from models.query import display_bbox  # noqa: E402
+from services.document_model import BBox, ParsedElement  # noqa: E402
+
+
+def test_display_bbox_omits_the_zero_sentinel_and_keeps_real_boxes():
+    assert display_bbox(None) is None
+    assert display_bbox({"x0": 0, "y0": 0, "x1": 0, "y1": 0}) is None
+    assert display_bbox({"x0": 10, "y0": 20, "x1": 110, "y1": 40}).model_dump() == {
+        "x0": 10.0, "y0": 20.0, "x1": 110.0, "y1": 40.0,
+    }
+
+
+def test_chunk_bbox_is_the_union_of_its_elements_on_its_first_page():
+    elements = [
+        ParsedElement(element_type=ElementType.HEADING, page_number=2, bbox=BBox(50, 100, 200, 115), content="H", element_id="h"),
+        ParsedElement(element_type=ElementType.TEXT, page_number=2, bbox=BBox(40, 120, 300, 180), content="T", element_id="t"),
+        ParsedElement(element_type=ElementType.TEXT, page_number=3, bbox=BBox(0, 0, 600, 800), content="U", element_id="u"),
+    ]
+    chunk = Chunk(chunk_index=0, element_type=ElementType.TEXT, page_numbers=[2, 3], source_element_indices=[0, 1, 2], content="")
+
+    assert _chunk_bbox(chunk, elements) == BBox(40, 100, 300, 180)
+
+
+def test_query_and_history_citations_carry_the_chunks_bbox(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id, chunk_row, retrieved = _setup_single_chunk_query(app_client, admin, user_id, token)
+    stored = admin.table("chunks").select("bbox").eq("id", chunk_row["id"]).execute().data[0]["bbox"]
+    assert stored == {"x0": 0, "y0": 0, "x1": 100, "y1": 20}  # fake_elements' bbox
+    _override(
+        retriever=FakeRetriever(retrieved),
+        generator=FakeGenerator(
+            GenerateResult(
+                answer="A fact [1].", cited_indices=[1], hallucinated_markers=[],
+                model="gemini-3.6-flash", input_tokens=1, output_tokens=1, latency_ms=1.0,
+            )
+        ),
+        verifier=FakeVerifier({chunk_row["id"]: _verdict(VerdictLabel.SUPPORTED, "Some fact.")}),
+    )
+
+    body = _post_query(app_client, token, document_id, "q")
+    history = app_client.get(
+        f"/conversations/{body['conversation_id']}/messages", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+
+    expected = {"x0": 0.0, "y0": 0.0, "x1": 100.0, "y1": 20.0}
+    assert body["citations"][0]["bbox"] == expected
+    assert history["messages"][1]["citations"][0]["bbox"] == expected
+
+
+
+# --- Follow-up questions are rewritten for retrieval (2026-10-06) -------------
+# Retrieval used to search on the raw latest question, so "and what about
+# Q2?" named nothing it could match. With history, retrieval now searches with
+# a standalone rewrite; generation still gets the user's own words.
+
+
+def test_first_turn_searches_with_the_question_itself_and_never_rewrites(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id, chunk_row, retrieved = _setup_single_chunk_query(app_client, admin, user_id, token)
+    retriever, rewriter = FakeRetriever(retrieved), PassthroughRewriter("SHOULD NOT BE USED")
+    _override(
+        retriever=retriever, rewriter=rewriter,
+        generator=FakeGenerator(GenerateResult(
+            answer="A fact [1].", cited_indices=[1], hallucinated_markers=[],
+            model="gemini-3.6-flash", input_tokens=1, output_tokens=1, latency_ms=1.0,
+        )),
+        verifier=FakeVerifier({chunk_row["id"]: _verdict(VerdictLabel.SUPPORTED)}),
+    )
+
+    _post_query(app_client, token, document_id, "What was Q3 revenue?")
+
+    assert retriever.calls[0]["question"] == "What was Q3 revenue?"
+    assert rewriter.calls == []
+
+
+def test_follow_up_searches_with_the_rewritten_question_but_generates_with_the_original(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id, chunk_row, retrieved = _setup_single_chunk_query(app_client, admin, user_id, token)
+    gen = FakeGenerator(GenerateResult(
+        answer="A fact [1].", cited_indices=[1], hallucinated_markers=[],
+        model="gemini-3.6-flash", input_tokens=1, output_tokens=1, latency_ms=1.0,
+    ))
+    verifier = FakeVerifier({chunk_row["id"]: _verdict(VerdictLabel.SUPPORTED)})
+    _override(retriever=FakeRetriever(retrieved), generator=gen, verifier=verifier)
+    first = _post_query(app_client, token, document_id, "What was Q3 revenue?")
+
+    retriever, rewriter = FakeRetriever(retrieved), PassthroughRewriter("What was Q2 revenue?")
+    _override(retriever=retriever, rewriter=rewriter, generator=gen, verifier=verifier)
+    _post_query(app_client, token, document_id, "And for Q2?", conversation_id=first["conversation_id"])
+
+    assert retriever.calls[0]["question"] == "What was Q2 revenue?"
+    assert rewriter.calls[0]["question"] == "And for Q2?"
+    assert [m["role"] for m in rewriter.calls[0]["history"]] == ["user", "assistant"]
+    assert gen.calls[-1]["question"] == "And for Q2?"

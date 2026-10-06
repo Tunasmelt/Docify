@@ -32,6 +32,7 @@ from services.verifier import (
     VerdictLabel,
     VerificationError,
     Verifier,
+    _BatchVerdictItem,
     _VerdictResponse,
 )
 
@@ -174,9 +175,10 @@ def test_multimodal_verify_passes_chunk_image_content_to_gemini():
     assert image_parts[0].inline_data.mime_type == "image/png"
 
 
-# Acceptance criterion: Batches verifications per generate call
+# Acceptance criterion: Batches verifications per generate call — since
+# 2026-10-06 literally: all claims of one answer go in ONE Gemini call.
 def test_batches_verifications_per_generate_call():
-    parsed = _VerdictResponse(verdict=VerdictLabel.SUPPORTED, quote="some content")
+    parsed = [_BatchVerdictItem(item=i, verdict=VerdictLabel.SUPPORTED, quote="some content") for i in range(1, 5)]
     client = FakeClient(response=FakeResponse(parsed=parsed))
     verifier = Verifier(client=client)
 
@@ -184,8 +186,8 @@ def test_batches_verifications_per_generate_call():
     results = verifier.verify_batch(pairs)
 
     assert len(results) == 4
-    assert all(isinstance(r, Verdict) for r in results)
-    assert len(client.models.calls) == 4
+    assert all(isinstance(r, Verdict) and r.verdict == VerdictLabel.SUPPORTED for r in results)
+    assert len(client.models.calls) == 1
 
 
 def test_verify_batch_runs_calls_concurrently_not_sequentially():
@@ -205,7 +207,7 @@ def test_verify_batch_runs_calls_concurrently_not_sequentially():
 
     pairs = [(f"claim {i}", _chunk()) for i in range(4)]
     started = time.monotonic()
-    verifier.verify_batch(pairs)
+    verifier._verify_each(pairs)  # the per-claim fallback path
     elapsed = time.monotonic() - started
 
     assert call_count == 4
@@ -229,7 +231,7 @@ def test_verify_batch_preserves_input_order_regardless_of_completion_order():
     verifier.verify = verify_by_index
 
     pairs = [(f"claim {i}", _chunk()) for i in range(4)]
-    results = verifier.verify_batch(pairs)
+    results = verifier._verify_each(pairs)  # the per-claim fallback path
 
     assert [r.quote for r in results] == ["0", "1", "2", "3"]
 
@@ -332,7 +334,7 @@ def test_verify_batch_one_failing_pair_does_not_contaminate_others():
         ("another working claim", _chunk(chunk_id="ok2")),
     ]
 
-    results = verifier.verify_batch(pairs)
+    results = verifier._verify_each(pairs)  # the per-claim fallback path
 
     assert results[0].verdict == VerdictLabel.SUPPORTED
     assert results[0].error is None
@@ -509,7 +511,7 @@ def test_verify_batch_survives_two_poisoned_pairs_at_any_position(poisoned_posit
         label = "POISON" if i in poisoned_positions else "clean"
         pairs.append((f"{label} claim {i}", _chunk(chunk_id=f"c{i}")))
 
-    results = Verifier(client=SelectivelyFailingClient(), retry_sleep=lambda _s: None).verify_batch(pairs)
+    results = Verifier(client=SelectivelyFailingClient(), retry_sleep=lambda _s: None)._verify_each(pairs)
 
     assert len(results) == 5
     # Each persistently failing pair is attempted 3 times (1 + 2 retries).
@@ -861,3 +863,131 @@ def test_figure_quote_found_in_the_caption_is_kept():
 
     assert result.verdict == VerdictLabel.PARTIAL
     assert result.quote == "Quarterly revenue chart"
+
+
+
+# --- One Gemini call per answer (2026-10-06) -----------------------------------
+# verify_batch used to make one call per claim (up to 8 in parallel), which
+# used up the free-tier request quota quickly. Claims are now verified in one
+# call per group of BATCH_SIZE, with the same per-claim quote checks, falling
+# back to per-claim calls when a batch call fails.
+
+
+def _items(*specs):
+    return [_BatchVerdictItem(item=i, verdict=v, quote=q) for i, v, q in specs]
+
+
+def test_batch_results_are_mapped_by_item_number_not_response_order():
+    parsed = _items((2, VerdictLabel.PARTIAL, "beta"), (1, VerdictLabel.SUPPORTED, "alpha"))
+    client = FakeClient(response=FakeResponse(parsed=parsed))
+
+    results = Verifier(client=client).verify_batch([("c1", _chunk(content="alpha")), ("c2", _chunk(content="beta"))])
+
+    assert [r.verdict for r in results] == [VerdictLabel.SUPPORTED, VerdictLabel.PARTIAL]
+    assert [r.quote for r in results] == ["alpha", "beta"]
+    prompt = " ".join(p.text for p in client.models.calls[0]["contents"] if p.text)
+    assert "ITEM 1" in prompt and "CLAIM 2: c2" in prompt
+
+
+def test_batch_applies_quote_grounding_to_each_item():
+    parsed = _items((1, VerdictLabel.SUPPORTED, "alpha"), (2, VerdictLabel.SUPPORTED, "invented quote"))
+    results = Verifier(client=FakeClient(response=FakeResponse(parsed=parsed))).verify_batch(
+        [("c1", _chunk(content="alpha")), ("c2", _chunk(content="beta"))]
+    )
+
+    assert results[0].verdict == VerdictLabel.SUPPORTED
+    assert results[1].verdict == VerdictLabel.UNSUPPORTED  # fabricated quote, this item only
+
+
+def test_item_missing_from_the_batch_response_is_verified_on_its_own():
+    class Models:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_content(self, *, model, contents, config):
+            self.calls += 1
+            if self.calls == 1:
+                return FakeResponse(parsed=_items((1, VerdictLabel.SUPPORTED, "alpha")))
+            return FakeResponse(parsed=_VerdictResponse(verdict=VerdictLabel.PARTIAL, quote="beta"))
+
+    client = type("C", (), {})()
+    client.models = Models()
+
+    results = Verifier(client=client).verify_batch([("c1", _chunk(content="alpha")), ("c2", _chunk(content="beta"))])
+
+    assert [r.verdict for r in results] == [VerdictLabel.SUPPORTED, VerdictLabel.PARTIAL]
+    assert client.models.calls == 2
+
+
+def test_failed_batch_call_falls_back_to_one_call_per_claim():
+    class Models:
+        def __init__(self):
+            self.batch_calls = 0
+            self.single_calls = 0
+
+        def generate_content(self, *, model, contents, config):
+            if config.response_schema == list[_BatchVerdictItem]:
+                self.batch_calls += 1
+                raise _fake_client_error(503, "unavailable")
+            self.single_calls += 1
+            return FakeResponse(parsed=_VerdictResponse(verdict=VerdictLabel.SUPPORTED, quote="some content"))
+
+    client = type("C", (), {})()
+    client.models = Models()
+
+    results = Verifier(client=client, retry_sleep=lambda _s: None).verify_batch(
+        [(f"claim {i}", _chunk(chunk_id=f"c{i}")) for i in range(3)]
+    )
+
+    assert [r.verdict for r in results] == [VerdictLabel.SUPPORTED] * 3
+    assert client.models.batch_calls == 3  # retried, then gave up on batching
+    assert client.models.single_calls == 3
+
+
+def test_malformed_batch_response_falls_back_to_one_call_per_claim():
+    class Models:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_content(self, *, model, contents, config):
+            self.calls += 1
+            if config.response_schema == list[_BatchVerdictItem]:
+                return FakeResponse(parsed=None, text="not json")
+            return FakeResponse(parsed=_VerdictResponse(verdict=VerdictLabel.SUPPORTED, quote="some content"))
+
+    client = type("C", (), {})()
+    client.models = Models()
+
+    results = Verifier(client=client).verify_batch([("a", _chunk()), ("b", _chunk())])
+
+    assert [r.verdict for r in results] == [VerdictLabel.SUPPORTED] * 2
+    assert client.models.calls == 3
+
+
+def test_more_claims_than_batch_size_use_one_call_per_group():
+    from services.verifier import BATCH_SIZE
+
+    class Models:
+        def __init__(self):
+            self.calls = []
+
+        def generate_content(self, *, model, contents, config):
+            n_items = sum(1 for p in contents if p.text and p.text.startswith("CLAIM "))
+            self.calls.append(n_items)
+            return FakeResponse(parsed=_items(*[(i, VerdictLabel.SUPPORTED, "some content") for i in range(1, n_items + 1)]))
+
+    client = type("C", (), {})()
+    client.models = Models()
+
+    results = Verifier(client=client).verify_batch([(f"claim {i}", _chunk()) for i in range(BATCH_SIZE + 3)])
+
+    assert len(results) == BATCH_SIZE + 3
+    assert client.models.calls == [BATCH_SIZE, 3]
+
+
+def test_a_model_claiming_unverified_is_not_trusted():
+    parsed = _items((1, VerdictLabel.UNVERIFIED, None), (2, VerdictLabel.SUPPORTED, "some content"))
+    results = Verifier(client=FakeClient(response=FakeResponse(parsed=parsed))).verify_batch([("a", _chunk()), ("b", _chunk())])
+
+    assert results[0].verdict == VerdictLabel.UNVERIFIED and results[0].error is not None
+    assert results[1].verdict == VerdictLabel.SUPPORTED

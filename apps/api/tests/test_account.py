@@ -58,6 +58,7 @@ def _override_query(retriever, generator, verifier):
     app.dependency_overrides[query.get_retriever] = lambda: retriever
     app.dependency_overrides[query.get_generator] = lambda: generator
     app.dependency_overrides[query.get_verifier] = lambda: verifier
+    app.dependency_overrides[query.get_query_rewriter] = lambda: _PassthroughRewriter()
 
 
 @pytest.fixture(autouse=True)
@@ -359,3 +360,11 @@ def test_refresh_token_is_invalidated_by_account_deletion(app_client, admin, use
     fresh_client = create_client(LOCAL_SUPABASE_URL, LOCAL_SUPABASE_ANON_KEY)
     with pytest.raises(Exception):
         fresh_client.auth.refresh_session(refresh_token)
+
+
+class _PassthroughRewriter:
+    """Follow-up questions are searched unchanged — no real Gemini rewrite call."""
+
+    def rewrite(self, question, history):
+        return question
+

@@ -106,7 +106,7 @@ The browser talks to FastAPI directly (`NEXT_PUBLIC_API_URL`, `apps/web/lib/api/
    BackgroundTask:
    a. Downloads the file from Storage (service-role client)
    b. Parses → typed elements (text, tables, figures, headings) with page/slide + bbox,
-      in document order (status='parsing'). A PDF page goes through the OCR fallback
+      in document order — two-column PDF pages are read column by column (status='parsing'). A PDF page goes through the OCR fallback
       chain if it has no text, or under 200 characters of text over a scan image covering
       half the page or more; the OCR text then replaces that page's thin text layer
    c. Uploads cropped figures to Storage: figures/{user_id}/{document_id}/{figure}.png
@@ -127,9 +127,13 @@ The browser talks to FastAPI directly (`NEXT_PUBLIC_API_URL`, `apps/web/lib/api/
 2. Browser POSTs to FastAPI POST /query or POST /query/stream { question, document_ids,
    conversation_id?, k?, rerank? } with Bearer <supabase_jwt>
 3. FastAPI (services/retriever.py):
+   0. If the conversation has earlier turns, Gemini 3.5 Flash-Lite rewrites the question
+      into a standalone search query (services/query_rewriter.py) — "and for Q2?" becomes
+      "What was Q2 revenue?". Used for retrieval only; generation gets the original
+      question. Any failure falls back to the original question
    a. Finds which embedding provider(s) have chunks in the document_ids scope (almost
       always just "voyage")
-   b. Embeds the question once PER provider present and runs that provider's own vector
+   b. Embeds the (search) question once PER provider present and runs that provider's own vector
       search (filtered by user_id, document_ids, embedding_provider; the HNSW scan is
       iterative, so other tenants' chunks can't crowd a user's own out of the results). Vectors from
       different providers are never compared — see MEMORY.md §Anti-patterns 2026-07-31
@@ -145,7 +149,8 @@ The browser talks to FastAPI directly (`NEXT_PUBLIC_API_URL`, `apps/web/lib/api/
       retryDelay but never waiting more than 8s (services/gemini_retry.py); the same
       applies to each verification call
    h. Maps markers back to chunk IDs, recovering claim spans (sentence → wider spans)
-   i. Runs the verify flow on each cited claim
+   i. Runs the verify flow on the cited claims — all claims in one Gemini call (groups of
+      12), falling back to one call per claim if the batch call fails
    j. Persists conversation + messages + citations atomically (create_query_turn RPC)
 4. Returns { answer, citations: [...], metadata }, or streams the same content as SSE
    events (with 12s keepalive frames) via /query/stream. A client disconnect or user
@@ -157,8 +162,10 @@ The browser talks to FastAPI directly (`NEXT_PUBLIC_API_URL`, `apps/web/lib/api/
 For each (claim_span, cited_chunk_id) pair:
 1. Fetch the chunk content
 2. Call Gemini 3.5 Flash-Lite: given source + claim → supported | partial | unsupported,
-   plus a supporting quote. A quote that is not actually in the source is treated as
-   unsupported.
+   plus a supporting quote. All claims of an answer go in one call (numbered ITEMs,
+   structured list response); a failed or malformed batch falls back to one call per
+   claim, and an item missing from the response is verified on its own. A quote that is
+   not actually in the source is treated as unsupported (checked per item).
 3. If the Gemini call errors, times out, or returns a malformed response, the verdict is
    `unverified` — an infrastructure failure, never conflated with `unsupported`
 4. Treatment:
@@ -196,7 +203,8 @@ apps/
 │   │   ├── ui/                   shadcn primitives
 │   │   ├── landing/              landing page sections
 │   │   ├── documents/            upload, list, card
-│   │   ├── chat/                 message-bubble, citation-marker, source-panel
+│   │   ├── chat/                 message-bubble, citation-marker, source-panel,
+│   │   │                         page-preview-dialog (highlighted PDF page)
 │   │   ├── conversations/        rename/delete dialogs
 │   │   ├── settings/             settings sections + delete-account dialog
 │   │   └── layout/               nav, sidebar, topbar
@@ -220,20 +228,23 @@ apps/
 │   ├── routes/
 │   │   ├── ingest.py             /ingest, /reindex
 │   │   ├── query.py              /query, /query/stream (verification runs internally)
-│   │   ├── documents.py          GET/DELETE /documents (+ stuck-document reaper)
+│   │   ├── documents.py          GET/DELETE /documents (+ stuck-document reaper),
+│   │   │                         GET /documents/{id}/pages/{n}/image (page preview)
 │   │   ├── conversations.py      GET/DELETE /conversations, rename, messages
 │   │   ├── export.py             GET /export/conversations
 │   │   ├── account.py            DELETE /account
 │   │   └── health.py             /health
 │   ├── services/
 │   │   ├── document_model.py     ElementType/BBox/ParsedElement/ParsedDocument (no heavy deps)
-│   │   ├── parser.py             PDF/DOCX/PPTX/HTML parser + OCR fallback chain
+│   │   ├── parser.py             PDF/DOCX/PPTX/HTML parser (two-column aware) + OCR fallback chain
 │   │   ├── chunker.py            element → chunk grouping, caption association
 │   │   ├── embedder.py           Voyage client + Gemini embedding-2 fallback
 │   │   ├── retriever.py          provider-partitioned vector + FTS search, RRF, rerank
 │   │   ├── generator.py          Gemini 3.6 Flash wrapper (sync + streaming)
 │   │   ├── verifier.py           Gemini 3.5 Flash-Lite citation check (4 verdicts)
-│   │   └── figure_fetcher.py     signed figure URLs for citation responses
+│   │   ├── query_rewriter.py     follow-up question → standalone search query
+│   │   ├── gemini_retry.py       bounded retries for interactive Gemini calls
+│   │   └── figure_fetcher.py     signed figure URLs + chunk bboxes for citation responses
 │   ├── db/
 │   │   ├── client.py             Supabase service-role client
 │   │   └── queries.py            typed query builders (all user_id-scoped)
@@ -274,7 +285,7 @@ Changing any of these requires human confirmation.
 - [x] **Single-agent workflow.** The original four-agent lane model (claude-code / claude-design / gemini / codex) was retired in practice: gemini was dropped 2026-07-24 and every commit since has been made by claude-code. AGENT.md describes the current workflow; external review passes (e.g. Codex reviews under `.agent/reviews/`) are still welcome as one-off audits.
 - [x] **Chunking: element-boundary-respecting, not fixed-token.** `services/chunker.py` groups adjacent text/heading/list elements toward `TOKEN_BUDGET` (~500 tokens), keeps tables and figures as their own chunks, and only splits an element larger than `MAX_CHUNK_TOKENS` (4000) — by table row or by paragraph/sentence, never mid-row. Every heading starts a new chunk; a chunk that doesn't start with its heading (a continuation, a page break, a table or figure) gets the current section heading prefixed to its content, so it's findable by section name. Headings directly above a table or figure fold into that chunk.
 - [x] **Rerank: opt-in, default off.** RRF alone put the expected chunk in the top 5 on 4/4 fixture questions; rerank added ~380ms with no measured gain. Exposed as a user preference.
-- [x] **No query-time query rewriting.** Prior turns go into the generation prompt only; retrieval uses the raw current question. A follow-up with no overlap with its target content may retrieve poorly — a known, accepted limitation.
+- [x] **Follow-up questions are rewritten for retrieval only** (reversed 2026-10-06 from "no query rewriting"). When a conversation has history, a cheap Flash-Lite call turns the question into a standalone search query; generation still gets the user's own words plus the history. Costs one extra Flash-Lite call per follow-up; any failure searches with the original question.
 - [x] **Document status: polling, not Supabase realtime.**
 
 ---

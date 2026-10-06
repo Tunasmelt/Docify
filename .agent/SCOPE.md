@@ -57,7 +57,7 @@ Source of truth for what is and is not in scope, per phase. Check here before de
 - [x] Response returns answer + cited chunks with source metadata
 - [x] Hybrid search: N provider-partitioned vector lists + Postgres FTS, fused with RRF
 - [x] Opt-in Voyage rerank-2.5 (default off)
-- [x] Conversation memory in the prompt (last 5 turns; no query rewriting)
+- [x] Conversation memory in the prompt (last 5 turns), plus follow-up questions rewritten into standalone search queries for retrieval
 - [x] SSE streaming (`/query/stream`) with keepalives and disconnect handling
 
 ### Explicitly out of scope
@@ -73,7 +73,7 @@ Source of truth for what is and is not in scope, per phase. Check here before de
 - [x] Protected-route middleware
 - [x] Upload page with drag-drop, progress state, document list
 - [x] Chat page: question input, streaming answers, inline citation chips, copy, timestamps, stop/regenerate
-- [x] Citation chip → source panel with chunk text and figure image
+- [x] Citation chip → source panel with chunk text and figure image; for PDFs, "Open page N" shows the page with the cited area highlighted
 - [x] Document list: filter and delete. **Document rename is not built** (`PATCH /documents/{id}` not yet defined)
 - [x] Conversation rename + delete
 - [x] Empty states, loading skeletons, error boundaries

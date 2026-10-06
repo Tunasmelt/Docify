@@ -72,8 +72,9 @@ def fetch_generator_chunks(client, retrieved_chunks: list[RetrievedChunk]) -> li
         return []
 
     chunk_ids = [c.chunk_id for c in retrieved_chunks]
-    rows = client.table("chunks").select("id,figure_path").in_("id", chunk_ids).execute().data
+    rows = client.table("chunks").select("id,figure_path,bbox").in_("id", chunk_ids).execute().data
     figure_paths = {row["id"]: row["figure_path"] for row in rows}
+    bboxes = {row["id"]: row.get("bbox") for row in rows}
 
     generator_chunks = []
     for chunk in retrieved_chunks:
@@ -105,6 +106,7 @@ def fetch_generator_chunks(client, retrieved_chunks: list[RetrievedChunk]) -> li
                 # figure_path a citation-URL builder would then treat as
                 # viewable, since the image fetch for it just failed.
                 figure_path=path if element_type == "figure" else None,
+                bbox=bboxes.get(chunk.chunk_id),
             )
         )
     return generator_chunks

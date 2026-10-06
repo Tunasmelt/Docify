@@ -100,6 +100,7 @@ class GeneratorChunk:
     document_name: str
     image: bytes | None = None  # PNG bytes; only meaningful when element_type == "figure"
     figure_path: str | None = None  # Storage object path; only meaningful when element_type == "figure"
+    bbox: dict | None = None  # chunks.bbox — the chunk's position on its page, for citation display
     # (FEAT-026) figure_fetcher.py already resolves this per chunk to
     # download the image above — carried through here so routes/query.py
     # can reuse it to build a signed URL for figure citations without a

@@ -6,6 +6,25 @@ Entry types: `feature` · `fix` · `decision` · `refactor` · `test` · `infra`
 
 ---
 
+## 2026-10-06 — feature: two-column PDFs, highlighted page preview, follow-up query rewriting, batched verification
+
+**Phase:** 5
+**Feature:** n/a (2026-10-06 code review, "Later" group)
+**Changed:**
+- **Two-column PDFs** (`services/parser.py`). Lines were grouped by height alone, so both columns merged into one garbled line. The parser now finds the gutter: an empty vertical strip in the middle of the page with text on both sides on many rows. It splits lines there and reads each section's left column, then its right; a full-width line (a title) starts a new section. Paragraphs never continue across the gutter, list-indent detection uses each column's own margin, and tables, figures and captions are placed in the same reading order. Single-column pages are unaffected: all fixture element counts are unchanged.
+- **Highlighted page preview.** Citations now carry `bbox` (`CitationResponse.bbox`, live and from history). Each chunk stores the union of its elements' boxes instead of only the first element's. The new `GET /documents/{id}/pages/{n}/image` renders the PDF page server-side with pdfplumber (no new dependency) and draws the bbox. In the chat source panel, "Open page N in document" (PDFs only) opens the page in a dialog; before, it only logged "[not yet built]" to the console.
+- **Follow-up query rewriting** (`services/query_rewriter.py`, both query routes). With conversation history, a Gemini 3.5 Flash-Lite call turns the question into a standalone search query for retrieval only; generation still gets the original question. Any failure falls back to the original. First turns never call it. This reverses the earlier "no query rewriting" Locked decision (MEMORY.md decision log).
+- **Batched verification** (`services/verifier.py`). All claims of an answer go in one Gemini call (groups of 12, structured list response) instead of one call per claim. Every item gets the same quote checks. A failed or malformed batch falls back to per-claim calls, and an item missing from the response is verified on its own. A model claiming `unverified` is no longer trusted as a verdict.
+**Verified:**
+- New regression tests fail on the old code and pass on the new: parser 4 (generated two-column PDFs), page image 6, citation bbox 3, query rewriter 4 unit + 2 `/query` + 1 `/query/stream`, verifier batch 7.
+- Existing verifier tests that pinned one call per claim now target the per-claim fallback (`_verify_each`).
+- Full backend suite against local Supabase: 458 passed, 1 environmental failure (Voyage tokenizer download blocked by the proxy).
+- Playwright `page-preview.e2e.ts` and `document-retry.e2e.ts` pass against local Supabase plus the local API. Web `tsc` and `next build` pass.
+- `google-genai` was checked to accept and parse `list[_BatchVerdictItem]` as a response schema.
+**Deploy:** no migrations. Rollback: revert the commit.
+
+---
+
 ## 2026-10-06 — fix: partly scanned OCR, section-aware chunks, tenant-safe vector search, unsupported-claim removal, Gemini retries, failed-document recovery UI
 
 **Phase:** 5

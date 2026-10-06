@@ -14,7 +14,7 @@ from models.conversations import (
     MessageResponse,
     RenameConversationRequest,
 )
-from models.query import CitationResponse
+from models.query import CitationResponse, display_bbox
 from routes._pagination import decode_cursor, encode_cursor
 from services.figure_fetcher import signed_figure_url
 
@@ -93,6 +93,7 @@ def _citation_response(client, row: dict) -> CitationResponse:
         verdict=row["verdict"],
         supporting_quote=row["supporting_quote"],
         figure_url=figure_url,
+        bbox=display_bbox(chunk.get("bbox")),
     )
 
 

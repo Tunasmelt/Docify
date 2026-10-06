@@ -176,3 +176,47 @@ export async function seedFailedDocument(userId: string, filename: string, error
   });
   return doc.id;
 }
+
+/** Uploads a real PDF to the `uploads` bucket and inserts a ready document
+ * row plus one text chunk with a real `bbox` — enough for the page preview
+ * endpoint to render the page and highlight the chunk. */
+export async function seedPdfWithChunk(
+  userId: string,
+  pdfBytes: Buffer,
+  chunkContent: string,
+  bbox: { x0: number; y0: number; x1: number; y1: number },
+  pageNumber = 1
+): Promise<{ documentId: string; chunkId: string }> {
+  const objectPath = `${userId}/preview-${Date.now()}.pdf`;
+  const upload = await fetch(`${LOCAL_SUPABASE_URL}/storage/v1/object/uploads/${objectPath}`, {
+    method: "POST",
+    headers: {
+      apikey: LOCAL_SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${LOCAL_SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/pdf",
+    },
+    body: new Uint8Array(pdfBytes),
+  });
+  if (!upload.ok) {
+    throw new Error(`PDF upload failed: ${upload.status} ${await upload.text()}`);
+  }
+  const doc = await restInsert<{ id: string }>("documents", {
+    user_id: userId,
+    filename: "preview.pdf",
+    storage_path: `uploads/${objectPath}`,
+    mime_type: "application/pdf",
+    size_bytes: pdfBytes.length,
+    status: "ready",
+  });
+  const chunk = await restInsert<{ id: string }>("chunks", {
+    document_id: doc.id,
+    user_id: userId,
+    chunk_index: 0,
+    element_type: "text",
+    page_number: pageNumber,
+    content: chunkContent,
+    bbox,
+    embedding: DUMMY_EMBEDDING,
+  });
+  return { documentId: doc.id, chunkId: chunk.id };
+}

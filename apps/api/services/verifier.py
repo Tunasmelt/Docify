@@ -69,6 +69,22 @@ class _VerdictResponse(pydantic.BaseModel):
     quote: str | None = None
 
 
+class _BatchVerdictItem(pydantic.BaseModel):
+    item: int
+    verdict: VerdictLabel
+    quote: str | None = None
+
+
+BATCH_SIZE = 12
+
+BATCH_SYSTEM_INSTRUCTION = (
+    SYSTEM_INSTRUCTION
+    + "\n\nYou will be given several numbered ITEMs, each with its own SOURCE and CLAIM. Judge "
+    "each ITEM independently, using only that ITEM's SOURCE. Return one result per ITEM, with "
+    "`item` set to its number."
+)
+
+
 @dataclass
 class Verdict:
     verdict: VerdictLabel
@@ -106,6 +122,17 @@ def _default_client() -> genai.Client:
     # SDK's auto-detection looks for GOOGLE_API_KEY, not this project's
     # actual env var, so it must be passed explicitly.
     return genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+
+def _build_batch_contents(pairs: list[tuple[str, GeneratorChunk]]) -> list[types.Part]:
+    parts: list[types.Part] = []
+    for index, (claim_text, chunk) in enumerate(pairs, start=1):
+        header = f"ITEM {index}\nSOURCE (page {chunk.page_number}, {chunk.element_type}, from {chunk.document_name}):"
+        parts.append(types.Part.from_text(text=f"{header}\n{chunk.content}"))
+        if chunk.image is not None:
+            parts.append(types.Part.from_bytes(data=chunk.image, mime_type="image/png"))
+        parts.append(types.Part.from_text(text=f"CLAIM {index}: {claim_text}\n"))
+    return parts
 
 
 def _build_contents(claim_text: str, chunk: GeneratorChunk) -> list[types.Part]:
@@ -245,42 +272,10 @@ class Verifier:
 
         parsed: _VerdictResponse = response.parsed
         usage = response.usage_metadata
-
-        # Defensive, not just prompted: an unsupported verdict must never
-        # carry a quote even if the model deviates from instructions and
-        # emits one anyway (the same "don't just trust the prompt, enforce
-        # structurally" lesson FEAT-010's citation-parsing gaps taught).
-        quote = parsed.quote if parsed.verdict != VerdictLabel.UNSUPPORTED else None
-
-        # A self-audit found this check was entirely missing: a
-        # SUPPORTED/PARTIAL verdict's quote was trusted as-is from the
-        # model, with nothing confirming it actually appears in the real
-        # source content — a fabricated-but-plausible quote passed
-        # straight through as "verified" (proven live before this
-        # existed). If the quote isn't grounded in the chunk, the verdict
-        # that depends on it can't be trusted either — fail safe exactly
-        # like a broken API call, not just the quote field.
-        if quote is not None and chunk.image is not None and not _quote_is_grounded(quote, chunk.content):
-            # A figure chunk's text is only its caption; the model also saw
-            # the image and may legitimately quote text read off it, which
-            # can't be checked against stored text. Keep the verdict, but
-            # don't display a quote nothing on our side can confirm.
-            logger.info("verifier: figure quote not in caption text — keeping verdict, omitting quote. quote=%r", quote)
-            quote = None
-        if quote is not None and not _quote_is_grounded(quote, chunk.content):
-            logger.warning(
-                "verifier: model returned verdict=%s with a quote not found in the source — "
-                "failing safe to UNSUPPORTED. quote=%r",
-                parsed.verdict.value,
-                quote,
-            )
-            return _fail_safe_verdict(
-                VerdictLabel.UNSUPPORTED, response.model_version or MODEL, f"returned quote not found in source content: {quote!r}", latency_ms
-            )
-
-        return Verdict(
-            verdict=parsed.verdict,
-            quote=quote,
+        return _finalize(
+            parsed.verdict,
+            parsed.quote,
+            chunk,
             model=response.model_version or MODEL,
             input_tokens=usage.prompt_token_count if usage and usage.prompt_token_count is not None else 0,
             output_tokens=usage.candidates_token_count if usage and usage.candidates_token_count is not None else 0,
@@ -288,13 +283,146 @@ class Verifier:
         )
 
     def verify_batch(self, pairs: list[tuple[str, GeneratorChunk]]) -> list[Verdict]:
-        """Verifies every (claim_text, chunk) pair from one generate()
-        call's answer concurrently — each pair is an independent,
-        unrelated Gemini call, the same shape as Retriever's parallel
-        vector/FTS searches (FEAT-009). Order of results matches order
-        of input pairs, regardless of completion order."""
+        """Verifies every (claim_text, chunk) pair from one answer. Claims are
+        checked in as few Gemini calls as possible — groups of up to
+        BATCH_SIZE in one call each — instead of one call per claim, which
+        burned the free-tier request quota fast (up to 8 parallel calls per
+        answer). Each verdict gets exactly the same quote checks as verify().
+        If a group's call fails or its response is malformed, that group
+        falls back to one call per claim; any claim missing from a batch
+        response is verified on its own. Order matches `pairs`."""
+        if not pairs:
+            return []
+        if len(pairs) == 1:
+            return [self.verify(*pairs[0])]
+        results: list[Verdict | None] = [None] * len(pairs)
+        groups = [list(range(i, min(i + BATCH_SIZE, len(pairs)))) for i in range(0, len(pairs), BATCH_SIZE)]
+        for group in groups:
+            batch = self._verify_group([pairs[i] for i in group])
+            if batch is None:
+                batch = self._verify_each([pairs[i] for i in group])
+            for i, verdict in zip(group, batch):
+                results[i] = verdict
+        return results  # type: ignore[return-value]  # every slot is filled above
+
+    def _verify_each(self, pairs: list[tuple[str, GeneratorChunk]]) -> list[Verdict]:
+        """One call per claim, concurrently — the fallback path. A failure on
+        one pair never affects another. Order matches `pairs`."""
         if not pairs:
             return []
         with ThreadPoolExecutor(max_workers=min(len(pairs), 8)) as pool:
             futures = [pool.submit(self.verify, claim_text, chunk) for claim_text, chunk in pairs]
             return [future.result() for future in futures]
+
+    def _verify_group(self, pairs: list[tuple[str, GeneratorChunk]]) -> list[Verdict] | None:
+        """One Gemini call for the whole group, or None if the call failed or
+        returned nothing usable (the caller then falls back to _verify_each)."""
+        for claim_text, _chunk in pairs:
+            if not claim_text or not claim_text.strip():
+                raise VerificationError("verify_batch() requires non-empty claim texts")
+        config = types.GenerateContentConfig(
+            system_instruction=BATCH_SYSTEM_INSTRUCTION,
+            response_mime_type="application/json",
+            response_schema=list[_BatchVerdictItem],
+            temperature=0.0,
+        )
+        started = time.perf_counter()
+        try:
+            response = call_with_retry(
+                lambda: self._client.models.generate_content(
+                    model=MODEL, contents=_build_batch_contents(pairs), config=config
+                ),
+                what="batch verifier",
+                sleep_fn=self._retry_sleep,
+            )
+        except (APIError, httpx.HTTPError) as exc:
+            logger.warning("verifier: batch call failed (%s) — verifying each claim separately", type(exc).__name__)
+            return None
+        latency_ms = (time.perf_counter() - started) * 1000
+
+        parsed = getattr(response, "parsed", None)
+        if not isinstance(parsed, list) or not all(isinstance(item, _BatchVerdictItem) for item in parsed):
+            logger.warning("verifier: batch response did not match the schema — verifying each claim separately")
+            return None
+
+        by_item: dict[int, _BatchVerdictItem] = {}
+        for item in parsed:
+            if 1 <= item.item <= len(pairs) and item.item not in by_item:
+                by_item[item.item] = item
+        usage = response.usage_metadata
+        model = response.model_version or MODEL
+        input_tokens = usage.prompt_token_count if usage and usage.prompt_token_count is not None else 0
+        output_tokens = usage.candidates_token_count if usage and usage.candidates_token_count is not None else 0
+        share = max(1, len(pairs))
+
+        verdicts: list[Verdict] = []
+        for index, (claim_text, chunk) in enumerate(pairs, start=1):
+            item = by_item.get(index)
+            if item is None:
+                logger.warning("verifier: batch response omitted item %d — verifying it on its own", index)
+                verdicts.append(self.verify(claim_text, chunk))
+                continue
+            verdicts.append(
+                _finalize(
+                    item.verdict,
+                    item.quote,
+                    chunk,
+                    model=model,
+                    input_tokens=input_tokens // share,
+                    output_tokens=output_tokens // share,
+                    latency_ms=latency_ms,
+                )
+            )
+        return verdicts
+
+
+def _finalize(
+    verdict: VerdictLabel,
+    quote: str | None,
+    chunk: GeneratorChunk,
+    *,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    latency_ms: float,
+) -> Verdict:
+    """The checks every model verdict goes through, single or batched."""
+    if verdict == VerdictLabel.UNVERIFIED:
+        # Only this code assigns UNVERIFIED (when verification couldn't run);
+        # a model claiming it is treated as an unusable answer.
+        return _fail_safe_verdict(VerdictLabel.UNVERIFIED, model, "model returned 'unverified'", latency_ms)
+
+    # Defensive, not just prompted: an unsupported verdict must never carry a
+    # quote even if the model deviates from instructions and emits one anyway.
+    if verdict == VerdictLabel.UNSUPPORTED:
+        quote = None
+
+    if quote is not None and chunk.image is not None and not _quote_is_grounded(quote, chunk.content):
+        # A figure chunk's text is only its caption; the model also saw the
+        # image and may legitimately quote text read off it, which can't be
+        # checked against stored text. Keep the verdict, but don't display a
+        # quote nothing on our side can confirm.
+        logger.info("verifier: figure quote not in caption text — keeping verdict, omitting quote. quote=%r", quote)
+        quote = None
+
+    # The quote must actually appear in the source: a fabricated-but-plausible
+    # quote means the verdict that depends on it can't be trusted either.
+    if quote is not None and not _quote_is_grounded(quote, chunk.content):
+        logger.warning(
+            "verifier: model returned verdict=%s with a quote not found in the source — failing safe to "
+            "UNSUPPORTED. quote=%r",
+            verdict.value,
+            quote,
+        )
+        return _fail_safe_verdict(
+            VerdictLabel.UNSUPPORTED, model, f"returned quote not found in source content: {quote!r}", latency_ms
+        )
+
+    return Verdict(
+        verdict=verdict,
+        quote=quote,
+        model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        latency_ms=latency_ms,
+    )

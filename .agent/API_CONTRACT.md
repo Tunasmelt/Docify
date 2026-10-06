@@ -190,6 +190,20 @@ Lists the user's documents.
 
 ---
 
+### `GET /documents/{document_id}/pages/{page_number}/image`
+Renders one page of a PDF as a PNG, for the citation page preview. With all four of `x0`, `y0`, `x1`, `y1` (a citation's `bbox`) the area is highlighted.
+
+**Query params:** `x0`, `y0`, `x1`, `y1` (optional, PDF points from the page's top-left).
+
+**Response 200:** `image/png` (110 dpi), `Cache-Control: private, max-age=300`. Not rate-limited (no vendor API calls).
+
+**Errors:**
+- `404 NOT_FOUND` — the document doesn't exist, isn't the caller's, or has no such page
+- `422 VALIDATION_ERROR` — not a PDF (DOCX/HTML have no pages; PPTX slides aren't rendered), page < 1, or the page couldn't be rendered
+- `500 STORAGE_ERROR` — the stored file couldn't be read
+
+---
+
 ### `DELETE /documents/{document_id}`
 Deletes the document's Storage objects (`uploads` file + `figures`), then the row. Chunks and citations cascade via FKs; the id is removed from any `conversations.document_ids` array in application code (arrays have no FK).
 
@@ -277,7 +291,7 @@ Ask a question over one or more documents.
 **Behaviour:**
 - If `conversation_id` omitted, creates a new conversation
 - If `conversation_id` provided, appends to it (must belong to user)
-- Runs hybrid retrieval → generation → verification pipeline (see ARCHITECTURE.md)
+- Runs hybrid retrieval → generation → verification pipeline (see ARCHITECTURE.md). In a continuing conversation, retrieval searches with the question rewritten into a standalone query (one extra Gemini Flash-Lite call); generation answers the original question
 - `verdict` is one of `supported` | `partial` | `unsupported` | `unverified` (see ARCHITECTURE.md §Verify flow):
   - `supported` — kept; the answer keeps its `[N]` marker.
   - `partial` — kept; the source backs only part of the claim (marker 3 above confirms broad growth but not "international demand"). Clients render it with a warning style.
@@ -286,6 +300,7 @@ Ask a question over one or more documents.
 - **`figure_url`** — only on `element_type: "figure"` citations: a signed Storage URL valid for 600s, generated fresh on every read (live or historical). Omitted (not `null`) otherwise. If the figure fetch fails server-side the citation is downgraded to `element_type: "text"` with no `figure_url`.
 - **`page_number`** — depends on the source format: a real page for PDF, a slide number for PPTX, and always `1` (no location available) for DOCX/HTML. Use `document_mime_type` to interpret it; `lib/chat/parse-message.ts`'s `citationLocation()` renders "Page N", "Slide N", or nothing.
 - **`document_mime_type`** — the source document's `mime_type`.
+- **`bbox`** — `{x0, y0, x1, y1}`, the cited chunk's area on its page in PDF points from the top-left corner. Omitted when the source has no real location (DOCX/HTML). Pass it to `GET /documents/{id}/pages/{n}/image` to show the highlighted page.
 - **`association_method`** — only on `table`/`figure` citations whose caption was linked by the parser: `"explicit"` (parser's direct caption match), `"heuristic"` (chunker's weaker proximity match), or `"unmatched"`. Omitted otherwise. Not yet displayed by the frontend.
 - `chunks.embedding_provider` is deliberately **not** exposed: which vendor located a chunk says nothing about whether the claim is supported — every citation goes through the same verifier.
 

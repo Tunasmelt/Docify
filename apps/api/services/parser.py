@@ -1,4 +1,5 @@
 import base64
+import bisect
 import logging
 import os
 import re
@@ -379,6 +380,156 @@ def _group_chars_into_lines(page) -> list[dict]:
     return result
 
 
+# ── Column layout ─────────────────────────────────────────────────────────
+# Lines are grouped by vertical position, so on a two-column page the text of
+# both columns at the same height used to merge into one line. A page is
+# treated as two-column when an empty vertical strip (the gutter) runs down
+# its middle with text on both sides of it on many rows; lines are then split
+# at the gutter and read column by column. A line that crosses the gutter (a
+# title, a full-width heading) starts a new section: within each section the
+# left column is read before the right.
+_SEGMENT_GAP_PT = 12.0  # a horizontal gap this wide inside a row separates columns
+_MIN_GUTTER_PT = 8.0
+_MIN_COLUMN_ROWS = 6
+_GUTTER_SEARCH = (0.25, 0.75)  # gutter must lie in this horizontal band of the page
+
+
+def _line_from_chars(chars: list[dict]) -> dict:
+    chars = sorted(chars, key=lambda c: c["x0"])
+    return {
+        "text": "".join(c["text"] for c in chars).strip(),
+        "top": min(c["top"] for c in chars),
+        "bottom": max(c["bottom"] for c in chars),
+        "x0": chars[0]["x0"],
+        "x1": chars[-1]["x1"],
+        "size": sum(c["size"] for c in chars) / len(chars),
+        "bold": all("bold" in c["fontname"].lower() for c in chars),
+    }
+
+
+def _split_at_gaps(chars: list[dict]) -> list[list[dict]]:
+    chars = sorted(chars, key=lambda c: c["x0"])
+    segments = [[chars[0]]]
+    for ch in chars[1:]:
+        if ch["x0"] - segments[-1][-1]["x1"] > _SEGMENT_GAP_PT:
+            segments.append([ch])
+        else:
+            segments[-1].append(ch)
+    return segments
+
+
+def _detect_gutter(rows: list[list[list[dict]]], page_width: float) -> tuple[float, float] | None:
+    """rows: each row's character segments. Returns the gutter's (left, right)
+    x-extent, or None for a single-column page."""
+    if len(rows) < _MIN_COLUMN_ROWS or page_width <= 0:
+        return None
+    width = int(page_width) + 1
+    coverage = [0] * width
+    for segments in rows:
+        covered = set()
+        for seg in segments:
+            covered.update(range(max(0, int(seg[0]["x0"])), min(width, int(seg[-1]["x1"]) + 1)))
+        for x in covered:
+            coverage[x] += 1
+
+    lo, hi = int(page_width * _GUTTER_SEARCH[0]), int(page_width * _GUTTER_SEARCH[1])
+    threshold = max(1, len(rows) // 10)
+    best: tuple[int, int] | None = None
+    start = None
+    for x in range(lo, hi + 1):
+        if coverage[x] <= threshold:
+            start = x if start is None else start
+            if best is None or x - start > best[1] - best[0]:
+                best = (start, x)
+        else:
+            start = None
+    if best is None or best[1] - best[0] < _MIN_GUTTER_PT:
+        return None
+    left, right = float(best[0]), float(best[1])
+    both_sides = sum(
+        1
+        for segments in rows
+        if any(seg[-1]["x1"] <= left + 1 for seg in segments) and any(seg[0]["x0"] >= right - 1 for seg in segments)
+    )
+    if both_sides < max(3, len(rows) * 0.3):
+        return None  # e.g. a single column of short lines leaves the right side empty
+    return left, right
+
+
+def _most_common_x0(lines: list[dict], default: float) -> float:
+    counts: dict[float, int] = {}
+    for line in lines:
+        key = round(line["x0"], 0)
+        counts[key] = counts.get(key, 0) + 1
+    return max(counts, key=lambda k: counts[k]) if counts else default
+
+
+def _page_layout(page, exclude_bboxes: list, body_x0: float) -> dict:
+    """Lines of a page in reading order, excluding those inside tables or
+    figures. Each line carries "col" (-1 full width / single column, 0 left,
+    1 right) and "col_x0" (its column's left margin, for indent heuristics).
+    Also returns the gutter and the tops of full-width lines, which
+    `_reading_order_key` uses to place tables, figures and captions."""
+    by_top: dict[float, list] = {}
+    for ch in page.chars:
+        by_top.setdefault(round(ch["top"], 0), []).append(ch)
+    rows = []
+    for top in sorted(by_top):
+        line = _line_from_chars(by_top[top])
+        if not line["text"]:
+            continue
+        if any(_bbox_overlaps((line["x0"], line["top"], line["x1"], line["bottom"]), tb) for tb in exclude_bboxes):
+            continue
+        rows.append(_split_at_gaps(by_top[top]))
+
+    gutter = _detect_gutter(rows, float(page.width))
+    if gutter is None:
+        lines = [_line_from_chars([c for seg in segments for c in seg]) for segments in rows]
+        lines = [line for line in lines if line["text"]]
+        for line in lines:
+            line["col"], line["col_x0"] = -1, body_x0
+        return {"lines": lines, "gutter": None, "spanning_tops": []}
+
+    left_edge, right_edge = gutter
+    lines: list[dict] = []
+    for segments in rows:
+        if any(seg[0]["x0"] < left_edge - 1 and seg[-1]["x1"] > right_edge + 1 for seg in segments):
+            line = _line_from_chars([c for seg in segments for c in seg])
+            line["col"] = -1
+            lines.append(line)
+            continue
+        for col, side in ((0, [c for seg in segments if seg[-1]["x1"] <= right_edge for c in seg]),
+                          (1, [c for seg in segments if seg[-1]["x1"] > right_edge for c in seg])):
+            if side:
+                line = _line_from_chars(side)
+                if line["text"]:
+                    line["col"] = col
+                    lines.append(line)
+
+    spanning_tops = sorted(line["top"] for line in lines if line["col"] == -1)
+    layout = {"lines": lines, "gutter": gutter, "spanning_tops": spanning_tops}
+    col_x0 = {
+        col: _most_common_x0([line for line in lines if line["col"] == col], body_x0) for col in (-1, 0, 1)
+    }
+    for line in lines:
+        line["col_x0"] = body_x0 if line["col"] == -1 else col_x0[line["col"]]
+    lines.sort(key=lambda line: _reading_order_key(layout, (line["x0"], line["top"], line["x1"], line["bottom"])))
+    return layout
+
+
+def _reading_order_key(layout: dict, bbox: tuple[float, float, float, float]) -> tuple:
+    x0, top, x1, _bottom = bbox
+    gutter = layout["gutter"]
+    if gutter is None:
+        return (0, 0, top)
+    section = bisect.bisect_right(layout["spanning_tops"], top)
+    if x0 < gutter[0] - 1 and x1 > gutter[1] + 1:
+        col = -1
+    else:
+        col = 0 if (x0 + x1) / 2 < (gutter[0] + gutter[1]) / 2 else 1
+    return (section, col, top)
+
+
 def _classify_line(line: dict, body_size: float, body_x0: float) -> ElementType:
     if _CAPTION_PREFIX_RE.match(line["text"]):
         return ElementType.CAPTION
@@ -500,15 +651,8 @@ def _parse_pdf(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
                 figures = _extract_pdf_figures(page)
                 target_bboxes = [t["bbox"] for t in tables] + [f["bbox"] for f in figures]
 
-                lines = _group_chars_into_lines(page)
-                non_table_lines = [
-                    line
-                    for line in lines
-                    if not any(
-                        _bbox_overlaps((line["x0"], line["top"], line["x1"], line["bottom"]), tb)
-                        for tb in target_bboxes
-                    )
-                ]
+                layout = _page_layout(page, target_bboxes, body_x0)
+                non_table_lines = layout["lines"]
 
                 # Classify every remaining line; merge consecutive TEXT
                 # lines into one paragraph-level element (small vertical
@@ -557,8 +701,15 @@ def _parse_pdf(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
                     caption_buffer.clear()
 
                 prev_bottom = None
+                prev_col = None
                 for line in non_table_lines:
-                    kind = _classify_line(line, body_size, body_x0)
+                    if line["col"] != prev_col:
+                        # Never continue a paragraph or caption across columns.
+                        flush_text_buffer()
+                        flush_caption_buffer()
+                        prev_bottom = None
+                        prev_col = line["col"]
+                    kind = _classify_line(line, body_size, line["col_x0"])
                     line_height = line["bottom"] - line["top"] or 12.0
                     gap = (line["top"] - prev_bottom) if prev_bottom is not None else 0.0
 
@@ -623,12 +774,12 @@ def _parse_pdf(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
                     if target_idx is not None:
                         caption_ids_by_target_index.setdefault(target_idx, []).append(cap_id)
 
-                positioned: list[tuple[float, ParsedElement]] = []
+                positioned: list[tuple[tuple, ParsedElement]] = []
                 for t_idx, table in enumerate(tables):
                     element_counter += 1
                     positioned.append(
                         (
-                            table["bbox"][1],
+                            _reading_order_key(layout, table["bbox"]),
                             ParsedElement(
                                 element_type=ElementType.TABLE,
                                 page_number=page_number,
@@ -643,7 +794,7 @@ def _parse_pdf(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
                     element_counter += 1
                     positioned.append(
                         (
-                            figure["bbox"][1],
+                            _reading_order_key(layout, figure["bbox"]),
                             ParsedElement(
                                 element_type=ElementType.FIGURE,
                                 page_number=page_number,
@@ -659,7 +810,7 @@ def _parse_pdf(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
                     method = "explicit" if target_idx is not None else "none"
                     positioned.append(
                         (
-                            caption["bbox"][1],
+                            _reading_order_key(layout, caption["bbox"]),
                             ParsedElement(
                                 element_type=ElementType.CAPTION,
                                 page_number=page_number,
@@ -674,7 +825,7 @@ def _parse_pdf(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
                     element_counter += 1
                     positioned.append(
                         (
-                            el["bbox"][1],
+                            _reading_order_key(layout, el["bbox"]),
                             ParsedElement(
                                 element_type=el["type"],
                                 page_number=page_number,
