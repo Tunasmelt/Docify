@@ -39,6 +39,15 @@ from services.verifier import (
 # --- Fakes --------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _no_real_retry_backoff(monkeypatch):
+    # Transient Gemini errors are retried (services/gemini_retry.py); don't
+    # spend real seconds sleeping between attempts in unit tests.
+    from services import gemini_retry
+
+    monkeypatch.setattr(gemini_retry, "BACKOFF_SECONDS", (0.0, 0.0))
+
+
 class FakeUsageMetadata:
     def __init__(self, prompt_token_count=50, candidates_token_count=10):
         self.prompt_token_count = prompt_token_count
@@ -315,7 +324,8 @@ def test_verify_batch_one_failing_pair_does_not_contaminate_others():
         def __init__(self):
             self.models = SelectivelyFailingModels()
 
-    verifier = Verifier(client=SelectivelyFailingClient())
+    # A persistent 503 is retried (services/gemini_retry.py) before failing safe.
+    verifier = Verifier(client=SelectivelyFailingClient(), retry_sleep=lambda _s: None)
     pairs = [
         ("a working claim", _chunk(chunk_id="ok1")),
         ("a BROKEN claim", _chunk(chunk_id="broken")),
@@ -330,7 +340,7 @@ def test_verify_batch_one_failing_pair_does_not_contaminate_others():
     assert results[1].error is not None
     assert results[2].verdict == VerdictLabel.SUPPORTED
     assert results[2].error is None
-    assert len(call_log) == 3
+    assert len(call_log) == 5  # the broken pair is attempted 3 times (1 + 2 retries)
 
 
 # --- Part 1c: 2026-07-24 self-audit findings ------------------------------
@@ -499,10 +509,11 @@ def test_verify_batch_survives_two_poisoned_pairs_at_any_position(poisoned_posit
         label = "POISON" if i in poisoned_positions else "clean"
         pairs.append((f"{label} claim {i}", _chunk(chunk_id=f"c{i}")))
 
-    results = Verifier(client=SelectivelyFailingClient()).verify_batch(pairs)
+    results = Verifier(client=SelectivelyFailingClient(), retry_sleep=lambda _s: None).verify_batch(pairs)
 
     assert len(results) == 5
-    assert len(call_log) == 5
+    # Each persistently failing pair is attempted 3 times (1 + 2 retries).
+    assert len(call_log) == 5 + 2 * len(poisoned_positions)
     for i, result in enumerate(results):
         if i in poisoned_positions:
             assert result.verdict == VerdictLabel.UNVERIFIED, f"position {i} (poisoned) should fail safe"

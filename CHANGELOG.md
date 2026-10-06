@@ -6,6 +6,23 @@ Entry types: `feature` · `fix` · `decision` · `refactor` · `test` · `infra`
 
 ---
 
+## 2026-10-06 — fix: partly scanned OCR, section-aware chunks, tenant-safe vector search, unsupported-claim removal, Gemini retries, failed-document recovery UI
+
+**Phase:** 5
+**Feature:** n/a (fixes from the 2026-10-06 code review, "Next" group)
+**Changed:**
+- **OCR for partly scanned pages** (`services/parser.py`). OCR used to run only on pages with zero text, so a scan with a stray text layer (scanned.pdf page 1: a 13-character title over a full-page scan) lost its whole body. Pages with under 200 characters of text over an image covering half the page or more are now OCR'd too, and the OCR text replaces their thin text layer. OCR elements now stay in page order, and their bbox is in PDF points rather than image pixels. Verified with the real Tesseract tier: page 1's letter body is now recovered.
+- **Section headings in chunks** (`services/chunker.py`). Every heading starts a new chunk, so headings are no longer stranded at the end of the previous chunk. Continuation chunks, page-break chunks, tables and figures get their section heading prefixed (stored as `metadata.section_heading` too), which gives uncaptioned figures searchable text. A heading directly above a table or figure folds into that chunk. A grouped chunk's type now reflects its body (`text`/`list`), not its first heading.
+- **Tenant-safe vector search** (migration `20261006_002_vector_search_iterative_scan.sql`). The HNSW index returned ~40 nearest chunks across all tenants before the user/document filter; reproduced locally, another tenant's 400 nearby chunks left a user with 0 of their 5. `match_chunks_by_vector` now uses `hnsw.iterative_scan = strict_order`.
+- **Unsupported claims removed** (`routes/query.py`, both `/query` and `/query/stream`). A sentence whose citations were all judged unsupported is removed (not just un-cited), and the answer notes how many statements were removed. Mixed sentences keep their supported citation. `raw_content` keeps the original. Decision recorded in MEMORY.md.
+- **Gemini retries** (`services/gemini_retry.py`, generator, verifier). Transient 429/5xx/network failures are retried up to 3 attempts, honoring Gemini's `retryDelay` (1s/2s backoff otherwise), but never waiting more than 8s on an interactive request. Streaming only retries before the first token reaches the client. The embedder's retry-delay parsing now uses the same helper.
+- **Failed-document recovery UI** (`apps/web`). Failed documents show their error and a **Retry** button (`POST /reindex`). The card returns to processing and polling restarts; rate-limit and conflict errors show inline.
+**Verified:** Regression tests for each item fail on the old code and pass on the new: parser 4, chunker 8, retriever 1 (real HNSW scenario in local Postgres), query 7 + stream 1, Gemini retry 10, Playwright e2e 1 (real browser + local Supabase + local API). Existing tests that pinned the old behaviour were updated: OCR call counts (3 low-yield pages, not 2) and clean_digital.pdf chunk grouping. Full backend suite against local Supabase (placeholder API keys): 431 passed, 1 environmental failure (the Voyage tokenizer download is blocked by this environment's proxy). Web `tsc` and `next build` (ESLint) pass. In `upload.e2e.ts`, 4 of 6 pass; the other 2 need a real Voyage key to reach Ready, which this environment doesn't have (the tokenizer download is blocked by the proxy).
+**Deploy:** apply `20261006_001` and `20261006_002` to production before deploying.
+**Rollback:** revert the commit. Each migration's `-- ROLLBACK` block restores the previous function.
+
+---
+
 ## 2026-10-06 — fix: event-loop blocking, HTML/DOCX reading order, FTS any-term matching, table/figure quote grounding
 
 **Phase:** 5

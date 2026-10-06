@@ -250,6 +250,81 @@ def _extract_claim_spans(answer: str, cited_positions: set[int]) -> dict[int, st
     return spans
 
 
+_SENTENCE_WITH_SEPARATOR = re.compile(r"(?<=[.!?])(\s+)")
+_LEADING_MARKERS = re.compile(r"^((?:\s*\[[^\[\]]*\])+)\s*")
+_EMPTY_LIST_ITEM = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)])?\s*$")
+
+
+def _markers_in(text: str) -> list[int]:
+    return [
+        int(n.group())
+        for bracket in CITATION_BRACKET.finditer(text)
+        for n in CITATION_NUMBER.finditer(bracket.group(1))
+    ]
+
+
+def _has_prose(text: str) -> bool:
+    return bool(re.sub(r"[\s.,;:!?]", "", CITATION_BRACKET.sub("", text)))
+
+
+def _remove_unsupported_claims(answer: str, unsupported_positions: set[int]) -> tuple[str, int]:
+    """Removes every sentence whose citations were ALL judged unsupported by
+    the verifier — stripping only the [N] marker would leave the rejected
+    claim in the answer, now looking like ordinary uncited text. A sentence
+    that also cites a kept source stays (the kept source supports it); its
+    unsupported marker is stripped later by _strip_dropped_markers. Works
+    line by line so markdown lists keep their structure, and a marker-only
+    segment after a full stop ("Claim. [2]") counts for the sentence before
+    it. Returns (new_answer, number_of_sentences_removed)."""
+    if not unsupported_positions:
+        return answer, 0
+
+    removed = 0
+    out_lines: list[str] = []
+    for line in answer.split("\n"):
+        parts = _SENTENCE_WITH_SEPARATOR.split(line)
+        # parts alternates [sentence, separator, sentence, ...]; markers at the
+        # start of a segment are folded into the preceding sentence.
+        sentences: list[list[str]] = []  # [text, trailing_separator]
+        for i in range(0, len(parts), 2):
+            text = parts[i]
+            separator = parts[i + 1] if i + 1 < len(parts) else ""
+            leading = _LEADING_MARKERS.match(text) if sentences else None
+            if leading and _markers_in(leading.group(1)):
+                # "Claim. [2] Next sentence" — the markers belong to "Claim."
+                sentences[-1][0] += sentences[-1][1] + leading.group(1).strip()
+                sentences[-1][1] = " "
+                text = text[leading.end():]
+                if not text.strip():
+                    sentences[-1][1] = separator
+                    continue
+            sentences.append([text, separator])
+
+        kept_parts: list[str] = []
+        line_had_removal = False
+        for text, separator in sentences:
+            markers = _markers_in(text)
+            if markers and _has_prose(text) and all(m in unsupported_positions for m in markers):
+                removed += 1
+                line_had_removal = True
+                continue
+            kept_parts.append(text + separator)
+        new_line = "".join(kept_parts).rstrip()
+        if line_had_removal and _EMPTY_LIST_ITEM.match(new_line):
+            continue  # the whole line (e.g. a list item) was the unsupported claim
+        out_lines.append(new_line if line_had_removal else line)
+
+    return "\n".join(out_lines), removed
+
+
+def _note_removed_claims(answer: str, removed: int) -> str:
+    if not removed:
+        return answer
+    noun = "statement was" if removed == 1 else "statements were"
+    note = f"_{removed} {noun} removed because the cited source did not support {'it' if removed == 1 else 'them'}._"
+    return f"{answer.rstrip()}\n\n{note}" if answer.strip() else note
+
+
 def _strip_dropped_markers(answer: str, dropped_positions: set[int]) -> str:
     """Rewrites `[...]` brackets to remove only the dropped positions —
     NOT a naive per-marker string replace, since Gemini has been observed
@@ -449,6 +524,7 @@ def post_query(
     # answer with no matching citation object — a real, separate (non-
     # data-loss) bug found while adding these guards, fixed here too.
     dropped_positions: set[int] = set()
+    unsupported_positions: set[int] = set()
 
     verify_pairs: list[tuple[str, GeneratorChunk]] = []
     verify_positions: list[int] = []
@@ -539,6 +615,7 @@ def post_query(
 
         if verdict.verdict == VerdictLabel.UNSUPPORTED:
             dropped_positions.add(position)
+            unsupported_positions.add(position)
             continue
 
         # figure_path is only set on GeneratorChunk when figure_fetcher.py's
@@ -565,7 +642,9 @@ def post_query(
             )
         )
 
-    final_answer = _strip_dropped_markers(gen_result.answer, dropped_positions) if dropped_positions else gen_result.answer
+    pruned_answer, removed_claims = _remove_unsupported_claims(gen_result.answer, unsupported_positions)
+    final_answer = _strip_dropped_markers(pruned_answer, dropped_positions) if dropped_positions else pruned_answer
+    final_answer = _note_removed_claims(final_answer, removed_claims)
 
     latency_ms = int((time.perf_counter() - started) * 1000)
 
@@ -899,6 +978,7 @@ async def _stream_query_events(
         # add to the same set — see post_query's identical comment. Same
         # dangling-marker fix applied identically to both paths.
         dropped_positions: set[int] = set()
+        unsupported_positions: set[int] = set()
 
         verify_pairs: list[tuple[str, GeneratorChunk]] = []
         verify_positions: list[int] = []
@@ -967,6 +1047,7 @@ async def _stream_query_events(
 
             if verdict.verdict == VerdictLabel.UNSUPPORTED:
                 dropped_positions.add(position)
+                unsupported_positions.add(position)
                 continue
 
             figure_url = None
@@ -990,9 +1071,9 @@ async def _stream_query_events(
                 )
             )
 
-        final_answer = (
-            _strip_dropped_markers(final_result.answer, dropped_positions) if dropped_positions else final_result.answer
-        )
+        pruned_answer, removed_claims = _remove_unsupported_claims(final_result.answer, unsupported_positions)
+        final_answer = _strip_dropped_markers(pruned_answer, dropped_positions) if dropped_positions else pruned_answer
+        final_answer = _note_removed_claims(final_answer, removed_claims)
 
         latency_ms = int((time.perf_counter() - started) * 1000)
 

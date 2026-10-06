@@ -64,6 +64,11 @@ class Chunk:
     # "originally one element" even though they now have distinct
     # chunk_index values. None for every chunk that wasn't split.
     split_from_element_id: str | None = None
+    # The most recent heading before (or leading) this chunk's body, or None
+    # if no heading precedes it. Continuation chunks, tables and figures get
+    # it prefixed to `content`, so a chunk is findable by its section name
+    # and carries its context into generation and verification.
+    section_heading: str | None = None
 
 
 def _bbox_center(element: ParsedElement) -> tuple[float, float]:
@@ -251,6 +256,7 @@ def _split_oversized(chunk: Chunk, elements: list[ParsedElement]) -> list[Chunk]
             association_method=chunk.association_method,
             merged_caption_ids=chunk.merged_caption_ids,
             split_from_element_id=parent_element_id,
+            section_heading=chunk.section_heading,
         )
         for part in parts
     ]
@@ -286,23 +292,47 @@ class Chunker:
         pending_indices: list[int] = []
         pending_texts: list[str] = []
         pending_pages: list[int] = []
-        pending_type: ElementType | None = None
+        pending_types: list[ElementType] = []
+        # Heading in effect for the chunk being built, captured when its first
+        # element is added; `current_heading` tracks the latest heading seen.
+        pending_section: str | None = None
+        current_heading: str | None = None
+
+        def pending_is_only_headings() -> bool:
+            return bool(pending_types) and all(t == ElementType.HEADING for t in pending_types)
 
         def flush_pending() -> None:
             if not pending_indices:
                 return
+            body_types = [t for t in pending_types if t != ElementType.HEADING]
+            if not body_types:
+                chunk_type = ElementType.HEADING
+            elif all(t == ElementType.LIST for t in body_types):
+                chunk_type = ElementType.LIST
+            else:
+                chunk_type = ElementType.TEXT
+            content = "\n".join(pending_texts)
+            if pending_types[0] != ElementType.HEADING and pending_section:
+                content = f"{pending_section}\n{content}"
+            leading_headings = []
+            for t, text in zip(pending_types, pending_texts):
+                if t != ElementType.HEADING:
+                    break
+                leading_headings.append(text)
             chunks.append(
                 Chunk(
                     chunk_index=0,  # reassigned in the final numbering pass
-                    element_type=pending_type,
+                    element_type=chunk_type,
                     page_numbers=sorted(set(pending_pages)),
                     source_element_indices=list(pending_indices),
-                    content="\n".join(pending_texts),
+                    content=content,
+                    section_heading=leading_headings[-1] if leading_headings else pending_section,
                 )
             )
             pending_indices.clear()
             pending_texts.clear()
             pending_pages.clear()
+            pending_types.clear()
 
         already_merged_caption_ids: set[str] = set()
 
@@ -329,6 +359,17 @@ class Chunker:
                 continue
 
             if element.element_type in (ElementType.TABLE, ElementType.FIGURE):
+                # Headings directly above a table/figure become its prefix
+                # rather than a one-line chunk of their own.
+                leading_heading_indices: list[int] = []
+                leading_heading_texts: list[str] = []
+                if pending_is_only_headings():
+                    leading_heading_indices = list(pending_indices)
+                    leading_heading_texts = list(pending_texts)
+                    pending_indices.clear()
+                    pending_texts.clear()
+                    pending_pages.clear()
+                    pending_types.clear()
                 flush_pending()
                 caption_items = captions_for_target.get(element.element_id, [])
                 caption_texts = [c.content for _, c in caption_items]
@@ -336,14 +377,20 @@ class Chunker:
                 for cid in caption_ids:
                     already_merged_caption_ids.add(cid)
 
-                source_indices = [index] + [ci for ci, _ in caption_items]
+                source_indices = [index] + [ci for ci, _ in caption_items] + leading_heading_indices
                 pages = sorted({element.page_number, *(c.page_number for _, c in caption_items)})
 
+                if leading_heading_texts:
+                    section_lines = leading_heading_texts
+                else:
+                    section_lines = [current_heading] if current_heading else []
                 if element.element_type == ElementType.FIGURE:
-                    content = "\n".join(caption_texts)  # image itself carried separately, in `image`
+                    # Image carried separately, in `image`. The section heading
+                    # gives even an uncaptioned figure some searchable text.
+                    content = "\n".join([*section_lines, *caption_texts])
                     image = element.content
                 else:
-                    content = "\n\n".join([*caption_texts, element.content]) if caption_texts else element.content
+                    content = "\n\n".join([*section_lines, *caption_texts, element.content])
                     image = None
 
                 chunks.append(
@@ -356,6 +403,7 @@ class Chunker:
                         image=image,
                         association_method=caption_methods.get(element.element_id),
                         merged_caption_ids=caption_ids,
+                        section_heading=current_heading,
                     )
                 )
                 continue
@@ -365,9 +413,15 @@ class Chunker:
 
             candidate_texts = pending_texts + [element.content]
             crosses_page_boundary = pending_pages and element.page_number != pending_pages[-1]
-            if pending_indices and (
-                _approx_token_count("\n".join(candidate_texts)) > TOKEN_BUDGET or crosses_page_boundary
-            ):
+            is_heading = element.element_type == ElementType.HEADING
+            # A heading always starts a new chunk (unless it follows another
+            # heading), so it is never stranded at the end of the previous one.
+            # Leading headings stay with their body even past TOKEN_BUDGET.
+            starts_new_section = is_heading and not pending_is_only_headings()
+            over_budget = (
+                _approx_token_count("\n".join(candidate_texts)) > TOKEN_BUDGET and not pending_is_only_headings()
+            )
+            if pending_indices and (starts_new_section or over_budget or crosses_page_boundary):
                 # FEAT-020 (2026-07-27) real finding: without this, grouping
                 # freely crosses a page_number boundary, and
                 # db/queries.py's build_chunk_rows stores
@@ -386,10 +440,13 @@ class Chunker:
                 flush_pending()
 
             if not pending_indices:
-                pending_type = element.element_type
+                pending_section = current_heading
             pending_indices.append(index)
             pending_texts.append(element.content)
             pending_pages.append(element.page_number)
+            pending_types.append(element.element_type)
+            if is_heading:
+                current_heading = element.content
 
         flush_pending()
 

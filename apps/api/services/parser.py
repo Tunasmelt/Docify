@@ -1078,6 +1078,25 @@ def _parse_html(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
 # Parser — format dispatch + OCR fallback
 # ══════════════════════════════════════════════════════════════════════════
 
+# A page whose text layer is this short AND that is mostly one image is a
+# scan with a stray text layer (a title, a stamp) — OCR it. scanned.pdf's
+# page 1 is the real case: 13 characters over a full-page scan.
+_LOW_YIELD_MAX_CHARS = 200
+_SCANNED_PAGE_MIN_IMAGE_COVERAGE = 0.5
+_OCR_REPLACEABLE_TYPES = {ElementType.TEXT, ElementType.HEADING, ElementType.LIST, ElementType.CAPTION}
+
+
+def _largest_image_coverage(page) -> float:
+    page_area = float(page.width) * float(page.height)
+    if page_area <= 0:
+        return 0.0
+    largest = 0.0
+    for img in page.images:
+        area = max(0.0, img["x1"] - img["x0"]) * max(0.0, img["bottom"] - img["top"])
+        largest = max(largest, area / page_area)
+    return largest
+
+
 _EXTENSION_TO_FORMAT = {
     "pdf": "pdf",
     "docx": "docx",
@@ -1133,20 +1152,27 @@ class Parser:
         original FEAT-020 investigation and unchanged here.
         """
         with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-            total_pages = len(pdf.pages)
+            page_info = {
+                page.page_number: (float(page.width), float(page.height), _largest_image_coverage(page))
+                for page in pdf.pages
+            }
 
-        pages_with_textual_content = {
-            e.page_number for e in elements if e.element_type in _TEXTUAL_ELEMENT_TYPES
-        }
+        textual_chars_by_page: dict[int, int] = {}
+        for e in elements:
+            if e.element_type in _TEXTUAL_ELEMENT_TYPES and isinstance(e.content, str):
+                textual_chars_by_page[e.page_number] = textual_chars_by_page.get(e.page_number, 0) + len(e.content)
 
-        for page_number in range(1, total_pages + 1):
-            if page_number in pages_with_textual_content:
-                continue
+        for page_number, (width, height, image_coverage) in page_info.items():
+            textual_chars = textual_chars_by_page.get(page_number)
+            if textual_chars is not None and not (
+                textual_chars < _LOW_YIELD_MAX_CHARS and image_coverage >= _SCANNED_PAGE_MIN_IMAGE_COVERAGE
+            ):
+                continue  # a real text layer — no OCR needed
 
             page_image = _render_pdf_page_image(file_bytes, page_number)
             if page_image is None:
                 logger.warning(
-                    "parser: page %s has no textual elements and could not be rendered for OCR fallback",
+                    "parser: page %s is low-yield and could not be rendered for OCR fallback",
                     page_number,
                 )
                 continue
@@ -1180,16 +1206,29 @@ class Parser:
                 )
                 continue
 
-            width, height = page_image.size
+            if textual_chars is not None:
+                # A partly scanned page: OCR transcribes the whole page, including
+                # the few characters of text layer, so the OCR text replaces the
+                # page's text elements rather than duplicating them. Tables and
+                # figures detected on the page are kept.
+                elements = [
+                    e
+                    for e in elements
+                    if not (e.page_number == page_number and e.element_type in _OCR_REPLACEABLE_TYPES)
+                ]
+
             elements.append(
                 ParsedElement(
                     element_type=ElementType.TEXT,
                     page_number=page_number,
-                    bbox=BBox(x0=0.0, y0=0.0, x1=float(width), y1=float(height)),
+                    bbox=BBox(x0=0.0, y0=0.0, x1=width, y1=height),
                     content=recovered_text,
                     element_id=f"ocr-page-{page_number}",
                 )
             )
             logger.info("parser: OCR fallback recovered text on page %s via tier=%s", page_number, recovered_tier)
 
+        # Stable sort: OCR elements land at the end of their own page, not at
+        # the end of the document.
+        elements.sort(key=lambda e: e.page_number)
         return elements

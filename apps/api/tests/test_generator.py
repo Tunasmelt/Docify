@@ -34,6 +34,15 @@ from services.generator import (
 # --- Fakes --------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _no_real_retry_backoff(monkeypatch):
+    # Transient Gemini errors are retried (services/gemini_retry.py); don't
+    # spend real seconds sleeping between attempts in unit tests.
+    from services import gemini_retry
+
+    monkeypatch.setattr(gemini_retry, "BACKOFF_SECONDS", (0.0, 0.0))
+
+
 class FakeUsageMetadata:
     def __init__(self, prompt_token_count=100, candidates_token_count=20):
         self.prompt_token_count = prompt_token_count

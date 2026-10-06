@@ -38,6 +38,13 @@ export async function deleteDocument(id: string): Promise<void> {
   await apiFetch<void>(`/documents/${id}`, { method: "DELETE" });
 }
 
+/** Re-runs parsing + embedding for an existing document (POST /reindex) —
+ * the recovery path for a document that ended in `failed`. Resolves once
+ * the API has reset it to `parsing`; poll for the outcome. */
+export async function reindexDocument(id: string): Promise<IngestResponse> {
+  return apiFetch<IngestResponse>(`/reindex/${id}`, { method: "POST" });
+}
+
 /** Direct-to-Storage upload (ARCHITECTURE.md's ingest flow), then
  * POST /ingest with the resulting storage_path. The Storage SDK's
  * `upload()` is fetch-based internally (confirmed via its source — no

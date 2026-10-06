@@ -13,6 +13,8 @@ from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 
+from services.gemini_retry import call_with_retry
+
 from services.generator import GeneratorChunk
 
 logger = logging.getLogger(__name__)
@@ -181,8 +183,9 @@ def _fail_safe_verdict(verdict_label: VerdictLabel, model: str, error: str, late
 
 
 class Verifier:
-    def __init__(self, client: genai.Client | None = None):
+    def __init__(self, client: genai.Client | None = None, *, retry_sleep=time.sleep):
         self._client = client or _default_client()
+        self._retry_sleep = retry_sleep
 
     def verify(self, claim_text: str, chunk: GeneratorChunk) -> Verdict:
         if not claim_text or not claim_text.strip():
@@ -198,7 +201,11 @@ class Verifier:
 
         started = time.perf_counter()
         try:
-            response = self._client.models.generate_content(model=MODEL, contents=contents, config=config)
+            response = call_with_retry(
+                lambda: self._client.models.generate_content(model=MODEL, contents=contents, config=config),
+                what="verifier",
+                sleep_fn=self._retry_sleep,
+            )
         except APIError as exc:
             latency_ms = (time.perf_counter() - started) * 1000
             logger.warning("verifier: Gemini call failed — failing safe to UNVERIFIED: %s", exc)

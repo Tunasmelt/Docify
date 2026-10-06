@@ -112,6 +112,10 @@ Things tried and failed, or explicitly rejected during design. Do not retry with
 **Context:** Every route was `async def` while calling the synchronous Supabase client, and `POST /query` also called the synchronous retriever, Gemini, and verifier. An `async def` handler runs on the event loop, so one `/query` (5–10s) stalled every other request on the single worker, including `/health` and other users' SSE streams and their keepalives. Measured: `/health` waited 1.76s behind a 2s blocking `/query`.
 **Rule:** Handlers that touch blocking clients are plain `def`. An `async def` route must route each blocking call through `asyncio.to_thread`. `tests/test_event_loop.py` fails if a new route breaks this.
 
+### 2026-10-06 [claude-code] — Filtering after an HNSW index scan silently starves results; reproduce it with realistic vectors
+**Context:** `match_chunks_by_vector` filters by `user_id`/`document_ids`/provider, but pgvector's HNSW scan first returns the ~`ef_search` (40) nearest chunks across ALL tenants. With 400 of user B's chunks near the query, user A got 0 of their 5 chunks. Fixed with `hnsw.iterative_scan = strict_order` on the function (migration `20261006_002`).
+**Gotchas found while testing:** (1) the function-level `SET hnsw.*` is rejected ("permission denied to set parameter") unless pgvector's library is already loaded in the session — the migration touches `'[1]'::vector` first. (2) Synthetic test vectors that are identical, or orthogonal to everything else, degenerate the HNSW graph (nodes become unreachable), so even iterative scan returns nothing — use varied, realistic vectors (random noise around a direction) or the test proves nothing. (3) Dead index entries left by other tests (deleted rows, not yet vacuumed) made the same scenario pass or fail depending on test order; the regression test VACUUMs first and asserts a control query (iterative scan off) really is crowded out.
+
 ---
 
 ## §Open questions
@@ -233,6 +237,11 @@ Every fork, what was chosen, why. Append-only.
 **Chosen:** Document what actually happened. After gemini was dropped (2026-07-24), every commit was made by claude-code; claude-design and codex only appeared as one-off design references and external review passes. AGENT.md and ARCHITECTURE.md's Locked decisions now describe a single implementing agent plus optional external reviews.
 **Reasoning:** The lane rules (cross-lane HANDOFF suggestions, per-agent commit tags) were never exercised and made the process docs describe a workflow that doesn't exist. Confirmed by the project owner as part of the 2026-10-06 documentation review.
 **Changed:** `AGENT.md`, `.agent/ARCHITECTURE.md`, `.agent/MEMORY.md` (this entry).
+
+### 2026-10-06 [claude-code] — Unsupported claims are removed from the answer, with a note
+**Alternatives considered:** Strip only the `[N]` marker (previous behavior — left the rejected claim in the answer as ordinary-looking uncited text); return unsupported citations to the client and render a "not supported" chip (needs an API contract and UI change; contradicts the "unsupported is dropped" contract).
+**Chosen:** Remove any sentence whose citations were all judged unsupported, and append a short italic note with the count. Sentences that also cite a kept source stay (that source supports them). `raw_content` and the export keep the original text.
+**Reasoning:** The user never sees a claim the verifier rejected presented as fact, and is told something was removed. Backend-only; no contract break for clients.
 
 ---
 

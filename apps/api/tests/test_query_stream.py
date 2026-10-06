@@ -995,3 +995,31 @@ def test_stream_real_disconnect_during_verification_still_persists_consistently(
         assert len(citations) == 1
         assert citations[0]["verdict"] == "unverified", "the in-flight call's real fail-safe verdict must persist unmodified"
         assert citations[0]["message_id"] in {m["id"] for m in messages}
+
+
+# 2026-10-06: the stream's final answer removes unsupported claims too, same
+# rule as POST /query (see test_query.py's _remove_unsupported_claims tests).
+def test_stream_final_answer_removes_the_unsupported_sentence(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id = _ingest_doc_with_content(app_client, admin, user_id, token, "doc.pdf", "Revenue grew 12%.")
+    chunk_row = _real_chunk_row(admin, document_id)
+    final = GenerateStreamResult(
+        answer="The outlook is fabricated [1].", cited_indices=[1], hallucinated_markers=[],
+        model="gemini-3.6-flash", input_tokens=1, output_tokens=1, latency_ms=1.0,
+    )
+    _override(
+        retriever=FakeRetriever([_retrieved_chunk(document_id, chunk_row)]),
+        generator=FakeStreamingGenerator(["The outlook is fabricated [1]."], final),
+        verifier=type("V", (), {"verify_batch": staticmethod(lambda pairs: [_verdict(VerdictLabel.UNSUPPORTED, None) for _ in pairs])})(),
+    )
+
+    with app_client.stream(
+        "POST", "/query/stream", json={"question": "q", "document_ids": [document_id]},
+        headers={"Authorization": f"Bearer {token}"},
+    ) as response:
+        events = _parse_sse(response)
+
+    resolved = next(data for name, data in events if name == "citations-resolved")
+    assert "fabricated" not in resolved["answer"]
+    assert "1 statement was removed" in resolved["answer"]
+    assert resolved["citations"] == []

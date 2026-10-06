@@ -160,3 +160,19 @@ export const TINY_PNG_BASE64 =
 export function decodeBase64Png(): Buffer {
   return Buffer.from(TINY_PNG_BASE64, "base64");
 }
+
+/** A document whose processing already failed — the state the stuck-document
+ * reaper or a parse error leaves behind, and the one the Retry button
+ * recovers from. */
+export async function seedFailedDocument(userId: string, filename: string, error: string): Promise<string> {
+  const doc = await restInsert<{ id: string }>("documents", {
+    user_id: userId,
+    filename,
+    storage_path: `uploads/${userId}/${filename}`,
+    mime_type: "application/pdf",
+    size_bytes: 1,
+    status: "failed",
+    error,
+  });
+  return doc.id;
+}

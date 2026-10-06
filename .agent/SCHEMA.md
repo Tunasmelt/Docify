@@ -98,6 +98,8 @@ create index chunks_embedding_idx on chunks
 
 The frontend turns this into a display label in one place — `apps/web/lib/chat/parse-message.ts`'s `citationLocation()` (PDF → "page", PPTX → "slide", DOCX/HTML → omitted) — using `document_mime_type`, which the retrieval functions return alongside each chunk.
 
+**`metadata->>'section_heading'`** is the heading in effect for the chunk (also prefixed to `content` when the chunk doesn't start with it — see ARCHITECTURE.md's chunking decision).
+
 **`metadata->>'association_method'`** (`"explicit"` / `"heuristic"` / `"unmatched"` / null) records how a table/figure caption was linked to its element by the chunker. The retrieval functions return it and the API exposes it as `CitationResponse.association_method`; the frontend does not display it yet.
 
 ### `conversations`
@@ -223,7 +225,7 @@ PostgREST cannot express vector/FTS ranking or multi-table transactions, so thes
 
 | Function | Purpose | Defined / last changed |
 |---|---|---|
-| `match_chunks_by_vector(query_embedding, match_user_id, match_document_ids, match_limit, match_provider)` | Cosine search within one embedding provider; returns chunk + filename, mime type, association_method | `20260724_001`, `20260727_001`, `20260731_001`, `20260802_002` |
+| `match_chunks_by_vector(query_embedding, match_user_id, match_document_ids, match_limit, match_provider)` | Cosine search within one embedding provider (iterative HNSW scan, so filtering never starves results); returns chunk + filename, mime type, association_method | `20260724_001`, `20260727_001`, `20260731_001`, `20260802_002`, `20261006_002` |
 | `match_chunks_by_fts(query_text, match_user_id, match_document_ids, match_limit)` | Postgres FTS search; **any** question term matches, chunks matching more terms rank higher | `20260724_001`, `20260727_001`, `20260802_002`, `20261006_001` |
 | `fts_any_term_query(query_text)` | Builds an OR `tsquery` from the question's english-normalized lexemes; NULL (matches nothing) if the question is all stopwords | `20261006_001` |
 | `distinct_embedding_providers(match_user_id, match_document_ids)` | Which providers have chunks in a document scope | `20260731_001` |
@@ -324,5 +326,6 @@ Migrations up to `20260804_001` are applied to the production project; later one
 | `20260803_001_citation_verdict_unverified.sql` | FEAT-028 | Adds `'unverified'` to the `verdict` enum |
 | `20260804_001_avatars_bucket.sql` | FEAT-032 | Public-read `avatars` bucket with owner-scoped write policies |
 | `20261006_001_fts_any_term_matching.sql` | Fix | `match_chunks_by_fts` matches any question term instead of requiring all of them (`websearch_to_tsquery` ANDed every term, so natural-language questions rarely matched); adds `fts_any_term_query` |
+| `20261006_002_vector_search_iterative_scan.sql` | Fix | `match_chunks_by_vector` runs with `hnsw.iterative_scan = strict_order` so the tenant/document/provider filters can't leave a user with fewer results than exist (the HNSW index returned ~40 nearest chunks across all tenants before filtering) |
 
 Account deletion (FEAT-035) needed no migration: all 6 user-scoped tables already cascade on `auth.users` deletion, and Storage cleanup is done in application code.

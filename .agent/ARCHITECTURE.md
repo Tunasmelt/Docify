@@ -105,8 +105,10 @@ The browser talks to FastAPI directly (`NEXT_PUBLIC_API_URL`, `apps/web/lib/api/
 4. FastAPI creates the documents row (status='uploaded'), returns 202, and continues in a
    BackgroundTask:
    a. Downloads the file from Storage (service-role client)
-   b. Parses → typed elements (text, tables, figures, headings) with page/slide + bbox
-      (status='parsing'); low-yield PDF pages go through the OCR fallback chain
+   b. Parses → typed elements (text, tables, figures, headings) with page/slide + bbox,
+      in document order (status='parsing'). A PDF page goes through the OCR fallback
+      chain if it has no text, or under 200 characters of text over a scan image covering
+      half the page or more; the OCR text then replaces that page's thin text layer
    c. Uploads cropped figures to Storage: figures/{user_id}/{document_id}/{figure}.png
    d. Chunks elements (services/chunker.py — see Locked decisions)
    e. Embeds chunks with Voyage; a batch whose Voyage retries are exhausted falls back to
@@ -128,7 +130,8 @@ The browser talks to FastAPI directly (`NEXT_PUBLIC_API_URL`, `apps/web/lib/api/
    a. Finds which embedding provider(s) have chunks in the document_ids scope (almost
       always just "voyage")
    b. Embeds the question once PER provider present and runs that provider's own vector
-      search (filtered by user_id, document_ids, embedding_provider). Vectors from
+      search (filtered by user_id, document_ids, embedding_provider; the HNSW scan is
+      iterative, so other tenants' chunks can't crowd a user's own out of the results). Vectors from
       different providers are never compared — see MEMORY.md §Anti-patterns 2026-07-31
    c. Runs one Postgres FTS search in parallel — any question term matches; chunks
       matching more terms rank higher (fts_any_term_query)
@@ -137,7 +140,10 @@ The browser talks to FastAPI directly (`NEXT_PUBLIC_API_URL`, `apps/web/lib/api/
       back to RRF's order
    f. Builds the prompt: system instruction + numbered chunks [1]..[k] + up to the last 5
       conversation turns + the question
-   g. Calls Gemini 3.6 Flash; the answer contains inline [N] markers
+   g. Calls Gemini 3.6 Flash; the answer contains inline [N] markers. Transient Gemini
+      failures (429/5xx/network) are retried up to 3 attempts, honoring the server's
+      retryDelay but never waiting more than 8s (services/gemini_retry.py); the same
+      applies to each verification call
    h. Maps markers back to chunk IDs, recovering claim spans (sentence → wider spans)
    i. Runs the verify flow on each cited claim
    j. Persists conversation + messages + citations atomically (create_query_turn RPC)
@@ -158,8 +164,11 @@ For each (claim_span, cited_chunk_id) pair:
 4. Treatment:
    - supported / partial / unverified: returned to the client, each with distinct chip
      styling (solid / dotted-amber / dashed-muted)
-   - unsupported: dropped from the response and its [N] marker stripped from the answer
-     text (_strip_dropped_markers, routes/query.py)
+   - unsupported: dropped from the response. A sentence whose citations were ALL judged
+     unsupported is removed from the answer, and a note says how many statements were
+     removed (_remove_unsupported_claims, routes/query.py). A sentence that also cites a
+     kept source stays, with only the unsupported [N] marker stripped. `raw_content` keeps
+     the original text
 5. All verdicts, including unsupported, are persisted to `citations` for audit. The only
    place unsupported citations surface is GET /export/conversations.
 ```
@@ -263,7 +272,7 @@ Changing any of these requires human confirmation.
 - [x] **Voyage multimodal-3.5 for embeddings**, with a per-chunk Gemini embedding-2 fallback. CLIP-style models rejected (modality gap).
 - [x] **Gemini for generation + verification.** 3.6 Flash + 3.5 Flash-Lite — one LLM provider.
 - [x] **Single-agent workflow.** The original four-agent lane model (claude-code / claude-design / gemini / codex) was retired in practice: gemini was dropped 2026-07-24 and every commit since has been made by claude-code. AGENT.md describes the current workflow; external review passes (e.g. Codex reviews under `.agent/reviews/`) are still welcome as one-off audits.
-- [x] **Chunking: element-boundary-respecting, not fixed-token.** `services/chunker.py` groups adjacent text/heading/list elements toward `TOKEN_BUDGET` (~500 tokens), keeps tables and figures as their own chunks, and only splits an element larger than `MAX_CHUNK_TOKENS` (4000) — by table row or by paragraph/sentence, never mid-row.
+- [x] **Chunking: element-boundary-respecting, not fixed-token.** `services/chunker.py` groups adjacent text/heading/list elements toward `TOKEN_BUDGET` (~500 tokens), keeps tables and figures as their own chunks, and only splits an element larger than `MAX_CHUNK_TOKENS` (4000) — by table row or by paragraph/sentence, never mid-row. Every heading starts a new chunk; a chunk that doesn't start with its heading (a continuation, a page break, a table or figure) gets the current section heading prefixed to its content, so it's findable by section name. Headings directly above a table or figure fold into that chunk.
 - [x] **Rerank: opt-in, default off.** RRF alone put the expected chunk in the top 5 on 4/4 fixture questions; rerank added ~380ms with no measured gain. Exposed as a user preference.
 - [x] **No query-time query rewriting.** Prior turns go into the generation prompt only; retrieval uses the raw current question. A follow-up with no overlap with its target content may retrieve poorly — a known, accepted limitation.
 - [x] **Document status: polling, not Supabase realtime.**

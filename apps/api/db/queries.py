@@ -123,6 +123,7 @@ def build_chunk_rows(
                     "association_method": chunk.association_method,
                     "merged_caption_ids": chunk.merged_caption_ids,
                     "split_from_element_id": chunk.split_from_element_id,
+                    "section_heading": chunk.section_heading,
                 },
             }
         )

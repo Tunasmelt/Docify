@@ -1709,3 +1709,94 @@ def test_real_two_turn_conversation_uses_first_turns_context_to_answer_the_secon
     # so a context-aware answer should reference 4.42 and/or note no
     # change between the two years.
     assert "4.42" in turn2["answer"] or "same" in turn2["answer"].lower() or "no change" in turn2["answer"].lower()
+
+
+# --- Unsupported claims are removed, not just un-cited (2026-10-06) ----------
+# Dropping an unsupported citation used to strip only its [N] marker, leaving
+# the claim the verifier had rejected in the answer — now looking like plain,
+# uncited text. A sentence whose every citation was rejected is now removed,
+# and the answer says how many statements were removed.
+
+from routes.query import _remove_unsupported_claims  # noqa: E402
+
+
+def test_sentence_citing_only_unsupported_sources_is_removed():
+    answer, removed = _remove_unsupported_claims("Revenue grew 12% [1]. The outlook is fabricated [2].", {2})
+
+    assert answer == "Revenue grew 12% [1]."
+    assert removed == 1
+
+
+def test_sentence_with_a_kept_citation_is_not_removed():
+    answer, removed = _remove_unsupported_claims("Revenue grew 12% [1][2]. Costs fell [1].", {2})
+
+    assert answer == "Revenue grew 12% [1][2]. Costs fell [1]."
+    assert removed == 0
+
+
+def test_marker_after_the_full_stop_counts_for_the_preceding_sentence():
+    answer, removed = _remove_unsupported_claims("Costs fell [1]. Profit tripled. [2] Margins held [1].", {2})
+
+    assert answer == "Costs fell [1]. Margins held [1]."
+    assert removed == 1
+
+
+def test_removed_list_item_leaves_no_empty_bullet():
+    answer, removed = _remove_unsupported_claims("Highlights:\n- Revenue grew [1].\n- Profit tripled [2].\n- Costs fell [1].", {2})
+
+    assert answer == "Highlights:\n- Revenue grew [1].\n- Costs fell [1]."
+    assert removed == 1
+
+
+def test_sentence_without_unsupported_markers_is_untouched():
+    text = "Revenue grew [1]. Context without a citation."
+    assert _remove_unsupported_claims(text, {2}) == (text, 0)
+
+
+def test_post_query_removes_the_unsupported_sentence_and_notes_it(app_client, admin, user_a):
+    user_id, token = user_a
+    document_id = _ingest_doc_with_content(app_client, admin, user_id, token, "doc.pdf", "Revenue grew 12%.")
+    supported_row = _real_chunk_row(admin, document_id)
+    other_doc = _ingest_doc_with_content(app_client, admin, user_id, token, "other.pdf", "Unrelated text.")
+    unsupported_row = _real_chunk_row(admin, other_doc)
+
+    retrieved = [
+        RetrievedChunk(
+            chunk_id=row["id"], content=row["content"], page=1, document_id=doc, document_name=name,
+            document_mime_type="application/pdf", element_type="text", score=0.9,
+        )
+        for row, doc, name in ((supported_row, document_id, "doc.pdf"), (unsupported_row, other_doc, "other.pdf"))
+    ]
+    _override(
+        retriever=FakeRetriever(retrieved),
+        generator=FakeGenerator(
+            GenerateResult(
+                answer="Revenue grew 12% [1]. The outlook is fabricated [2].", cited_indices=[1, 2],
+                hallucinated_markers=[], model="gemini-3.6-flash", input_tokens=1, output_tokens=1, latency_ms=1.0,
+            )
+        ),
+        verifier=FakeVerifier(
+            {
+                supported_row["id"]: _verdict(VerdictLabel.SUPPORTED, "Revenue grew 12%"),
+                unsupported_row["id"]: _verdict(VerdictLabel.UNSUPPORTED, None),
+            }
+        ),
+    )
+
+    body = app_client.post(
+        "/query", json={"question": "q", "document_ids": [document_id, other_doc]},
+        headers={"Authorization": f"Bearer {token}"},
+    ).json()
+
+    assert "fabricated" not in body["answer"]
+    assert body["answer"].startswith("Revenue grew 12% [1].")
+    assert "1 statement was removed" in body["answer"]
+    assert [c["marker"] for c in body["citations"]] == [1]
+
+
+def test_note_alone_when_every_statement_was_removed():
+    from routes.query import _note_removed_claims
+
+    answer, removed = _remove_unsupported_claims("Only claim [2].", {2})
+    assert _note_removed_claims(answer, removed) == "_1 statement was removed because the cited source did not support it._"
+    assert _note_removed_claims("Kept [1].", 2).endswith("\n\n_2 statements were removed because the cited source did not support them._")

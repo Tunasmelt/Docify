@@ -16,6 +16,7 @@ import {
   ApiError,
   deleteDocument,
   listDocuments,
+  reindexDocument,
   type ApiDocument,
 } from "@/lib/api/documents";
 import type { DocumentStatus } from "@/lib/status-styles";
@@ -47,6 +48,7 @@ function toCardData(doc: ApiDocument): DocumentCardData {
     pages: doc.page_count,
     date: formatDocDate(doc.created_at),
     status: doc.status,
+    error: doc.error,
   };
 }
 
@@ -60,6 +62,8 @@ export default function DocumentsPage() {
   const [deleteId, setDeleteId] = React.useState<string | null>(null);
   const [deleteError, setDeleteError] = React.useState<string | null>(null);
   const [deleting, setDeleting] = React.useState(false);
+  const [retryingId, setRetryingId] = React.useState<string | null>(null);
+  const [retryError, setRetryError] = React.useState<string | null>(null);
   const [mobileMenuOpen, setMobileMenuOpen] = React.useState(false);
   const [selectedIds, setSelectedIds] = React.useState<string[]>([]);
 
@@ -211,6 +215,28 @@ export default function DocumentsPage() {
     }
   }
 
+  async function handleRetryDocument(id: string) {
+    setRetryError(null);
+    setRetryingId(id);
+    try {
+      await reindexDocument(id);
+      commitDocs(docs.map((d) => (d.id === id ? { ...d, status: "parsing", error: null } : d)));
+      startPolling();
+    } catch (err) {
+      if (err instanceof ApiError && err.code === "RATE_LIMITED") {
+        setRetryError("Too many processing requests right now — wait a minute and try again.");
+      } else if (err instanceof ApiError && err.code === "CONFLICT") {
+        setRetryError("This document is already being processed.");
+      } else if (err instanceof ApiError) {
+        setRetryError(err.message);
+      } else {
+        setRetryError("Couldn't retry this document. Try again.");
+      }
+    } finally {
+      setRetryingId(null);
+    }
+  }
+
   async function handleRetryLoad() {
     setLoading(true);
     setLoadError(null);
@@ -301,6 +327,11 @@ export default function DocumentsPage() {
 
             {loading ? (
               <div className="mt-10">
+                {retryError ? (
+                  <p role="alert" className="m-0 mb-2 px-[18px] text-sm text-destructive">
+                    {retryError}
+                  </p>
+                ) : null}
                 <div className="overflow-hidden rounded-lg border border-line bg-drop-bg">
                   {[0, 1, 2].map((i) => (
                     <div
@@ -347,6 +378,8 @@ export default function DocumentsPage() {
                       onDelete={setDeleteId}
                       selected={selectedIds.includes(doc.id)}
                       onToggleSelect={toggleSelect}
+                      onRetry={handleRetryDocument}
+                      retrying={retryingId === doc.id}
                     />
                   ))}
                 </div>

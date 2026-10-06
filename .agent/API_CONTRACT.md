@@ -281,7 +281,7 @@ Ask a question over one or more documents.
 - `verdict` is one of `supported` | `partial` | `unsupported` | `unverified` (see ARCHITECTURE.md §Verify flow):
   - `supported` — kept; the answer keeps its `[N]` marker.
   - `partial` — kept; the source backs only part of the claim (marker 3 above confirms broad growth but not "international demand"). Clients render it with a warning style.
-  - `unsupported` — **dropped** from `citations`, and its `[N]` marker is stripped from `answer`. Still persisted for audit.
+  - `unsupported` — **dropped** from `citations`. A sentence whose citations were all unsupported is **removed** from `answer`, and `answer` ends with a note such as `_1 statement was removed because the cited source did not support it._`. If the sentence also cites a kept source, only the unsupported `[N]` marker is stripped. Still persisted for audit (`raw_content` keeps the original text).
   - `unverified` — kept, `supporting_quote` is always `null`. Verification itself could not run (Gemini error/timeout/malformed response) — never used as a substitute for `unsupported`. Clients must style it distinctly from both `supported` and `partial` (`components/chat/citation-marker.tsx`).
 - **`figure_url`** — only on `element_type: "figure"` citations: a signed Storage URL valid for 600s, generated fresh on every read (live or historical). Omitted (not `null`) otherwise. If the figure fetch fails server-side the citation is downgraded to `element_type: "text"` with no `figure_url`.
 - **`page_number`** — depends on the source format: a real page for PDF, a slide number for PPTX, and always `1` (no location available) for DOCX/HTML. Use `document_mime_type` to interpret it; `lib/chat/parse-message.ts`'s `citationLocation()` renders "Page N", "Slide N", or nothing.
@@ -292,7 +292,7 @@ Ask a question over one or more documents.
 **Errors:**
 - `403 FORBIDDEN` if any `document_ids` don't belong to user
 - `422 VALIDATION_ERROR` if `document_ids` empty or `question` empty
-- `502 GENERATE_FAILED` if the Gemini generation call fails
+- `502 GENERATE_FAILED` if the Gemini generation call fails. Transient failures (429/5xx/network) are retried first, up to 3 attempts in total, waiting at most 8s per retry
 - `404 NOT_FOUND` if `conversation_id` doesn't exist or isn't the caller's
 - `429 RATE_LIMITED` — **3/minute** and **40/day** per user, one combined counter shared with `POST /query/stream`. Each call uses one Voyage query embedding (shared 3 RPM ceiling), one Gemini 3.6 Flash call, and Gemini 3.5 Flash-Lite verification calls. Reasoning in `routes/query.py`.
 

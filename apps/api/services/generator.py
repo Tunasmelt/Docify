@@ -1,12 +1,16 @@
+import asyncio
 import logging
 import os
 import re
 import time
 from dataclasses import dataclass
 
+import httpx
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
+
+from services.gemini_retry import call_with_retry, call_with_retry_async
 
 logger = logging.getLogger(__name__)
 
@@ -247,8 +251,10 @@ def _parse_citations(answer: str, num_chunks: int) -> tuple[list[int], list[int]
 
 
 class Generator:
-    def __init__(self, client: genai.Client | None = None):
+    def __init__(self, client: genai.Client | None = None, *, retry_sleep=time.sleep, async_retry_sleep=asyncio.sleep):
         self._client = client or _default_client()
+        self._retry_sleep = retry_sleep
+        self._async_retry_sleep = async_retry_sleep
 
     def generate(
         self, question: str, chunks: list[GeneratorChunk], history: list[dict] | None = None
@@ -284,8 +290,12 @@ class Generator:
 
         started = time.perf_counter()
         try:
-            response = self._client.models.generate_content(model=MODEL, contents=contents, config=config)
-        except APIError as exc:
+            response = call_with_retry(
+                lambda: self._client.models.generate_content(model=MODEL, contents=contents, config=config),
+                what="generator",
+                sleep_fn=self._retry_sleep,
+            )
+        except (APIError, httpx.TransportError) as exc:
             raise GenerationError(f"Gemini generation failed: {exc}") from exc
         latency_ms = (time.perf_counter() - started) * 1000
 
@@ -334,15 +344,38 @@ class Generator:
         started = time.perf_counter()
         answer_parts: list[str] = []
         last_response = None
-        try:
+        async def open_stream():
+            # Opens the stream and reads its first chunk. Transient failures up
+            # to this point are retried; once text has reached the client, a
+            # failure can't be retried without duplicating it.
             stream = await self._client.aio.models.generate_content_stream(model=MODEL, contents=contents, config=config)
-            async for response_chunk in stream:
-                last_response = response_chunk
-                delta = response_chunk.text
-                if delta:
-                    answer_parts.append(delta)
-                    yield delta
-        except APIError as exc:
+            iterator = stream.__aiter__()
+            try:
+                first = await iterator.__anext__()
+            except StopAsyncIteration:
+                first = None
+            return iterator, first
+
+        try:
+            iterator, first = await call_with_retry_async(
+                open_stream, what="streaming generator", sleep_fn=self._async_retry_sleep
+            )
+            if first is not None:
+                pending = [first]
+                while True:
+                    if pending:
+                        response_chunk = pending.pop()
+                    else:
+                        try:
+                            response_chunk = await iterator.__anext__()
+                        except StopAsyncIteration:
+                            break
+                    last_response = response_chunk
+                    delta = response_chunk.text
+                    if delta:
+                        answer_parts.append(delta)
+                        yield delta
+        except (APIError, httpx.TransportError) as exc:
             raise GenerationError(f"Gemini streaming generation failed: {exc}") from exc
         latency_ms = (time.perf_counter() - started) * 1000
 
