@@ -356,40 +356,48 @@ def _document_body_font_size(pdf) -> float:
     return max(sizes, key=lambda s: sizes[s])
 
 
-def _group_chars_into_lines(page) -> list[dict]:
-    """Groups a page's characters into visual lines by vertical position —
-    pdfplumber's own primitive (page.chars) has no line concept built in.
-    Each line carries its text, bbox, average font size, and whether every
-    character in it is bold (by font name — pdfplumber doesn't expose a
-    separate bold flag)."""
-    lines: dict[float, list] = {}
-    for ch in page.chars:
-        key = round(ch["top"], 0)
-        lines.setdefault(key, []).append(ch)
+def _text_from_chars(chars: list[dict]) -> str:
+    """Recover word spaces encoded as glyph positions rather than characters.
 
-    result = []
-    for top in sorted(lines.keys()):
-        chars = sorted(lines[top], key=lambda c: c["x0"])
-        text = "".join(c["text"] for c in chars).strip()
-        if not text:
-            continue
-        x0 = chars[0]["x0"]
-        x1 = chars[-1]["x1"]
-        bottom = max(c["bottom"] for c in chars)
-        avg_size = sum(c["size"] for c in chars) / len(chars)
-        is_bold = all("bold" in c["fontname"].lower() for c in chars)
-        result.append(
-            {
-                "text": text,
-                "top": top,
-                "bottom": bottom,
-                "x0": x0,
-                "x1": x1,
-                "size": avg_size,
-                "bold": is_bold,
-            }
-        )
-    return result
+    TeX PDFs often omit literal spaces. A size-relative gap distinguishes
+    word boundaries from kerning, while existing spaces stay untouched.
+    """
+    parts: list[str] = []
+    previous = None
+    for char in sorted(chars, key=lambda c: c["x0"]):
+        if previous is not None:
+            gap = char["x0"] - previous["x1"]
+            tolerance = max(0.5, min(previous["size"], char["size"]) * 0.15)
+            if gap > tolerance and not previous["text"].isspace() and not char["text"].isspace():
+                parts.append(" ")
+        parts.append(char["text"])
+        previous = char
+    return "".join(parts).strip()
+
+
+def _char_rows(page) -> list[list[dict]]:
+    """Group by text baseline, not font-dependent glyph top.
+
+    Bold labels and inline math have different glyph tops on the same
+    baseline. Allow small baseline shifts for subscripts/superscripts.
+    """
+    def baseline(char):
+        matrix = char.get("matrix")
+        return -float(matrix[5]) if matrix is not None else float(char["top"])
+
+    rows: list[list[dict]] = []
+    row_baseline = None
+    for char in sorted(page.chars, key=baseline):
+        value = baseline(char)
+        if row_baseline is None or value - row_baseline > 3.0:
+            rows.append([])
+            row_baseline = value
+        rows[-1].append(char)
+    return rows
+
+
+def _group_chars_into_lines(page) -> list[dict]:
+    return [line for chars in _char_rows(page) if (line := _line_from_chars(chars))["text"]]
 
 
 # ── Column layout ─────────────────────────────────────────────────────────
@@ -400,7 +408,7 @@ def _group_chars_into_lines(page) -> list[dict]:
 # at the gutter and read column by column. A line that crosses the gutter (a
 # title, a full-width heading) starts a new section: within each section the
 # left column is read before the right.
-_SEGMENT_GAP_PT = 12.0  # a horizontal gap this wide inside a row separates columns
+_SEGMENT_GAP_PT = 6.0  # must be smaller than the minimum detectable gutter
 _MIN_GUTTER_PT = 8.0
 _MIN_COLUMN_ROWS = 6
 _GUTTER_SEARCH = (0.25, 0.75)  # gutter must lie in this horizontal band of the page
@@ -409,7 +417,7 @@ _GUTTER_SEARCH = (0.25, 0.75)  # gutter must lie in this horizontal band of the 
 def _line_from_chars(chars: list[dict]) -> dict:
     chars = sorted(chars, key=lambda c: c["x0"])
     return {
-        "text": "".join(c["text"] for c in chars).strip(),
+        "text": _text_from_chars(chars),
         "top": min(c["top"] for c in chars),
         "bottom": max(c["bottom"] for c in chars),
         "x0": chars[0]["x0"],
@@ -455,15 +463,15 @@ def _detect_gutter(rows: list[list[list[dict]]], page_width: float) -> tuple[flo
                 best = (start, x)
         else:
             start = None
-    if best is None or best[1] - best[0] < _MIN_GUTTER_PT:
+    if best is None or best[1] - best[0] + 1 < _MIN_GUTTER_PT:
         return None
     left, right = float(best[0]), float(best[1])
-    both_sides = sum(
-        1
-        for segments in rows
-        if any(seg[-1]["x1"] <= left + 1 for seg in segments) and any(seg[0]["x0"] >= right - 1 for seg in segments)
-    )
-    if both_sides < max(3, len(rows) * 0.3):
+    # Columns need not share baselines: TeX lists and inline mathematics
+    # routinely offset one column's rows from the other. Count sustained
+    # text on each side independently instead of requiring aligned rows.
+    left_rows = sum(any(seg[-1]["x1"] <= left + 1 for seg in segments) for segments in rows)
+    right_rows = sum(any(seg[0]["x0"] >= right - 1 for seg in segments) for segments in rows)
+    if min(left_rows, right_rows) < max(3, len(rows) * 0.3):
         return None  # e.g. a single column of short lines leaves the right side empty
     return left, right
 
@@ -482,17 +490,14 @@ def _page_layout(page, exclude_bboxes: list, body_x0: float) -> dict:
     1 right) and "col_x0" (its column's left margin, for indent heuristics).
     Also returns the gutter and the tops of full-width lines, which
     `_reading_order_key` uses to place tables, figures and captions."""
-    by_top: dict[float, list] = {}
-    for ch in page.chars:
-        by_top.setdefault(round(ch["top"], 0), []).append(ch)
     rows = []
-    for top in sorted(by_top):
-        line = _line_from_chars(by_top[top])
+    for chars in _char_rows(page):
+        line = _line_from_chars(chars)
         if not line["text"]:
             continue
         if any(_bbox_overlaps((line["x0"], line["top"], line["x1"], line["bottom"]), tb) for tb in exclude_bboxes):
             continue
-        rows.append(_split_at_gaps(by_top[top]))
+        rows.append(_split_at_gaps(chars))
 
     gutter = _detect_gutter(rows, float(page.width))
     if gutter is None:

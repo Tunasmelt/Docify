@@ -49,7 +49,7 @@ export function SourcePanel({ citation, onClose, onOpenInDocument }: SourcePanel
         </button>
       </div>
       <div className="px-5 pb-8">
-        <h3 className="m-0 font-serif text-lg font-medium leading-snug">
+        <h3 className="m-0 break-words font-serif text-lg font-medium leading-snug">
           {citation.documentName}
         </h3>
         {location ? (
@@ -93,7 +93,7 @@ export function SourcePanel({ citation, onClose, onOpenInDocument }: SourcePanel
             ) : null}
           </figure>
         ) : null}
-        <blockquote className="m-0 mt-5 border-l-2 border-border pl-4 font-serif text-[15px] leading-[1.7] text-muted">
+        <blockquote className="m-0 mt-5 whitespace-pre-line break-words border-l-2 border-border pl-4 font-serif text-[15px] leading-[1.7] text-muted">
           {citation.excerpt}
         </blockquote>
         {/* PDFs open the rendered page; other formats open the cited slide or

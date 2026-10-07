@@ -1351,3 +1351,59 @@ def test_continuation_chunk_is_a_self_contained_table_on_its_own_page():
     assert continuation.page_numbers == [2]  # citations still point at the page it's on
     assert "| Region | Units | Revenue |" in continuation.content
     assert "North 1" not in continuation.content
+
+
+def test_positioned_pdf_words_keep_spaces_without_literal_space_glyphs():
+    # TeX commonly draws separate words with a positioning gap and no space.
+    doc = Parser(ocr_tiers=[]).parse(_text_pdf([(72, 700, "embedding"), (125, 700, "space"), (72, 680, "Document"), (120, 680, "Retrieval")]), filename="positioned.pdf")
+    text = "\n".join(e.content for e in doc.elements)
+    assert "embedding space" in text
+    assert "Document Retrieval" in text
+    assert "embeddingspace" not in text
+
+
+def test_pdf_spacing_preserves_kerning_and_existing_spaces():
+    from services.parser import _text_from_chars
+    def char(text, x0, x1):
+        return {"text": text, "x0": x0, "x1": x1, "size": 10}
+    assert _text_from_chars([char("R", 0, 6), char("A", 6.3, 12), char("G", 12, 18)]) == "RAG"
+    assert _text_from_chars([char("RAG", 0, 18), char(" ", 18, 21), char("retrieval", 21, 55)]) == "RAG retrieval"
+    assert _text_from_chars([char("RAG", 0, 18), char("retrieval", 21, 55)]) == "RAG retrieval"
+
+
+def test_two_columns_with_staggered_baselines_are_not_interleaved():
+    lines = []
+    for row in range(9):
+        lines.append((72, 700 - row * 14, f"Left retrieval step {row}"))
+        lines.append((330, 694 - row * 14, f"Right generation step {row}"))
+    doc = Parser(ocr_tiers=[]).parse(_text_pdf(lines), filename="staggered.pdf")
+    text = "\n".join(e.content for e in doc.elements)
+    assert text.index("Left retrieval step 8") < text.index("Right generation step 0")
+    assert "Left retrieval step 0" in text and "Right generation step 8" in text
+
+
+def test_narrow_pdf_column_gutter_is_detected():
+    lines = []
+    for row in range(9):
+        lines.append((72, 700 - row * 14, "x" * 43 + str(row)))
+        lines.append((303.5, 700 - row * 14, f"Right generation step {row} continues with source context."))
+    doc = Parser(ocr_tiers=[]).parse(_text_pdf(lines), filename="narrow-columns.pdf")
+    text = "\n".join(e.content for e in doc.elements)
+    assert text.index("x" * 43 + "8") < text.index("Right generation step 0")
+
+
+def test_mixed_font_labels_and_subscripts_stay_in_visual_line_order():
+    from types import SimpleNamespace
+    from services.parser import _group_chars_into_lines
+    def glyph(text, x0, x1, top, baseline, size=10):
+        return {"text": text, "x0": x0, "x1": x1, "top": top, "bottom": top + size, "size": size, "fontname": "Times", "matrix": (1, 0, 0, 1, x0, baseline)}
+    page = SimpleNamespace(chars=[
+        glyph("2.", 0, 8, 70, 760),
+        glyph("Document Retrieval:", 12, 100, 73, 760),
+        glyph("Using query", 104, 160, 70, 760),
+        glyph("v", 162, 166, 73, 760),
+        glyph("q", 166, 169, 77, 758.4, 8),
+    ])
+    lines = _group_chars_into_lines(page)
+    assert len(lines) == 1
+    assert lines[0]["text"] == "2. Document Retrieval: Using query vq"

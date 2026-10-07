@@ -991,3 +991,14 @@ def test_a_model_claiming_unverified_is_not_trusted():
 
     assert results[0].verdict == VerdictLabel.UNVERIFIED and results[0].error is not None
     assert results[1].verdict == VerdictLabel.SUPPORTED
+
+
+@pytest.mark.parametrize("label", [VerdictLabel.SUPPORTED, VerdictLabel.PARTIAL])
+@pytest.mark.parametrize("quote", [None, "", "   "])
+def test_text_verdict_without_evidence_is_unverified(label, quote):
+    from services.verifier import _finalize
+    chunk = GeneratorChunk(chunk_id="no-evidence", content="The source discusses retrieval.", element_type="text", page_number=1, document_name="source.pdf")
+    result = _finalize(label, quote, chunk, model="test", input_tokens=1, output_tokens=1, latency_ms=1)
+    assert result.verdict == VerdictLabel.UNVERIFIED
+    assert result.quote is None
+    assert "no supporting quote" in result.error

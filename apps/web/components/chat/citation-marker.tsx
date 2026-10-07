@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import { createPortal } from "react-dom";
 
 import { CITATION_VERDICT_STYLES } from "@/lib/status-styles";
 import type { Citation } from "@/lib/types/chat";
@@ -30,6 +31,10 @@ function truncateExcerpt(text: string): string {
  * source-panel, unchanged. */
 export function CitationMarker({ citation, active, onOpen }: CitationMarkerProps) {
   const [previewOpen, setPreviewOpen] = React.useState(false);
+  const [position, setPosition] = React.useState<{ top: number; left: number } | null>(null);
+  const anchor = React.useRef<HTMLButtonElement>(null);
+  const preview = React.useRef<HTMLSpanElement>(null);
+  const tooltipId = React.useId();
   const style = CITATION_VERDICT_STYLES[citation.verdict];
   const isPartial = citation.verdict === "partial";
   const isUnverified = citation.verdict === "unverified";
@@ -41,19 +46,42 @@ export function CitationMarker({ citation, active, onOpen }: CitationMarkerProps
     : "";
   const tipPrefix = isPartial ? "Partially supported — " : isUnverified ? "Could not be verified — " : "";
   const tip = tipPrefix + `${citation.documentName}${locationSuffix}`;
+  React.useEffect(() => {
+    if (!previewOpen) { setPosition(null); return; }
+    const place = () => {
+      if (!anchor.current || !preview.current) return;
+      const button = anchor.current.getBoundingClientRect();
+      const box = preview.current.getBoundingClientRect();
+      const left = Math.max(8, Math.min(button.left + button.width / 2 - box.width / 2, window.innerWidth - box.width - 8));
+      const above = button.top - box.height - 8;
+      const top = Math.max(8, Math.min(above >= 8 ? above : button.bottom + 8, window.innerHeight - box.height - 8));
+      setPosition({ top, left });
+    };
+    place();
+    const dismiss = () => setPreviewOpen(false);
+    window.addEventListener("resize", dismiss);
+    window.addEventListener("scroll", dismiss, true);
+    return () => {
+      window.removeEventListener("resize", dismiss);
+      window.removeEventListener("scroll", dismiss, true);
+    };
+  }, [previewOpen, citation.excerpt]);
 
   return (
     <sup className="relative">
       <button
+        ref={anchor}
         type="button"
         data-testid={`citation-marker-${citation.id}`}
         data-verdict={citation.verdict}
-        onClick={() => onOpen(citation)}
+        onClick={() => { setPreviewOpen(false); onOpen(citation); }}
         onMouseEnter={() => setPreviewOpen(true)}
         onMouseLeave={() => setPreviewOpen(false)}
         onFocus={() => setPreviewOpen(true)}
         onBlur={() => setPreviewOpen(false)}
-        title={tip}
+        aria-label={`Citation ${citation.n}: ${tip}`}
+        aria-describedby={previewOpen ? tooltipId : undefined}
+        onKeyDown={(event) => { if (event.key === "Escape") setPreviewOpen(false); }}
         // Tailwind's Preflight reset sets `sup { line-height: 0 }` (the
         // standard typographic sub/sup reset) — this button inherits
         // that (Preflight also resets `button { line-height: inherit }`),
@@ -63,7 +91,7 @@ export function CitationMarker({ citation, active, onOpen }: CitationMarkerProps
         // the element, restoring real, clickable height. Caught live via
         // Playwright (`element is not visible`, computed height: 0px) —
         // not visible from reading the JSX/CSS alone.
-        className="min-w-[15px] rounded-[3px] px-[3px] font-mono text-[0.74em] font-medium leading-[1.4] transition-colors"
+        className="min-w-[15px] rounded-[3px] px-[3px] font-mono text-[0.74em] font-medium leading-[1.4] transition-colors focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-focus-ring"
         style={{
           color: style.fg,
           background: active ? style.bg : "transparent",
@@ -76,19 +104,14 @@ export function CitationMarker({ citation, active, onOpen }: CitationMarkerProps
       >
         {citation.n}
       </button>
-      {previewOpen ? (
-        // Absolutely positioned relative to the <sup> itself — never
-        // affects text flow/layout, so it can't push or collide with
-        // the streaming cursor (item 3) that may sit right after a
-        // citation near the end of an in-progress message; it only
-        // exists on hover/focus, floating above surrounding content.
-        // z-20 keeps it above normal message text but below the source
-        // panel (z-40) and the copy-message button — neither of which
-        // it would ever overlap anyway.
+      {previewOpen ? createPortal(
         <span
+          ref={preview}
+          id={tooltipId}
           data-testid={`citation-preview-${citation.id}`}
           role="tooltip"
-          className="absolute bottom-full left-1/2 z-20 mb-1.5 w-[240px] -translate-x-1/2 animate-fade-up rounded-md border border-border bg-surface p-2.5 text-left normal-case leading-normal shadow-[0_8px_24px_rgba(25,23,20,0.16)]"
+          style={{ top: position?.top ?? 0, left: position?.left ?? 0, visibility: position ? "visible" : "hidden" }}
+          className="pointer-events-none fixed z-50 w-[280px] max-w-[calc(100vw-16px)] animate-fade-in rounded-md border border-border bg-surface p-3 text-left normal-case leading-normal shadow-[0_8px_24px_rgba(25,23,20,0.16)]"
         >
           <span
             className="mb-1.5 block truncate font-mono text-[10px] font-medium tracking-[0.04em]"
@@ -97,10 +120,11 @@ export function CitationMarker({ citation, active, onOpen }: CitationMarkerProps
             {citation.documentName}
             {locationSuffix}
           </span>
-          <span className="block font-serif text-[13px] leading-snug text-muted">
+          <span className="mb-2 block text-[11px] font-medium" style={{ color: style.fg }}>{isPartial ? "Partially supported" : isUnverified ? "Could not be verified" : "Verified source"}</span>
+          <span className="block whitespace-pre-line break-words font-serif text-[13px] leading-relaxed text-muted">
             {truncateExcerpt(citation.excerpt)}
           </span>
-        </span>
+        </span>, document.body
       ) : null}
     </sup>
   );

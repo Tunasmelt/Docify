@@ -1226,3 +1226,17 @@ Document names in cards and sidebar open an action dialog with original-file vie
 - Document actions use matching icons, a close control, themed loading/error states and a viewport-bounded original-file preview. Sidebar document links align left; page headers show the active workspace instead of the Acme Legal placeholder.
 - Workspace loading and retry states use the same theme. Dialog entrance animations fade without overriding the transform that centres the modal.
 - Browser coverage checks workspace dialog cancellation/focus, both themes, mobile fit, and the existing preview/direct-chat flow.
+
+
+## 2026-10-07 — fix: citation preview and PDF evidence extraction
+
+- Removed duplicate native citation tooltips; one accessible, viewport-constrained hover/focus preview shows source, location and verification status. Escape and source-panel activation dismiss it; a body portal avoids scroll-container clipping and an opacity-only animation preserves positioning. Source quotes retain line breaks and wrap long words.
+- Restore PDF word boundaries from glyph gaps instead of concatenating characters. Detect narrow gutters and staggered column baselines; reproduced on arXiv 2507.18910 page 10. Existing documents need reindexing (or re-upload) to replace stored malformed chunks/embeddings; saved answers are not rewritten.
+- Supported/partial text verdicts require a nonempty evidence quote. Missing evidence becomes unverified, including the display of older saved citations; figures retain visual verification.
+- Checked retrieval, generation, verifier and streaming contracts against local Postgres tests. Real-paper page-10 keyword matches improved from 1 to 3; a live verifier call supported a retrieval claim with a grounded quote. The live generation smoke hit Gemini 503 high-demand errors after retries; local Cohere credentials were absent, so live generation quality remains unconfirmed. No provider/ranking changes made.
+
+
+## 2026-10-07 — fix: preserve PDF mixed-font citation line order
+
+- Follow-up live smoke exposed same-baseline bold labels and inline math being reordered by glyph-top grouping, causing a correct generated claim to fail strict quote grounding. Group rows by text baseline with a small allowance for subscripts; count gutter bins inclusively so an 8-point gutter survives integer rounding.
+- Added a mixed-font/subscript regression. Final parser/chunker/verifier tests:130 passed,5 skipped. With the previously supplied Cohere credential in process memory only, live fallback generated valid markers and the corrected-source claim verified as supported with a grounded quote. Gemini 503 overload persists, but the Cohere fallback works when configured. This checks one real claim, not general answer quality for every prompt.

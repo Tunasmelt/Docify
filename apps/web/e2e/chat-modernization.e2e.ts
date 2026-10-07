@@ -361,8 +361,8 @@ test.describe("Chat UI modernization batch 1", () => {
             chunk_id: chunk,
             marker: 1,
             claim_span: "Seeded answer",
-            verdict: "supported",
-            supporting_quote: "The exact excerpt content for the hover preview to show.",
+            verdict: "partial",
+            supporting_quote: "",
           },
         ],
       });
@@ -370,12 +370,33 @@ test.describe("Chat UI modernization batch 1", () => {
       await page.goto(`/chat/${conversationId}`);
       const marker = page.locator('[data-testid^="citation-marker-"]').first();
       await expect(marker).toBeVisible();
+      await expect(marker).toHaveAttribute("data-verdict", "unverified");
 
       // Hover (not click) shows the preview.
       await marker.hover();
       const preview = page.locator('[data-testid^="citation-preview-"]');
       await expect(preview).toBeVisible();
       await expect(preview).toContainText("The exact excerpt content for the hover preview to show.");
+      await expect(preview).toContainText("Could not be verified");
+      await expect(marker).not.toHaveAttribute("title");
+      await expect(marker).toHaveAttribute("aria-describedby", await preview.getAttribute("id") as string);
+      const checkFit = async () => {
+        const box = await preview.boundingBox();
+        const viewport = page.viewportSize()!;
+        expect(box!.x).toBeGreaterThanOrEqual(8);
+        expect(box!.y).toBeGreaterThanOrEqual(8);
+        expect(box!.x + box!.width).toBeLessThanOrEqual(viewport.width - 8);
+        expect(box!.y + box!.height).toBeLessThanOrEqual(viewport.height - 8);
+      };
+      await checkFit();
+      await marker.press("Escape");
+      await expect(preview).toHaveCount(0);
+      await page.setViewportSize({ width: 390, height: 844 });
+      await page.mouse.move(0, 0);
+      await marker.hover();
+      await expect(preview).toBeVisible();
+      await checkFit();
+      await page.screenshot({ path: "test-results/citation-preview-mobile.png", animations: "disabled" });
 
       // Source panel must NOT have opened from hover alone.
       await expect(page.getByTestId("source-panel")).not.toBeVisible();
@@ -383,6 +404,7 @@ test.describe("Chat UI modernization batch 1", () => {
       // Click still opens the real source panel — hover is a separate,
       // additive path, not a replacement.
       await marker.click();
+      await expect(preview).toHaveCount(0);
       await expect(page.getByTestId("source-panel")).toBeVisible();
       await expect(page.getByTestId("source-panel")).toContainText(
         "The exact excerpt content for the hover preview to show."
