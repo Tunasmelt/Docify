@@ -299,3 +299,7 @@ PDF mixed-font labels and math must group by baseline (glyph matrix translation)
 
 ### 2026-10-07 [codex] — preserve cited versions and fence ingest claims
 User requested all five reviewed improvements. Reindex archives cited chunks (including figures), with current-only uniqueness and search/provider/context filters; later reprocessing prunes unreferenced versions. A historical non-PDF context must show the archived block itself: looking for its id in current neighbours would fail or mix different extraction versions. Ingest progress/staging/publish/retry/finish use one tenant- and claim-checked RPC; heartbeat matches worker and attempt. Publication and retry update document/job state transactionally. Apply migration 20261007_003 before API deployment and drain older workers. Keep local browser/benchmark runs explicitly on local Supabase with dummy vendor keys; live generation evaluation is opt-in and reports conservative literal answer-fact checks, not a complete semantic quality guarantee.
+
+
+### 2026-10-07 [codex] — bundle typography instead of downloading it during builds
+Fresh CI intermittently failed in Next14's Google font loader at its font-extension regex, while another run passed. Bundle the same Latin Newsreader (normal/italic), Spline Sans and Spline Sans Mono assets with original SIL OFL notices and provenance. Use next/font/local with the same CSS variables and weight ranges; build and browser regressions pass. This removes font URL/network fragility without installing packages or changing design families.

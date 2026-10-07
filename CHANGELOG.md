@@ -1252,3 +1252,10 @@ Document names in cards and sidebar open an action dialog with original-file vie
 - Apply migration 20261007_003 before deploying the API; drain old ingest workers first. Previously deleted citations cannot be restored. Archived evidence uses additional storage until its citations/documents are removed.
 
 Validation: 43 targeted backend regressions pass, all five deterministic browser tests pass, web lint/typecheck/build pass, and local FTS recall@5 is 28/29 (0.966), exceeding the 0.95 CI gate. Full local suite had 602 passes and one historical-figure test-helper failure; the corrected helper passed in the targeted repeat. Fresh GitHub CI remains the final complete-suite gate.
+
+
+## 2026-10-07 — deterministic font builds and mobile reprocessing controls [codex]
+
+GitHub CI exposed Next14 Google font loader failure: its file-extension regex does not accept a returned Google Fonts URL. Bundle the same Latin Newsreader (normal/italic), Spline Sans and Spline Sans Mono weight ranges as local WOFF2 assets, with original SIL OFL licences/provenance. `next/font/local` keeps the CSS variables and typography while removing build-time font downloads. Compact mobile document rows keep filenames visible alongside Reprocess; browser regression verifies the row does not overflow at390px.
+
+Fresh GitHub CI for dc8801b passed604 backend tests,18 skipped,1 deselected; all five browser tests and the FTS gate passed. One sibling web build failed intermittently in the Google font loader, prompting the local-font fix above. With local fonts, production build and all five browser tests pass locally, including the390px document-row overflow check.
