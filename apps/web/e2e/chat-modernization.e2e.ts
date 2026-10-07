@@ -362,7 +362,7 @@ test.describe("Chat UI modernization batch 1", () => {
             marker: 1,
             claim_span: "Seeded answer",
             verdict: "partial",
-            supporting_quote: null,
+            supporting_quote: "",
           },
         ],
       });

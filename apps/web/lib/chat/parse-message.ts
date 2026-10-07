@@ -65,7 +65,7 @@ function apiCitationToClientCitation(id: string, c: ApiCitation): Citation {
     // have no text content to quote from) — snippet (the raw chunk
     // content) is always present, so it's the honest fallback rather
     // than showing an empty excerpt.
-    excerpt: c.supporting_quote ?? c.snippet,
+    excerpt: c.supporting_quote?.trim() ? c.supporting_quote : c.snippet,
     isFigure: c.element_type === "figure",
     figureUrl: c.figure_url,
     documentId: c.document_id,
