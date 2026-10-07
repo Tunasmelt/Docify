@@ -375,40 +375,29 @@ def _text_from_chars(chars: list[dict]) -> str:
     return "".join(parts).strip()
 
 
-def _group_chars_into_lines(page) -> list[dict]:
-    """Groups a page's characters into visual lines by vertical position —
-    pdfplumber's own primitive (page.chars) has no line concept built in.
-    Each line carries its text, bbox, average font size, and whether every
-    character in it is bold (by font name — pdfplumber doesn't expose a
-    separate bold flag)."""
-    lines: dict[float, list] = {}
-    for ch in page.chars:
-        key = round(ch["top"], 0)
-        lines.setdefault(key, []).append(ch)
+def _char_rows(page) -> list[list[dict]]:
+    """Group by text baseline, not font-dependent glyph top.
 
-    result = []
-    for top in sorted(lines.keys()):
-        chars = sorted(lines[top], key=lambda c: c["x0"])
-        text = _text_from_chars(chars)
-        if not text:
-            continue
-        x0 = chars[0]["x0"]
-        x1 = chars[-1]["x1"]
-        bottom = max(c["bottom"] for c in chars)
-        avg_size = sum(c["size"] for c in chars) / len(chars)
-        is_bold = all("bold" in c["fontname"].lower() for c in chars)
-        result.append(
-            {
-                "text": text,
-                "top": top,
-                "bottom": bottom,
-                "x0": x0,
-                "x1": x1,
-                "size": avg_size,
-                "bold": is_bold,
-            }
-        )
-    return result
+    Bold labels and inline math have different glyph tops on the same
+    baseline. Allow small baseline shifts for subscripts/superscripts.
+    """
+    def baseline(char):
+        matrix = char.get("matrix")
+        return -float(matrix[5]) if matrix is not None else float(char["top"])
+
+    rows: list[list[dict]] = []
+    row_baseline = None
+    for char in sorted(page.chars, key=baseline):
+        value = baseline(char)
+        if row_baseline is None or value - row_baseline > 3.0:
+            rows.append([])
+            row_baseline = value
+        rows[-1].append(char)
+    return rows
+
+
+def _group_chars_into_lines(page) -> list[dict]:
+    return [line for chars in _char_rows(page) if (line := _line_from_chars(chars))["text"]]
 
 
 # ── Column layout ─────────────────────────────────────────────────────────
@@ -474,7 +463,7 @@ def _detect_gutter(rows: list[list[list[dict]]], page_width: float) -> tuple[flo
                 best = (start, x)
         else:
             start = None
-    if best is None or best[1] - best[0] < _MIN_GUTTER_PT:
+    if best is None or best[1] - best[0] + 1 < _MIN_GUTTER_PT:
         return None
     left, right = float(best[0]), float(best[1])
     # Columns need not share baselines: TeX lists and inline mathematics
@@ -501,17 +490,14 @@ def _page_layout(page, exclude_bboxes: list, body_x0: float) -> dict:
     1 right) and "col_x0" (its column's left margin, for indent heuristics).
     Also returns the gutter and the tops of full-width lines, which
     `_reading_order_key` uses to place tables, figures and captions."""
-    by_top: dict[float, list] = {}
-    for ch in page.chars:
-        by_top.setdefault(round(ch["top"], 0), []).append(ch)
     rows = []
-    for top in sorted(by_top):
-        line = _line_from_chars(by_top[top])
+    for chars in _char_rows(page):
+        line = _line_from_chars(chars)
         if not line["text"]:
             continue
         if any(_bbox_overlaps((line["x0"], line["top"], line["x1"], line["bottom"]), tb) for tb in exclude_bboxes):
             continue
-        rows.append(_split_at_gaps(by_top[top]))
+        rows.append(_split_at_gaps(chars))
 
     gutter = _detect_gutter(rows, float(page.width))
     if gutter is None:

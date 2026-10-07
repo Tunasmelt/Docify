@@ -1390,3 +1390,20 @@ def test_narrow_pdf_column_gutter_is_detected():
     doc = Parser(ocr_tiers=[]).parse(_text_pdf(lines), filename="narrow-columns.pdf")
     text = "\n".join(e.content for e in doc.elements)
     assert text.index("x" * 43 + "8") < text.index("Right generation step 0")
+
+
+def test_mixed_font_labels_and_subscripts_stay_in_visual_line_order():
+    from types import SimpleNamespace
+    from services.parser import _group_chars_into_lines
+    def glyph(text, x0, x1, top, baseline, size=10):
+        return {"text": text, "x0": x0, "x1": x1, "top": top, "bottom": top + size, "size": size, "fontname": "Times", "matrix": (1, 0, 0, 1, x0, baseline)}
+    page = SimpleNamespace(chars=[
+        glyph("2.", 0, 8, 70, 760),
+        glyph("Document Retrieval:", 12, 100, 73, 760),
+        glyph("Using query", 104, 160, 70, 760),
+        glyph("v", 162, 166, 73, 760),
+        glyph("q", 166, 169, 77, 758.4, 8),
+    ])
+    lines = _group_chars_into_lines(page)
+    assert len(lines) == 1
+    assert lines[0]["text"] == "2. Document Retrieval: Using query vq"
