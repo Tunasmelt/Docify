@@ -664,8 +664,24 @@ def _remove_figures(client, paths: list[str]) -> None:
     if not paths:
         return
     try:
-        client.storage.from_("figures").remove(paths)
+        # A publication may commit even when its HTTP acknowledgement is lost.
+        # Cleanup must never delete an image that live or archived chunks use.
+        # These paths were generated from the ingest's authenticated user_id.
+        by_user: dict[str, list[str]] = {}
+        for path in paths:
+            by_user.setdefault(path.split("/", 1)[0], []).append(path)
+        removable = []
+        for user_id, candidates in by_user.items():
+            rows = client.table("chunks").select("figure_path").eq("user_id", user_id).in_(
+                "figure_path", candidates
+            ).execute().data
+            referenced = {row["figure_path"] for row in rows}
+            removable.extend(path for path in candidates if path not in referenced)
+        if removable:
+            client.storage.from_("figures").remove(removable)
     except Exception:
+        # If reference checking fails, retaining an orphan is safer than
+        # deleting source evidence whose publication could have succeeded.
         logger.warning("ingest: couldn't remove %d figure object(s)", len(paths), exc_info=True)
 
 

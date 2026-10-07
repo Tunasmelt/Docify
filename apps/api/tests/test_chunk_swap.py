@@ -185,3 +185,28 @@ def test_reindex_preserves_saved_citations_and_excludes_old_evidence_from_search
     admin.table("chunks").update({"embedding_provider": "cohere"}).eq("id", old["id"]).execute()
     providers = admin.rpc("distinct_embedding_providers", {"match_user_id": user_id, "match_document_ids": [document_id]}).execute().data
     assert providers == [{"embedding_provider": "voyage"}]
+
+
+
+def test_lost_publication_acknowledgement_does_not_delete_published_figures(app_client, admin, user_a, monkeypatch):
+    from db import queries
+    from routes import ingest
+    from tests.conftest import FakeEmbedder, FakeParser, upload_placeholder
+
+    user_id, token = user_a
+    storage_path = upload_placeholder(user_id, token, filename="lost-ack.pdf")
+    doc = queries.create_document(admin, user_id=user_id, filename="lost-ack.pdf", storage_path=storage_path,
+        mime_type="application/pdf", size_bytes=17)
+    original = queries.swap_document_chunks
+
+    def commit_then_lose_ack(client, **kwargs):
+        original(client, **kwargs)
+        raise ConnectionError("simulated acknowledgement loss after database commit")
+
+    monkeypatch.setattr(queries, "swap_document_chunks", commit_then_lose_ack)
+    with pytest.raises(ingest.TransientIngestError):
+        ingest.run_ingest_pipeline(document_id=doc["id"], user_id=user_id, storage_path=storage_path,
+            client=admin, parser=FakeParser(), chunker=_FigureChunker(), embedder=FakeEmbedder(), final_attempt=False)
+    path = next(row["figure_path"] for row in admin.table("chunks").select("figure_path").eq("document_id", doc["id"]).execute().data if row["figure_path"])
+    assert admin.storage.from_("figures").download(path)
+    admin.storage.from_("figures").remove([path])

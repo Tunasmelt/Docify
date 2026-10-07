@@ -1259,3 +1259,8 @@ Validation: 43 targeted backend regressions pass, all five deterministic browser
 GitHub CI exposed Next14 Google font loader failure: its file-extension regex does not accept a returned Google Fonts URL. Bundle the same Latin Newsreader (normal/italic), Spline Sans and Spline Sans Mono weight ranges as local WOFF2 assets, with original SIL OFL licences/provenance. `next/font/local` keeps the CSS variables and typography while removing build-time font downloads. Compact mobile document rows keep filenames visible alongside Reprocess; browser regression verifies the row does not overflow at390px.
 
 Fresh GitHub CI for dc8801b passed604 backend tests,18 skipped,1 deselected; all five browser tests and the FTS gate passed. One sibling web build failed intermittently in the Google font loader, prompting the local-font fix above. With local fonts, production build and all five browser tests pass locally, including the390px document-row overflow check.
+
+
+## 2026-10-07 — preserve published figures after acknowledgement loss [codex]
+
+If chunk publication commits but its HTTP reply is lost, pipeline cleanup previously treated the new figures as unpublished and could delete them. Check tenant-scoped live/archived references before removing any candidate figure; if checking fails, retain it. A real local Storage/Postgres regression commits the swap then raises a transport error and confirms the published figure remains downloadable. Chunk-swap and ingest-queue regressions:25 passed.
