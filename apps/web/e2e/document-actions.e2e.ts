@@ -36,6 +36,11 @@ test("document selection offers original viewing and a directly scoped chat", as
     await dialog.getByRole("link", { name: "Chat with document" }).click();
     await page.waitForURL(`**/chat/new?docs=${documentId}`);
     await expect(page.getByText("preview.pdf", { exact: true }).first()).toBeVisible();
+    await page.getByRole("link", { name: "Documents", exact: true }).click();
+    const queued = page.waitForResponse((r) => r.url().endsWith(`/reindex/${documentId}`) && r.request().method() === "POST");
+    await page.getByRole("button", { name: "Reprocess preview.pdf", exact: true }).click();
+    expect((await queued).status()).toBe(202);
+    await expect(page.getByRole("button", { name: "Reprocess preview.pdf", exact: true })).toHaveCount(0);
   } finally {
     await deleteTestUserByEmail(email);
   }

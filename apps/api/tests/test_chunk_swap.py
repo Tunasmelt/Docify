@@ -84,7 +84,8 @@ class _FigureChunker:
         ]
 
 
-def test_reindex_replaces_figures_and_removes_the_old_objects(app_client, admin, user_a):
+@pytest.mark.parametrize("cited", [False, True])
+def test_reindex_replaces_figures_and_removes_the_old_objects(app_client, admin, user_a, cited):
     user_id, token = user_a
     override_pipeline(chunker=_FigureChunker())
     try:
@@ -101,10 +102,14 @@ def test_reindex_replaces_figures_and_removes_the_old_objects(app_client, admin,
     document_id = response.json()["document_id"]
 
     def figure_path():
-        rows = admin.table("chunks").select("figure_path").eq("document_id", document_id).execute().data
+        rows = admin.table("chunks").select("figure_path").eq("document_id", document_id).eq("archived", False).execute().data
         return next(r["figure_path"] for r in rows if r["figure_path"])
 
     old_path = figure_path()
+    if cited:
+        from tests.test_conversations import _ask_real_question
+        figure = admin.table("chunks").select("*").eq("document_id", document_id).eq("element_type", "figure").execute().data[0]
+        _ask_real_question(app_client, admin, user_id, token, document_id, figure, "Figure 1 shows the result [1].")
     assert admin.storage.from_("figures").download(old_path)
 
     assert _reindex(app_client, token, document_id, chunker=_FigureChunker()).status_code == 202
@@ -113,8 +118,10 @@ def test_reindex_replaces_figures_and_removes_the_old_objects(app_client, admin,
     assert new_path != old_path
     assert admin.storage.from_("figures").download(new_path)
     listing = admin.storage.from_("figures").list(old_path.rsplit("/", 1)[0])
-    assert all(item["name"] != old_path.rsplit("/", 1)[1] for item in listing)  # old object removed
-    admin.storage.from_("figures").remove([new_path])
+    assert any(item["name"] == old_path.rsplit("/", 1)[1] for item in listing) is cited
+    if cited:
+        assert admin.storage.from_("figures").download(old_path)
+    admin.storage.from_("figures").remove([new_path, old_path] if cited else [new_path])
 
 
 def test_first_ingest_also_goes_through_staging(app_client, admin, user_a):
@@ -150,3 +157,31 @@ def test_a_failure_after_the_swap_keeps_the_new_figures_the_live_chunks_use(app_
     live_figure = next(r["figure_path"] for r in rows if r["figure_path"])
     assert admin.storage.from_("figures").download(live_figure)  # not cleaned up
     admin.storage.from_("figures").remove([live_figure])
+
+
+def test_reindex_preserves_saved_citations_and_excludes_old_evidence_from_search(app_client, admin, user_a):
+    from tests.test_conversations import _ask_real_question
+    from db import queries
+
+    user_id, token = user_a
+    document_id = ingest_real_document(app_client, user_id, token, filename="versions.pdf")
+    old = admin.table("chunks").select("*").eq("document_id", document_id).execute().data[0]
+    turn = _ask_real_question(app_client, admin, user_id, token, document_id, old, "Revenue grew 12% [1].")
+    before = app_client.get(f"/conversations/{turn['conversation_id']}/messages", headers={"Authorization": f"Bearer {token}"}).json()
+    assert _reindex(app_client, token, document_id).status_code == 202
+    after = app_client.get(f"/conversations/{turn['conversation_id']}/messages", headers={"Authorization": f"Bearer {token}"}).json()
+    assert after["messages"][-1]["citations"] == before["messages"][-1]["citations"]
+    archived = admin.table("chunks").select("archived").eq("id", old["id"]).execute().data[0]
+    assert archived["archived"] is True
+    current = queries.list_document_chunks(admin, document_id=document_id, user_id=user_id)
+    assert current and all(c["id"] != old["id"] for c in current)
+    for name, params in [
+        ("match_chunks_by_fts", {"query_text": old["content"]}),
+        ("match_chunks_by_vector", {"query_embedding": old["embedding"], "match_provider": old["embedding_provider"]}),
+    ]:
+        rows = admin.rpc(name, dict(params, match_user_id=user_id, match_document_ids=[document_id], match_limit=100)).execute().data
+        assert rows and all(r["id"] != old["id"] for r in rows)
+
+    admin.table("chunks").update({"embedding_provider": "cohere"}).eq("id", old["id"]).execute()
+    providers = admin.rpc("distinct_embedding_providers", {"match_user_id": user_id, "match_document_ids": [document_id]}).execute().data
+    assert providers == [{"embedding_provider": "voyage"}]

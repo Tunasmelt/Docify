@@ -76,8 +76,9 @@ create table chunks (
   ts                 tsvector generated always as (to_tsvector('english', content)) stored,
   metadata           jsonb not null default '{}'::jsonb,
   created_at         timestamptz not null default now(),
-  unique (document_id, chunk_index)
+  archived           boolean not null default false
 );
+create unique index chunks_current_document_index on chunks(document_id, chunk_index) where not archived;
 
 create index chunks_document_idx on chunks(document_id);
 create index chunks_user_idx     on chunks(user_id);
@@ -351,8 +352,17 @@ Migrations up to `20260804_001` are applied to the production project; later one
 | `20261006_003_ingest_job_queue.sql` | Feature | `ingest_jobs` table + `claim_ingest_job()` (queue with global concurrency cap, heartbeat leases, retries); `chunks_staging` + `swap_document_chunks()` (atomic chunk replacement on (re)index). **Apply before deploying the code that ships with it:** `/ingest` and the pipeline use these immediately |
 | `20261006_002_vector_search_iterative_scan.sql` | Fix | `match_chunks_by_vector` runs with `hnsw.iterative_scan = strict_order` so the tenant/document/provider filters can't leave a user with fewer results than exist (the HNSW index returned ~40 nearest chunks across all tenants before filtering) |
 
+| `20261007_003_citation_versions_and_ingest_fencing.sql` | Reliability | Cited chunk versions survive reindex; searches use current chunks; ingest mutations validate tenant, worker, attempt and lease transactionally. Apply before API deployment |
+
 Account deletion (FEAT-035) needed no migration: all 6 user-scoped tables already cascade on `auth.users` deletion, and Storage cleanup is done in application code.
 
 ## Personal workspaces migrations (2026-10-06)
 
 20261007_001 adds cohere to embedding_provider without changing vector dimensions. 20261007_002 creates private workspaces(id, user_id, name, created_at), owner RLS and per-user case-insensitive unique names. Adds non-null workspace_id to documents/conversations and backfills legacy rows into My workspace. Default triggers support older inserts and enforce ownership and conversation document scope. Documents prevent deleting nonempty workspaces; conversations cascade. Storage paths remain user-scoped; auth.users deletion cascades workspaces.
+
+
+## Citation versions and ingest fencing (2026-10-07)
+
+Migration `20261007_003_citation_versions_and_ingest_fencing.sql` implements the requested citation preservation and worker ownership fixes. `chunks.archived` defaults false. `(document_id, chunk_index)` is unique only for current chunks. Replacement retains cited chunks as archived versions and deletes unreferenced versions; vector search, FTS, provider discovery and current context listings exclude archives. Citation foreign keys remain unchanged, so historical evidence and document-deletion cascades still work.
+
+`mutate_ingest_attempt(job_id, user_id, worker_id, attempt, action, values, rows)` is service-role-only. It locks the job and validates tenant, running status, claim owner, attempt number and unexpired 120-second lease before mutating progress, staging, publishing, retry or finish. Publishing swaps chunks and marks the document ready atomically; retry resets job and document state atomically. Existing queue/staging RLS remains enabled with no browser policies.

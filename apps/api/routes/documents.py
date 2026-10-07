@@ -454,7 +454,12 @@ def get_source_context(document_id: str, chunk_id: str, request: Request):
     if cited is None:
         return not_found
 
-    if document["mime_type"] == PPTX_MIME_TYPE:
+    if cited.get("archived"):
+        # Neighbouring current chunks may describe different content after reprocessing.
+        kind = "slide" if document["mime_type"] == PPTX_MIME_TYPE else "section"
+        label = f"Slide {cited['page_number']}" if kind == "slide" else _section_of(cited)
+        chunks = [cited]
+    elif document["mime_type"] == PPTX_MIME_TYPE:
         kind, label = "slide", f"Slide {cited['page_number']}"
         chunks = queries.list_document_chunks(
             client, document_id=document_id, user_id=user_id, page_number=cited["page_number"], limit=MAX_SLIDE_BLOCKS

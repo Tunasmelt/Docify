@@ -100,6 +100,8 @@ cd apps/web && pnpm build               # production build — runs ESLint as a 
   uv run python -m eval.run --retrieval fts    # + full-text ranking against local Supabase, no API keys
   uv run python -m eval.run --retrieval full --sleep 21 --json run.json   # + real hybrid retrieval (Voyage/Gemini quota; --rerank optional)
   ```
+  Add `--min-recall 0.95` to fail if answering evidence falls out of the top five for more than one question. Add `--generation` to either retrieval mode to evaluate live answers, expected facts, correct source citations, grounded quotes and invalid markers; results include the generation model so fallbacks are visible. This uses provider quota and requires API keys. `--json run.json` saves the individual answers and verdicts. Answer fact matching is conservative and literal (case/whitespace normalized), so a paraphrase or different number formatting can fail and needs manual review. Provider outage/fallback quality regressions run offline in pytest.
+
   Run it before and after a parser, chunker or retrieval change and compare recall@k/MRR. A new failure mode gets a new question (and fixture, if needed).
 - Before calling a multi-file change done, verify from a fresh clone (`git stash -u` or a new `git clone`). The working tree can hide files you never committed (STANDARDS.md §Testing).
 
@@ -108,7 +110,7 @@ cd apps/web && pnpm build               # production build — runs ESLint as a 
 - Branch from `master` using `feat/FEAT-NNN-…`, `fix/…`, `docs/…` (STANDARDS.md §Git); never commit to `master` directly.
 - Commit format: `<type>(<scope>): <summary> [<agent-tag>]`.
 - A PR that changes behaviour updates `CHANGELOG.md`; schema changes add a migration plus a row in SCHEMA.md's migration log; API changes update `.agent/API_CONTRACT.md` and `apps/web/lib/types/` together.
-- CI (`.github/workflows/ci.yml`) runs the backend suite against a fresh local Supabase stack, plus web lint, typecheck and build, on every PR. Run the commands in step 5 locally first. CI doesn't run the Playwright e2e suite.
+- CI (`.github/workflows/ci.yml`) runs the backend suite against a fresh local Supabase stack, plus web lint, typecheck and build, on every PR. Run the commands in step 5 locally first. CI also runs five deterministic Playwright regressions (document viewing/chat/reprocessing, workspaces, citation previews and page highlights) with vendor calls disabled, plus a 95% minimum recall@5 retrieval gate. Run the same browser subset with `cd apps/api && uv run python scripts/run_browser_tests.py`; it starts and stops the local API and sets local-only Supabase configuration.
 
 ## Cohere and personal workspaces
 

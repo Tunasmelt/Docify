@@ -170,3 +170,16 @@ def test_context_is_404_outside_the_callers_own_document(app_client, admin, user
     else:
         response = _context(app_client, token, other_doc, ids[0])
     assert response.status_code == 404
+
+
+@pytest.mark.parametrize("mime,filename", [(DOCX, "history.docx"), (PPTX, "history.pptx")])
+def test_archived_source_shows_original_evidence_without_current_version_neighbours(app_client, admin, user_a, mime, filename):
+    user_id, token = user_a
+    doc = _document(admin, user_id, mime, filename)
+    old = _chunks(admin, user_id, doc, [{"content": "Original revenue was 100.", "section": "Revenue"}])[0]
+    admin.table("chunks").update({"archived": True}).eq("id", old).execute()
+    _chunks(admin, user_id, doc, [{"content": "New extraction says 200.", "section": "Revenue"}])
+    response = _context(app_client, token, doc, old)
+    assert response.status_code == 200
+    assert [b["content"] for b in response.json()["blocks"]] == ["Original revenue was 100."]
+    assert response.json()["blocks"][0]["cited"] is True
