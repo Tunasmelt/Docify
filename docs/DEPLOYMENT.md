@@ -81,3 +81,10 @@ Note that a 5-minute ping keeps the free Render instance from ever idling, so it
 - **API:** in Render, redeploy a previous successful deploy. Check `GET /health` afterwards.
 - **Web:** in Vercel, promote a previous deployment to production.
 - **Schema:** each migration documents its reversal in a trailing `-- ROLLBACK` comment. Run it in the SQL editor only after rolling the code back, since newer code may depend on the newer schema.
+
+
+## Citation history and ingest ownership (2026-10-07)
+
+Apply `apps/api/migrations/20261007_003_citation_versions_and_ingest_fencing.sql` after all earlier migrations and **before deploying this API version**. It adds archived chunk versions, current-version uniqueness/search filters, and the lease-checked ingest mutation RPC. Stop or drain the old API's ingest worker before deploying the new API: old workers do not enforce claim ownership. This migration does not rewrite answers or change embeddings.
+
+Reprocess a ready document from its library row to apply parser fixes. Saved citations keep their original text, coordinates and figures; new searches use current chunks. Archived DOCX/HTML/PPTX sources show the original cited block, without mixing current-version neighbours. Versions without citations are removed during subsequent reprocessing; deleting the document still removes all versions and citations. Existing citations lost before this migration cannot be recovered by it.

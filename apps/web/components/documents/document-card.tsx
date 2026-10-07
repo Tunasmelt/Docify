@@ -30,7 +30,7 @@ export interface DocumentCardProps {
    * additive rather than a breaking change) don't have to pass anything. */
   selected?: boolean;
   onToggleSelect?: (id: string) => void;
-  /** Offered only on a failed document: re-run processing (POST /reindex). */
+  /** Re-run processing on failed or ready documents (POST /reindex). */
   onRetry?: (id: string) => void;
   retrying?: boolean;
 }
@@ -42,7 +42,7 @@ export function DocumentCard({ doc, onDelete, onOpen, onRename, selected, onTogg
   const failed = doc.status === "failed";
 
   return (
-    <div className={`flex items-center gap-4 border-b border-line px-[18px] py-3.5 last:border-b-0 hover:bg-panel-hover ${selected ? "bg-panel-active" : ""}`}
+    <div className={`flex items-center gap-2 sm:gap-4 border-b border-line px-[18px] py-3.5 last:border-b-0 hover:bg-panel-hover ${selected ? "bg-panel-active" : ""}`}
       onClick={(event) => {
         if (selectable && !(event.target as HTMLElement).closest("button,a,input,[role=checkbox]")) onToggleSelect?.(doc.id);
       }}>
@@ -59,7 +59,7 @@ export function DocumentCard({ doc, onDelete, onOpen, onRename, selected, onTogg
           <div className="h-[18px] w-[18px] flex-shrink-0" />
         )
       ) : null}
-      <div className="flex h-9 w-7 flex-shrink-0 items-center justify-center rounded-[3px] border border-border bg-surface font-serif text-sm text-faint">
+      <div className="hidden h-9 w-7 flex-shrink-0 items-center sm:flex justify-center rounded-[3px] border border-border bg-surface font-serif text-sm text-faint">
         ¶
       </div>
       <div className="min-w-0 flex-1">
@@ -85,16 +85,17 @@ export function DocumentCard({ doc, onDelete, onOpen, onRename, selected, onTogg
         />
         {style.label}
       </Badge>
-      {failed && onRetry ? (
+      {(failed || doc.status === "ready") && onRetry ? (
         <button
           type="button"
-          title="Retry processing"
+          title={failed ? "Retry processing" : "Reprocess document"}
+          aria-label={failed ? `Retry ${doc.filename}` : `Reprocess ${doc.filename}`}
           onClick={() => onRetry(doc.id)}
           disabled={retrying}
           className="flex h-[30px] flex-shrink-0 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted transition-colors hover:bg-panel-active hover:text-ink disabled:opacity-50"
         >
           <RotateCcw size={14} strokeWidth={1.8} className={retrying ? "animate-spin" : undefined} />
-          {retrying ? "Retrying…" : "Retry"}
+          <span className="hidden sm:inline">{retrying ? "Queuing…" : failed ? "Retry" : "Reprocess"}</span>
         </button>
       ) : null}
       {onRename ? (

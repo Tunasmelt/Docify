@@ -1240,3 +1240,27 @@ Document names in cards and sidebar open an action dialog with original-file vie
 
 - Follow-up live smoke exposed same-baseline bold labels and inline math being reordered by glyph-top grouping, causing a correct generated claim to fail strict quote grounding. Group rows by text baseline with a small allowance for subscripts; count gutter bins inclusively so an 8-point gutter survives integer rounding.
 - Added a mixed-font/subscript regression. Final parser/chunker/verifier tests:130 passed,5 skipped. With the previously supplied Cohere credential in process memory only, live fallback generated valid markers and the corrected-source claim verified as supported with a grounded quote. Gemini 503 overload persists, but the Cohere fallback works when configured. This checks one real claim, not general answer quality for every prompt.
+
+
+## 2026-10-07 — preserve citation history and enforce ingest ownership [codex]
+
+- Retain cited chunks/figures as historical versions during reprocessing; exclude them from fresh vector/FTS searches, provider discovery and current context. Historical non-PDF previews show the original cited block. Prune unreferenced versions on later reprocessing.
+- Fence ingest mutations with a service-role-only, tenant-scoped RPC that locks and validates the running claim/attempt/lease. Progress, staging, publication, cleanup, retry and completion cannot be overwritten by stale workers. Heartbeats also match the attempt.
+- Add themed, accessible Reprocess controls for ready documents; existing Retry remains for failures, and icon-only controls fit mobile rows.
+- Run deterministic document/workspace/citation/page-preview browser regressions and a 95% recall@5 retrieval gate in CI. Local browser runner uses explicit local Supabase settings and dummy vendor keys, owns its API subprocess and cleans it up.
+- Extend the benchmark with explicit expected answer facts, live generation/grounding checks and per-model reports. Offline outage tests reject wrong facts, unrelated sources, fabricated quotes and invalid markers through the production Cohere fallback path. Live generation evaluation is opt-in and consumes quota.
+- Apply migration 20261007_003 before deploying the API; drain old ingest workers first. Previously deleted citations cannot be restored. Archived evidence uses additional storage until its citations/documents are removed.
+
+Validation: 43 targeted backend regressions pass, all five deterministic browser tests pass, web lint/typecheck/build pass, and local FTS recall@5 is 28/29 (0.966), exceeding the 0.95 CI gate. Full local suite had 602 passes and one historical-figure test-helper failure; the corrected helper passed in the targeted repeat. Fresh GitHub CI remains the final complete-suite gate.
+
+
+## 2026-10-07 — deterministic font builds and mobile reprocessing controls [codex]
+
+GitHub CI exposed Next14 Google font loader failure: its file-extension regex does not accept a returned Google Fonts URL. Bundle the same Latin Newsreader (normal/italic), Spline Sans and Spline Sans Mono weight ranges as local WOFF2 assets, with original SIL OFL licences/provenance. `next/font/local` keeps the CSS variables and typography while removing build-time font downloads. Compact mobile document rows keep filenames visible alongside Reprocess; browser regression verifies the row does not overflow at390px.
+
+Fresh GitHub CI for dc8801b passed604 backend tests,18 skipped,1 deselected; all five browser tests and the FTS gate passed. One sibling web build failed intermittently in the Google font loader, prompting the local-font fix above. With local fonts, production build and all five browser tests pass locally, including the390px document-row overflow check.
+
+
+## 2026-10-07 — preserve published figures after acknowledgement loss [codex]
+
+If chunk publication commits but its HTTP reply is lost, pipeline cleanup previously treated the new figures as unpublished and could delete them. Check tenant-scoped live/archived references before removing any candidate figure; if checking fails, retain it. A real local Storage/Postgres regression commits the swap then raises a transport error and confirms the published figure remains downloadable. Chunk-swap and ingest-queue regressions:25 passed.

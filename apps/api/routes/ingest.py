@@ -22,7 +22,7 @@ from services.document_model import (
     check_deadline,
 )
 from services.embedder import Embedder
-from services.ingest_queue import JOB_TIME_LIMIT_SECONDS, TransientIngestError
+from services.ingest_queue import JOB_TIME_LIMIT_SECONDS, IngestLease, LostIngestLease, TransientIngestError
 
 JOB_TIME_LIMIT_MINUTES = JOB_TIME_LIMIT_SECONDS / 60
 # Matches the upload UI's stated limit and the Storage bucket's file_size_limit.
@@ -474,6 +474,7 @@ def run_ingest_pipeline(
     embedder=None,
     deadline: float | None = None,
     final_attempt: bool = True,
+    lease: IngestLease | None = None,
 ) -> bool:
     """download -> parse -> chunk -> embed -> upload figures -> stage
     chunks -> swap them live -> mark ready. Every stage dependency is
@@ -529,8 +530,12 @@ def run_ingest_pipeline(
         chunker = chunker or Chunker()
         embedder = embedder or Embedder()
 
-        queries.mark_parsing(resolved_client, document_id)
-        queries.delete_staged_chunks(resolved_client, document_id)  # leftovers of an interrupted attempt
+        if lease:
+            lease.mutate("progress", {"status": "parsing", "error": None})
+            lease.mutate("discard")
+        else:
+            queries.mark_parsing(resolved_client, document_id)
+            queries.delete_staged_chunks(resolved_client, document_id)  # interrupted attempt
 
         # storage_path is "uploads/{user_id}/{filename}" (API_CONTRACT.md) —
         # includes the bucket name itself, but .from_("uploads") already
@@ -562,7 +567,10 @@ def run_ingest_pipeline(
         # number seen among *extracted* elements. A trailing page with no
         # elements we model (e.g. fully blank) would undercount by one.
         page_count = max((e.page_number for e in parsed.elements), default=None)
-        queries.mark_parsed(resolved_client, document_id, page_count=page_count)
+        if lease:
+            lease.mutate("progress", {"page_count": page_count, "parsed_at": queries._now_iso()})
+        else:
+            queries.mark_parsed(resolved_client, document_id, page_count=page_count)
 
         chunks = chunker.chunk(parsed)
         opened_images = [c.image for c in chunks if c.image is not None]
@@ -576,7 +584,10 @@ def run_ingest_pipeline(
         # batches hit the fallback.
         embedded_chunks = embedder.embed(chunks)
         check_deadline(deadline, JOB_TIME_LIMIT_MINUTES)
-        queries.mark_embedded(resolved_client, document_id)
+        if lease:
+            lease.mutate("progress", {"status": "embedded", "embedded_at": queries._now_iso()})
+        else:
+            queries.mark_embedded(resolved_client, document_id)
 
         # A fresh prefix per run, so the old chunks' figures stay valid until
         # the swap; the old objects are removed after it.
@@ -590,15 +601,24 @@ def run_ingest_pipeline(
             figure_paths=figure_paths,
             elements=parsed.elements,
         )
-        queries.insert_staged_chunks(resolved_client, rows)
+        if lease:
+            lease.mutate("stage", rows=rows)
+        else:
+            queries.insert_staged_chunks(resolved_client, rows)
         old_figure_paths = queries.list_figure_paths_for_document(resolved_client, document_id)
-        queries.swap_document_chunks(resolved_client, document_id=document_id, user_id=user_id)
+        if lease:
+            lease.mutate("publish")
+        else:
+            queries.swap_document_chunks(resolved_client, document_id=document_id, user_id=user_id)
         # The new figures are referenced by live chunks now: a failure after
         # this point (e.g. in mark_ready) must not clean them up.
         live_figures = set(new_figure_paths)
         new_figure_paths.clear()
-        queries.mark_ready(resolved_client, document_id)
-        _remove_figures(resolved_client, [p for p in old_figure_paths if p not in live_figures])
+        if not lease:
+            queries.mark_ready(resolved_client, document_id)
+        # Archived cited figures still back historical source panels.
+        retained_paths = set(queries.list_figure_paths_for_document(resolved_client, document_id))
+        _remove_figures(resolved_client, [p for p in old_figure_paths if p not in retained_paths])
         return True
     except StoragePathError as exc:
         # Deliberately not logger.exception() here — that would dump a
@@ -613,21 +633,24 @@ def run_ingest_pipeline(
             user_id,
             exc.reason,
         )
-        _fail_document(resolved_client, document_id, exc)
+        _fail_document(resolved_client, document_id, exc, lease=lease)
         return False
     except (ParseError, IngestTimeoutError, MissingSourceFileError) as exc:
         # Permanent: the same file fails the same way next time. Includes
         # DocumentLimitError (too large, too many pages / OCR pages).
         logger.warning("ingest pipeline failed for document %s: %s", document_id, exc)
-        _fail_document(resolved_client, document_id, exc, new_figure_paths)
+        _fail_document(resolved_client, document_id, exc, new_figure_paths, lease=lease)
         return False
     except Exception as exc:
+        if isinstance(exc, LostIngestLease):
+            _remove_figures(resolved_client, new_figure_paths)
+            raise
         if not final_attempt:
             # Rate limits, network or storage errors: let the queue retry.
-            _discard_attempt(resolved_client, document_id, new_figure_paths)
+            _discard_attempt(resolved_client, document_id, new_figure_paths, lease=lease)
             raise TransientIngestError(f"{type(exc).__name__}: {exc}") from exc
         logger.exception("ingest pipeline failed for document %s", document_id)
-        _fail_document(resolved_client, document_id, exc, new_figure_paths)
+        _fail_document(resolved_client, document_id, exc, new_figure_paths, lease=lease)
         return False
     finally:
         # FEAT-004's image ownership contract: Chunk images are the
@@ -641,23 +664,42 @@ def _remove_figures(client, paths: list[str]) -> None:
     if not paths:
         return
     try:
-        client.storage.from_("figures").remove(paths)
+        # A publication may commit even when its HTTP acknowledgement is lost.
+        # Cleanup must never delete an image that live or archived chunks use.
+        # These paths were generated from the ingest's authenticated user_id.
+        by_user: dict[str, list[str]] = {}
+        for path in paths:
+            by_user.setdefault(path.split("/", 1)[0], []).append(path)
+        removable = []
+        for user_id, candidates in by_user.items():
+            rows = client.table("chunks").select("figure_path").eq("user_id", user_id).in_(
+                "figure_path", candidates
+            ).execute().data
+            referenced = {row["figure_path"] for row in rows}
+            removable.extend(path for path in candidates if path not in referenced)
+        if removable:
+            client.storage.from_("figures").remove(removable)
     except Exception:
+        # If reference checking fails, retaining an orphan is safer than
+        # deleting source evidence whose publication could have succeeded.
         logger.warning("ingest: couldn't remove %d figure object(s)", len(paths), exc_info=True)
 
 
-def _discard_attempt(client, document_id: str, new_figure_paths: list[str]) -> None:
+def _discard_attempt(client, document_id: str, new_figure_paths: list[str], lease: IngestLease | None = None) -> None:
     """Removes what a failed attempt staged; the live chunks are untouched."""
     if client is None:
         return
     try:
-        queries.delete_staged_chunks(client, document_id)
+        if lease:
+            lease.mutate("discard")
+        else:
+            queries.delete_staged_chunks(client, document_id)
     except Exception:
         logger.warning("ingest: couldn't clear staged chunks for document %s", document_id, exc_info=True)
     _remove_figures(client, new_figure_paths)
 
 
-def _fail_document(client, document_id: str, exc: Exception, new_figure_paths: list[str] | None = None) -> None:
+def _fail_document(client, document_id: str, exc: Exception, new_figure_paths: list[str] | None = None, lease: IngestLease | None = None) -> None:
     """Best-effort failure handling (Codex review, 2026-07-23). If
     `client` never got constructed, there is no client to write with —
     log at ERROR and stop; the document stays at whatever status it
@@ -678,7 +720,10 @@ def _fail_document(client, document_id: str, exc: Exception, new_figure_paths: l
     # Only this attempt's staged chunks: a reindexed document's live chunks
     # stay searchable after a failure (2026-10-06).
     try:
-        queries.delete_staged_chunks(client, document_id)
+        if lease:
+            lease.mutate("discard")
+        else:
+            queries.delete_staged_chunks(client, document_id)
     except Exception:
         logger.error(
             "ingest pipeline failure-cleanup: delete_staged_chunks itself failed for "
@@ -690,7 +735,10 @@ def _fail_document(client, document_id: str, exc: Exception, new_figure_paths: l
     _remove_figures(client, new_figure_paths or [])
 
     try:
-        queries.mark_failed(client, document_id, error=str(exc))
+        if lease:
+            lease.mutate("progress", {"status": "failed", "error": str(exc)})
+        else:
+            queries.mark_failed(client, document_id, error=str(exc))
     except Exception:
         logger.error(
             "ingest pipeline failure-cleanup: mark_failed itself failed for document %s "

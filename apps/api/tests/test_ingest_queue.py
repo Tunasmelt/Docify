@@ -189,7 +189,7 @@ def test_heartbeat_keeps_the_lease_fresh_while_a_job_runs(admin, user_a, monkeyp
     claimed = ingest_queue.claim(admin, "hb-worker", max_running=5)
     admin.table("ingest_jobs").update({"locked_at": _ago(3600)}).eq("id", job["id"]).execute()
 
-    with ingest_queue._Heartbeat(claimed["id"], "hb-worker"):
+    with ingest_queue._Heartbeat(claimed["id"], "hb-worker", claimed["attempts"]):
         time.sleep(1.0)
 
     locked_at = datetime.fromisoformat(_job(admin, job["id"])["locked_at"])
@@ -223,3 +223,40 @@ def test_reindex_is_refused_while_a_job_for_the_document_is_queued(app_client, a
 
     response = app_client.post(f"/reindex/{doc}", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 409
+
+
+@pytest.mark.parametrize("action,values", [
+    ("progress", {"status": "failed", "error": "stale error"}),
+    ("discard", {}), ("stage", {}), ("publish", {}),
+    ("retry", {"run_after": _ago(1)}), ("finish", {"status": "failed"}),
+])
+def test_reclaimed_attempt_cannot_mutate_job_document_or_chunks(admin, user_a, action, values):
+    user_id, token = user_a
+    doc, path = _document(admin, user_id, token, "fenced.pdf")
+    queued = ingest_queue.enqueue(admin, document_id=doc, user_id=user_id, storage_path=path)
+    old = ingest_queue.claim(admin, "old-worker", max_running=5)
+    admin.table("ingest_jobs").update({"locked_at": _ago(121)}).eq("id", queued["id"]).execute()
+    new = ingest_queue.claim(admin, "new-worker", max_running=5)
+    with pytest.raises(ingest_queue.LostIngestLease):
+        ingest_queue.IngestLease(admin, old, "old-worker").mutate(action, values)
+    assert _job(admin, queued["id"])["locked_by"] == "new-worker"
+    assert _doc(admin, doc) == {"status": "uploaded", "error": None}
+    assert ingest_queue.process_job(admin, new, _runner(), "new-worker") == "succeeded"
+    assert _doc(admin, doc)["status"] == "ready"
+
+
+def test_worker_that_loses_lease_during_embedding_cannot_publish(admin, user_a):
+    user_id, token = user_a
+    doc, path = _document(admin, user_id, token, "takeover.pdf")
+    queued = ingest_queue.enqueue(admin, document_id=doc, user_id=user_id, storage_path=path)
+    old = ingest_queue.claim(admin, "old-worker", max_running=5)
+
+    class ReclaimingEmbedder(FakeEmbedder):
+        def embed(self, chunks):
+            admin.table("ingest_jobs").update({"locked_at": _ago(121)}).eq("id", queued["id"]).execute()
+            assert ingest_queue.claim(admin, "new-worker", max_running=5)
+            return super().embed(chunks)
+
+    assert ingest_queue.process_job(admin, old, _runner(embedder=ReclaimingEmbedder()), "old-worker") == "lost"
+    assert _job(admin, queued["id"])["locked_by"] == "new-worker"
+    assert admin.table("chunks").select("id").eq("document_id", doc).execute().data == []

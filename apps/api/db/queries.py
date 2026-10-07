@@ -240,7 +240,7 @@ def rename_document(client, *, document_id: str, user_id: str, filename: str) ->
     return get_document(client, document_id=document_id, user_id=user_id)
 
 
-_CONTEXT_CHUNK_COLUMNS = "id,chunk_index,element_type,page_number,content,figure_path,metadata"
+_CONTEXT_CHUNK_COLUMNS = "id,chunk_index,element_type,page_number,content,figure_path,metadata,archived"
 
 
 def get_document_chunk(client, *, document_id: str, chunk_id: str, user_id: str) -> dict | None:
@@ -267,7 +267,7 @@ def list_document_chunks(
 ) -> list[dict]:
     """A document's chunks in reading order, filtered to one page/slide or a
     chunk_index range (inclusive)."""
-    query = client.table("chunks").select(_CONTEXT_CHUNK_COLUMNS).eq("document_id", document_id).eq("user_id", user_id)
+    query = client.table("chunks").select(_CONTEXT_CHUNK_COLUMNS).eq("document_id", document_id).eq("user_id", user_id).eq("archived", False)
     if page_number is not None:
         query = query.eq("page_number", page_number)
     if index_range is not None:

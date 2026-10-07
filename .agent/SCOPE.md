@@ -123,7 +123,7 @@ Source of truth for what is and is not in scope, per phase. Check here before de
   - [x] **Per-user concurrency cap** (2026-10-06) — at most 2 documents processing per user (`MAX_CONCURRENT_INGESTS_PER_USER`); `/ingest` and `/reindex` return `429 TOO_MANY_PROCESSING` beyond that. Counted in Postgres, so it holds across restarts and instances.
   - [x] **Queue, global cap, time limit, document limits** — one worker thread per API process; at most `INGEST_MAX_CONCURRENT_JOBS` (default 1) jobs run across all users and instances. 20-minute time limit per attempt, checked between stages and OCR'd pages (cooperative: an OCR call in flight can overrun by its own timeout). Documents over 50 MB, 300 pages/slides, or 30 pages needing OCR are refused before the expensive work starts.
   - [x] **Reindex keeps old chunks** — new chunks are staged and swapped in atomically; a failed reindex leaves the old ones live.
-  - [ ] Still open: the worker shares the API process (a hard kill on timeout, or OOM isolation, would need a subprocess or separate worker service), and a reindex still cascades away citations that pointed at the old chunks.
+  - [ ] Still open: the worker shares the API process; hard timeout termination or OOM isolation needs a subprocess or separate worker service.
 
 ### Explicitly out of scope
 - Marketing site beyond the landing page
@@ -140,3 +140,7 @@ Source of truth for what is and is not in scope, per phase. Check here before de
 - Public API / developer platform
 - Billing / payments / subscriptions
 - Anything requiring paid infrastructure
+
+### 2026-10-07 — project reliability improvements
+
+Cited chunk versions survive reprocessing and are excluded from new retrieval. Ingest mutations validate worker ownership and attempt number under a DB lock. Ready documents expose Reprocess. CI includes deterministic browser regressions and a retrieval recall gate. Live generation/grounding evaluation is available separately because it consumes provider quota.

@@ -26,7 +26,6 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from db import queries
 from db.client import get_service_role_client
 
 logger = logging.getLogger(__name__)
@@ -92,34 +91,31 @@ def claim(client, worker_id: str, *, max_running: int) -> dict | None:
     return rows[0] if rows else None
 
 
-def _finish(client, job_id: str, status: str, error: str | None = None) -> None:
-    client.table("ingest_jobs").update(
-        {"status": status, "last_error": error, "locked_at": None, "updated_at": _iso(datetime.now(timezone.utc))}
-    ).eq("id", job_id).execute()
+class LostIngestLease(Exception):
+    """The attempt was reclaimed; this worker must stop without mutating it."""
 
 
-def _schedule_retry(client, job: dict, error: str) -> float:
-    delay = RETRY_BACKOFF_SECONDS[min(job["attempts"] - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
-    now = datetime.now(timezone.utc)
-    client.table("ingest_jobs").update(
-        {
-            "status": "queued",
-            "run_after": _iso(now + timedelta(seconds=delay)),
-            "locked_at": None,
-            "locked_by": None,
-            "last_error": error,
-            "updated_at": _iso(now),
-        }
-    ).eq("id", job["id"]).execute()
-    return delay
+class IngestLease:
+    def __init__(self, client, job: dict, worker_id: str):
+        self.client, self.job, self.worker_id = client, job, worker_id
+
+    def mutate(self, action: str, values: dict | None = None, rows: list | None = None) -> None:
+        accepted = self.client.rpc("mutate_ingest_attempt", {
+            "p_job_id": self.job["id"], "p_user_id": self.job["user_id"],
+            "p_worker_id": self.worker_id, "p_attempt": self.job["attempts"],
+            "p_action": action, "p_values": values or {}, "p_rows": rows or [],
+        }).execute().data
+        if not accepted:
+            raise LostIngestLease(self.job["id"])
 
 
 class _Heartbeat:
     """Refreshes the job's lease while it runs, on its own client and thread."""
 
-    def __init__(self, job_id: str, worker_id: str):
+    def __init__(self, job_id: str, worker_id: str, attempt: int):
         self._job_id = job_id
         self._worker_id = worker_id
+        self._attempt = attempt
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name=f"ingest-heartbeat-{job_id[:8]}", daemon=True)
 
@@ -130,7 +126,7 @@ class _Heartbeat:
                 client = client or get_service_role_client()
                 client.table("ingest_jobs").update({"locked_at": _iso(datetime.now(timezone.utc))}).eq(
                     "id", self._job_id
-                ).eq("locked_by", self._worker_id).execute()
+                ).eq("locked_by", self._worker_id).eq("attempts", self._attempt).eq("status", "running").execute()
             except Exception:
                 logger.warning("ingest heartbeat failed for job %s", self._job_id, exc_info=True)
 
@@ -144,17 +140,18 @@ class _Heartbeat:
 
 
 def process_job(client, job: dict, runner, worker_id: str) -> str:
-    """Runs one claimed job. Returns "succeeded", "failed" or "retry"."""
+    """Runs one claimed job. Returns "succeeded", "failed", "retry" or "lost"."""
+    lease = IngestLease(client, job, worker_id)
     if job["attempts"] > job["max_attempts"]:
         # Claimed again after its lease expired more times than allowed: the
         # process keeps dying on this document (e.g. out of memory).
-        queries.mark_failed(client, job["document_id"], error=INTERRUPTED_TOO_OFTEN)
-        _finish(client, job["id"], "failed", INTERRUPTED_TOO_OFTEN)
+        lease.mutate("progress", {"status": "failed", "error": INTERRUPTED_TOO_OFTEN})
+        lease.mutate("finish", {"status": "failed", "error": INTERRUPTED_TOO_OFTEN})
         return "failed"
 
     final_attempt = job["attempts"] >= job["max_attempts"]
     deadline = time.monotonic() + JOB_TIME_LIMIT_SECONDS
-    with _Heartbeat(job["id"], worker_id):
+    with _Heartbeat(job["id"], worker_id, job["attempts"]):
         try:
             ok = runner(
                 document_id=job["document_id"],
@@ -162,17 +159,26 @@ def process_job(client, job: dict, runner, worker_id: str) -> str:
                 storage_path=job["storage_path"],
                 deadline=deadline,
                 final_attempt=final_attempt,
+                lease=lease,
             )
         except TransientIngestError as exc:
-            delay = _schedule_retry(client, job, str(exc))
-            queries.mark_queued(client, job["document_id"])
+            delay = RETRY_BACKOFF_SECONDS[min(job["attempts"] - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
+            try:
+                lease.mutate("retry", {"error": str(exc), "run_after": _iso(datetime.now(timezone.utc) + timedelta(seconds=delay))})
+            except LostIngestLease:
+                return "lost"
             logger.warning(
                 "ingest job %s (document %s) attempt %s/%s failed transiently, retrying in %ss: %s",
                 job["id"], job["document_id"], job["attempts"], job["max_attempts"], delay, exc,
             )
             return "retry"
+        except LostIngestLease:
+            return "lost"
     status = "succeeded" if ok else "failed"
-    _finish(client, job["id"], status)
+    try:
+        lease.mutate("finish", {"status": status})
+    except LostIngestLease:
+        return "lost"
     return status
 
 

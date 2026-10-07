@@ -1,28 +1,32 @@
 import type { Metadata } from "next";
-import { Newsreader, Spline_Sans, Spline_Sans_Mono } from "next/font/google";
+import localFont from "next/font/local";
 
 import { ThemeProvider } from "@/components/theme-provider";
 
 import "./globals.css";
 
-const newsreader = Newsreader({
-  subsets: ["latin"],
-  weight: ["400", "500", "600"],
-  style: ["normal", "italic"],
+// Bundle the same families locally: builds must not depend on Google Fonts
+// URL formats or availability. Licence notices live beside these assets.
+const newsreader = localFont({
+  src: [
+    { path: "./fonts/newsreader-normal.woff2", weight: "400 600", style: "normal" },
+    { path: "./fonts/newsreader-italic.woff2", weight: "400 600", style: "italic" },
+  ],
   variable: "--font-newsreader",
   display: "swap",
+  adjustFontFallback: "Times New Roman",
 });
 
-const splineSans = Spline_Sans({
-  subsets: ["latin"],
-  weight: ["400", "500", "600"],
+const splineSans = localFont({
+  src: "./fonts/spline-sans-normal.woff2",
+  weight: "400 600",
   variable: "--font-spline-sans",
   display: "swap",
 });
 
-const splineSansMono = Spline_Sans_Mono({
-  subsets: ["latin"],
-  weight: ["400", "500"],
+const splineSansMono = localFont({
+  src: "./fonts/spline-sans-mono-normal.woff2",
+  weight: "400 500",
   variable: "--font-spline-mono",
   display: "swap",
 });
