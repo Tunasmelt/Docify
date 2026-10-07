@@ -55,7 +55,11 @@ function apiCitationToClientCitation(id: string, c: ApiCitation): Citation {
     // violation worth a loud runtime error, not a silently-accepted
     // type. 'unverified' (2026-08-03) IS a legitimate, kept-not-dropped
     // state now — see API_CONTRACT.md and CITATION_VERDICT_STYLES.
-    verdict: c.verdict as "supported" | "partial" | "unverified",
+    // Older saved text verdicts could lack evidence. Do not present those
+    // as verified; figure evidence can legitimately be visual-only.
+    verdict: c.element_type !== "figure" && (c.verdict === "supported" || c.verdict === "partial") && !c.supporting_quote?.trim()
+      ? "unverified"
+      : c.verdict as "supported" | "partial" | "unverified",
     // supporting_quote is null whenever the verifier couldn't ground a
     // verbatim quote (always true for figure citations — figure chunks
     // have no text content to quote from) — snippet (the raw chunk

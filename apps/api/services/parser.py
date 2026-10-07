@@ -356,6 +356,25 @@ def _document_body_font_size(pdf) -> float:
     return max(sizes, key=lambda s: sizes[s])
 
 
+def _text_from_chars(chars: list[dict]) -> str:
+    """Recover word spaces encoded as glyph positions rather than characters.
+
+    TeX PDFs often omit literal spaces. A size-relative gap distinguishes
+    word boundaries from kerning, while existing spaces stay untouched.
+    """
+    parts: list[str] = []
+    previous = None
+    for char in sorted(chars, key=lambda c: c["x0"]):
+        if previous is not None:
+            gap = char["x0"] - previous["x1"]
+            tolerance = max(0.5, min(previous["size"], char["size"]) * 0.15)
+            if gap > tolerance and not previous["text"].isspace() and not char["text"].isspace():
+                parts.append(" ")
+        parts.append(char["text"])
+        previous = char
+    return "".join(parts).strip()
+
+
 def _group_chars_into_lines(page) -> list[dict]:
     """Groups a page's characters into visual lines by vertical position —
     pdfplumber's own primitive (page.chars) has no line concept built in.
@@ -370,7 +389,7 @@ def _group_chars_into_lines(page) -> list[dict]:
     result = []
     for top in sorted(lines.keys()):
         chars = sorted(lines[top], key=lambda c: c["x0"])
-        text = "".join(c["text"] for c in chars).strip()
+        text = _text_from_chars(chars)
         if not text:
             continue
         x0 = chars[0]["x0"]
@@ -400,7 +419,7 @@ def _group_chars_into_lines(page) -> list[dict]:
 # at the gutter and read column by column. A line that crosses the gutter (a
 # title, a full-width heading) starts a new section: within each section the
 # left column is read before the right.
-_SEGMENT_GAP_PT = 12.0  # a horizontal gap this wide inside a row separates columns
+_SEGMENT_GAP_PT = 6.0  # must be smaller than the minimum detectable gutter
 _MIN_GUTTER_PT = 8.0
 _MIN_COLUMN_ROWS = 6
 _GUTTER_SEARCH = (0.25, 0.75)  # gutter must lie in this horizontal band of the page
@@ -409,7 +428,7 @@ _GUTTER_SEARCH = (0.25, 0.75)  # gutter must lie in this horizontal band of the 
 def _line_from_chars(chars: list[dict]) -> dict:
     chars = sorted(chars, key=lambda c: c["x0"])
     return {
-        "text": "".join(c["text"] for c in chars).strip(),
+        "text": _text_from_chars(chars),
         "top": min(c["top"] for c in chars),
         "bottom": max(c["bottom"] for c in chars),
         "x0": chars[0]["x0"],
@@ -458,12 +477,12 @@ def _detect_gutter(rows: list[list[list[dict]]], page_width: float) -> tuple[flo
     if best is None or best[1] - best[0] < _MIN_GUTTER_PT:
         return None
     left, right = float(best[0]), float(best[1])
-    both_sides = sum(
-        1
-        for segments in rows
-        if any(seg[-1]["x1"] <= left + 1 for seg in segments) and any(seg[0]["x0"] >= right - 1 for seg in segments)
-    )
-    if both_sides < max(3, len(rows) * 0.3):
+    # Columns need not share baselines: TeX lists and inline mathematics
+    # routinely offset one column's rows from the other. Count sustained
+    # text on each side independently instead of requiring aligned rows.
+    left_rows = sum(any(seg[-1]["x1"] <= left + 1 for seg in segments) for segments in rows)
+    right_rows = sum(any(seg[0]["x0"] >= right - 1 for seg in segments) for segments in rows)
+    if min(left_rows, right_rows) < max(3, len(rows) * 0.3):
         return None  # e.g. a single column of short lines leaves the right side empty
     return left, right
 

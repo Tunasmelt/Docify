@@ -288,3 +288,8 @@ Local GoTrue may ignore GET /auth/v1/admin/users?email=... and return all users.
 ### 2026-10-07 [codex] — centred dialogs need opacity-only entrance animation
 
 Shared DialogContent is positioned with translate(-50%, -50%). The fade-up keyframe ended at transform:none, overriding that centring transform and leaving wide previews off-screen. Use fade-in without transform for dialogs and overlays. Workspace and document additions reuse existing design tokens and dialog/input/button components; headers show the actual active workspace.
+
+
+### 2026-10-07 [codex] — PDF glyph concatenation corrupts citation evidence
+
+TeX PDFs can encode word spaces solely as horizontal glyph gaps. Joining page.chars text directly removed these spaces. Restore gaps relative to font size, preserving explicit spaces and kerning. Column segmentation must use a threshold below the minimum gutter and count rows on each side independently: narrow gutters and staggered baselines otherwise interleave columns. Reproduced using public arXiv 2507.18910 page 10. Reindex existing documents to replace corrupt text/embeddings; do not fake spaces in rendered quotes or rewrite historical answers. Supported/partial text verdicts without an evidence quote must remain unverified.

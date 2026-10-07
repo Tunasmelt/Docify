@@ -514,6 +514,11 @@ def _finalize(
     if verdict == VerdictLabel.UNSUPPORTED:
         quote = None
 
+    if verdict in (VerdictLabel.SUPPORTED, VerdictLabel.PARTIAL) and chunk.image is None and (quote is None or not quote.strip()):
+        return _fail_safe_verdict(
+            VerdictLabel.UNVERIFIED, model, "text verdict has no supporting quote", latency_ms
+        )
+
     if quote is not None and chunk.image is not None and not _quote_is_grounded(quote, chunk.content):
         # A figure chunk's text is only its caption; the model also saw the
         # image and may legitimately quote text read off it, which can't be
