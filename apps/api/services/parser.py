@@ -201,6 +201,7 @@ from services.document_model import (  # noqa: E402
     _TEXTUAL_ELEMENT_TYPES,
     BBox,
     DocumentLimitError,
+    IngestTimeoutError,
     check_deadline,
     ElementType,
     ParsedDocument,
@@ -339,7 +340,7 @@ def _bbox_distance(a: tuple[float, float, float, float], b: tuple[float, float, 
 # ══════════════════════════════════════════════════════════════════════════
 
 
-def _document_body_font_size(pdf) -> float:
+def _document_body_font_size(pdf, deadline: float | None = None) -> float:
     """The single most common (char-count-weighted) font size across the
     whole document — the body-text baseline every heading heuristic below
     is judged against. Computed once per document, not per page: real
@@ -348,9 +349,11 @@ def _document_body_font_size(pdf) -> float:
     it — confirmed live, not assumed."""
     sizes: dict[float, int] = {}
     for page in pdf.pages:
+        check_deadline(deadline)
         for ch in page.chars:
             size = round(ch["size"], 1)
             sizes[size] = sizes.get(size, 0) + 1
+        page.close()
     if not sizes:
         return 11.0  # no text at all on any page — fallback, never divides by zero below
     return max(sizes, key=lambda s: sizes[s])
@@ -569,15 +572,17 @@ def _classify_line(line: dict, body_size: float, body_x0: float) -> ElementType:
     return ElementType.TEXT
 
 
-def _document_body_x0(pdf) -> float:
+def _document_body_x0(pdf, deadline: float | None = None) -> float:
     """Left-margin baseline for the indent-based list heuristic — the most
     common line-start x0 across the document, mirroring
     _document_body_font_size's same weighting approach."""
     positions: dict[float, int] = {}
     for page in pdf.pages:
+        check_deadline(deadline)
         for line in _group_chars_into_lines(page):
             key = round(line["x0"], 0)
             positions[key] = positions.get(key, 0) + 1
+        page.close()
     if not positions:
         return 0.0
     return max(positions, key=lambda x: positions[x])
@@ -710,14 +715,14 @@ def _match_captions_to_targets(
     return resolution
 
 
-def _parse_pdf(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
+def _parse_pdf(file_bytes: bytes, deadline: float | None = None) -> tuple[list[ParsedElement], int]:
     last_page_number: int | None = None
     try:
         with pdfplumber.open(BytesIO(file_bytes)) as pdf:
             if not pdf.pages:
                 raise ParseError("PDF has no pages")
-            body_size = _document_body_font_size(pdf)
-            body_x0 = _document_body_x0(pdf)
+            body_size = _document_body_font_size(pdf, deadline)
+            body_x0 = _document_body_x0(pdf, deadline)
 
             elements: list[ParsedElement] = []
             dropped = 0
@@ -726,6 +731,7 @@ def _parse_pdf(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
             open_table: dict | None = None
 
             for page in pdf.pages:
+                check_deadline(deadline)
                 page_number = page.page_number
                 last_page_number = page_number
 
@@ -932,9 +938,10 @@ def _parse_pdf(file_bytes: bytes) -> tuple[list[ParsedElement], int]:
                     page_elements_in_order, table_meta, open_table, page_number, float(page.height)
                 )
                 elements.extend(page_elements_in_order)
+                page.close()  # Do not retain decoded glyph/layout caches for every page.
 
             return elements, dropped
-    except ParseError:
+    except (ParseError, IngestTimeoutError):
         raise
     except Exception as exc:
         raise ParseError(f"Failed to parse PDF: {exc}", page_number=last_page_number) from exc
@@ -1346,7 +1353,7 @@ def _largest_image_coverage(page) -> float:
 # time on a 512MB instance, so a single huge or fully scanned file must not
 # hold it for hours. Each OCR'd page can take up to ~3 minutes when every
 # tier times out, and Gemini's OCR tier allows ~20 requests a day in total.
-MAX_PAGES = 300  # PDF pages or PPTX slides
+MAX_PAGES = 1000  # digital PDF pages or PPTX slides
 MAX_OCR_PAGES = 30
 
 
@@ -1401,7 +1408,7 @@ class Parser:
             raise DocumentLimitError(f"This document has {pages} {unit}; the limit is {MAX_PAGES}.")
 
         if fmt == "pdf":
-            elements, dropped = _parse_pdf(file_bytes)
+            elements, dropped = _parse_pdf(file_bytes, self._deadline)
         elif fmt == "docx":
             elements, dropped = _parse_docx(file_bytes)
         elif fmt == "pptx":
@@ -1428,10 +1435,11 @@ class Parser:
         original FEAT-020 investigation and unchanged here.
         """
         with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-            page_info = {
-                page.page_number: (float(page.width), float(page.height), _largest_image_coverage(page))
-                for page in pdf.pages
-            }
+            page_info = {}
+            for page in pdf.pages:
+                check_deadline(self._deadline)
+                page_info[page.page_number] = (float(page.width), float(page.height), _largest_image_coverage(page))
+                page.close()
 
         textual_chars_by_page: dict[int, int] = {}
         for e in elements:

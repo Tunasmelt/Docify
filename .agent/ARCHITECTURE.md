@@ -111,7 +111,7 @@ The browser talks to FastAPI directly (`NEXT_PUBLIC_API_URL`, `apps/web/lib/api/
    limits, network, storage) retry after 60s then 300s, up to 3 attempts; parse errors,
    limit violations, a missing file and the 20-minute time limit fail at once. Each job:
    a. Downloads the file from Storage (service-role client) and checks its real size
-   b. Refuses documents over 300 pages/slides or with more than 30 pages needing OCR
+   b. Refuses documents over 1,000 pages/slides or with more than 30 pages needing OCR
       (both checked before any parsing or OCR), then parses → typed elements (text, tables, figures, headings) with page/slide + bbox,
       in document order — two-column PDF pages are read column by column (status='parsing'). A PDF page goes through the OCR fallback
       chain if it has no text, or under 200 characters of text over a scan image covering

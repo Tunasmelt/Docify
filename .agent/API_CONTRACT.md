@@ -104,7 +104,7 @@ Supported `mime_type`s: PDF, DOCX, PPTX, HTML.
 - Creates the `documents` row with `status='uploaded'` (queued), enqueues an ingest job, and returns `202` immediately.
 - The ingest worker processes jobs one at a time across all users: it downloads, parses (with the OCR fallback for low-yield PDF pages), chunks, embeds, uploads figures, and swaps the new chunks in. Status moves `uploaded` → `parsing` → `embedded` → `ready`, or `failed` with `documents.error` set. `parsed_at`/`embedded_at` are milestone timestamps.
 - **Retries:** a transient failure (rate limit, network, storage error) puts the document back to `uploaded` and retries after 60s, then 300s, up to 3 attempts in all; the last failure marks it `failed`. A job interrupted by a restart resumes within about 2 minutes.
-- **Limits** (the document fails with a message saying which): over 50 MB (real size, after download), over 300 pages or slides, more than 30 pages needing OCR, or processing past 20 minutes. A missing upload fails at once.
+- **Limits** (the document fails with a message saying which): over 50 MB (real size, after download), over 1,000 pages or slides, more than 30 pages needing OCR, or processing past 20 minutes. A missing upload fails at once.
 - **Embedding fallback:** a batch whose Voyage retries are exhausted is embedded with Gemini `gemini-embedding-2` instead; `chunks.embedding_provider` records which. This is invisible to the client. A document only fails at this stage if both providers fail for the same batch.
 - Clients poll `GET /documents` (or `GET /documents/{id}`) to observe status.
 

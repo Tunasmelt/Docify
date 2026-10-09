@@ -303,3 +303,7 @@ User requested all five reviewed improvements. Reindex archives cited chunks (in
 
 ### 2026-10-07 [codex] — bundle typography instead of downloading it during builds
 Fresh CI intermittently failed in Next14's Google font loader at its font-extension regex, while another run passed. Bundle the same Latin Newsreader (normal/italic), Spline Sans and Spline Sans Mono assets with original SIL OFL notices and provenance. Use next/font/local with the same CSS variables and weight ranges; build and browser regressions pass. This removes font URL/network fragility without installing packages or changing design families.
+
+
+### 2026-10-10 [codex] — shared document normalization and larger digital files
+User clarified more pages per document, not concurrent documents. Normalize element text once before chunking using NFC, common Latin ligatures, nonbreaking spaces, consistent line endings and corrupt-control removal. Avoid blanket NFKC: it can alter superscripts, fractions and mathematical semantics. Preserve joiners for multilingual scripts. PDF page caches are released after document-wide font/margin passes, extraction and OCR inspection; deadline checks cover these passes. Digital PDFs/slides now allow1,000, keeping30OCRpages/50MB/20minutes. Real generated1,000-pagePDF passes,1,001refused beforeextraction. Reprocess existingdocs; no original-file/schema changes. Host UTCdate differs fromuserdate, explaining gap-check datewarning.

@@ -110,7 +110,8 @@ export function UploadZone({ onUploadComplete, workspaceId }: UploadZoneProps) {
       </h2>
       <p className="mx-auto m-0 max-w-[380px] text-sm leading-relaxed text-muted">
         or <span className="font-medium text-accent">browse your files</span>{" "}
-        — up to 50 MB, text is extracted and indexed automatically.
+        — up to 50 MB and 1,000 pages. Text is extracted and indexed automatically.
+        Scanned PDFs support up to 30 pages requiring OCR.
       </p>
       {error ? (
         <p className="m-0 mt-3 text-[13px] text-destructive">{error}</p>
