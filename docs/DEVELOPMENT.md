@@ -115,3 +115,8 @@ cd apps/web && pnpm build               # production build — runs ESLint as a 
 ## Cohere and personal workspaces
 
 Set COHERE_API_KEY in the API runtime environment to enable fallback. Apply migrations 20261007_001 and 20261007_002 before starting the updated API. Existing documents and chats go into My workspace. The sidebar creates, renames, switches and deletes private workspaces. Remove documents before deleting a workspace.
+
+
+## Document normalization and larger files
+
+PDFs and presentations support up to 1,000 pages/slides. Upload size remains 50 MB, scanned PDF OCR remains limited to 30 pages, and each ingest attempt has a 20-minute deadline. The parser releases PDF glyph/layout caches between pages and checks deadlines during font/margin analysis, extraction and OCR inspection. Extracted text from every supported format and OCR is normalized before chunking: NFC Unicode, common Latin ligatures, nonbreaking spaces, line endings, excess blank lines and corrupt control bytes. Numeric values, mathematical symbols, tables and multilingual joiners are preserved. Original uploaded files remain unchanged. Use Reprocess on existing documents to update extracted text; saved citations retain their original versions.

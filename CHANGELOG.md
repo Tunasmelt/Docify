@@ -1264,3 +1264,10 @@ Fresh GitHub CI for dc8801b passed604 backend tests,18 skipped,1 deselected; all
 ## 2026-10-07 — preserve published figures after acknowledgement loss [codex]
 
 If chunk publication commits but its HTTP reply is lost, pipeline cleanup previously treated the new figures as unpublished and could delete them. Check tenant-scoped live/archived references before removing any candidate figure; if checking fails, retain it. A real local Storage/Postgres regression commits the swap then raises a transport error and confirms the published figure remains downloadable. Chunk-swap and ingest-queue regressions:25 passed.
+
+
+## 2026-10-10 — document normalization and larger digital documents [codex]
+
+User requested document normalization and more pages per document. Normalize extracted element text once in the shared model, covering PDF/DOCX/PPTX/HTML and OCR. Preserve numbers, mathematical symbols, tabs/table structure, provenance and multilingual joiners while normalizing NFC, common ligatures, nonbreaking spaces, line endings and corrupt control characters. Raise PDF/slide limit from 300 to 1,000; retain 50 MB upload, 30-page OCR and 20-minute attempt limits. Release pdfplumber page caches after each font/margin/extraction/OCR-inspection pass and check the deadline in each pass. Existing documents require Reprocess; original files and historical citations remain unchanged. No schema migration or dependency installation required.
+
+Validation: parser/chunker/evaluation/normalization selection115 passed,3 skipped,14 deselected; final limits/normalization15 passed,4 skipped (local Supabase unavailable). A generated1,000-pagePDF retains all page numbers and passes cache-release checks;1,001pages rejected beforeextraction. Offline answerability29/29. Uploadcopy now communicates digital/OCR page limits. Fresh CI supplies local DB integration coverage.

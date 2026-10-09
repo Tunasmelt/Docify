@@ -1,4 +1,7 @@
-# Gap Check — 2026-10-07T17:29:41Z
+# Gap Check — 2026-10-09T22:01:52Z
+### [WARNING] Files changed today with no CHANGELOG entry for today
+Detected: 2026-10-09T22:01:52Z
+
 
 <!-- MANUAL ENTRIES BELOW — preserved across /gap-check runs, edit freely -->
 
@@ -273,3 +276,6 @@ Revisit if this app's threat model changes (e.g. handling genuinely sensitive da
 attacker gaining transient mailbox access to force an email swap — setting up a follow-on
 password-reset takeover — is judged unacceptable even as a two-step chain rather than a one-click
 exploit).
+
+### 2026-10-10 [codex] — changelog date warning explained
+The execution host reports2026-10-09UTC while user-facing date is2026-10-10Asia/Dubai. The automated changelog check matches only host UTC and reports a date warning; the requested implementation is documented under2026-10-10 in CHANGELOG.md. No implementation gap.

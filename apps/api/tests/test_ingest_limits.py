@@ -156,3 +156,36 @@ def test_a_missing_upload_fails_at_once_instead_of_being_retried(admin, user_a):
 
     assert ok is False
     assert _doc(admin, doc["id"]) == {"status": "failed", "error": "The uploaded file is missing from storage. Upload it again."}
+
+
+
+def test_digital_document_over_old_limit_keeps_all_pages_and_releases_page_caches(monkeypatch):
+    from tests.test_parser import _pdf, _text_ops
+    from pdfplumber.page import Page
+
+    closed = []
+    original = Page.close
+    def tracked_close(page):
+        original(page)
+        closed.append(page.page_number)
+        assert "_objects" not in page.__dict__
+        assert "_layout" not in page.__dict__
+    monkeypatch.setattr(Page, "close", tracked_close)
+    payload = _pdf([_text_ops([(72, 700, f"Page {i} revenue 1,350,000.")]) for i in range(1, 1001)])
+    document = Parser(ocr_tiers=[]).parse(payload, filename="large.pdf")
+    assert {e.page_number for e in document.elements} == set(range(1, 1001))
+    assert all("1,350,000" in e.content for e in document.elements)
+    assert len(closed) >= 1000 * 4  # font, margin, extraction, OCR inspection passes
+
+
+def test_thousand_page_limit_is_enforced_before_extracting(monkeypatch):
+    from tests.test_parser import _pdf
+    monkeypatch.setattr(parser_module, "_parse_pdf", lambda *a: pytest.fail("must reject before extraction"))
+    with pytest.raises(DocumentLimitError, match="1001 pages; the limit is 1000"):
+        Parser(ocr_tiers=[]).parse(_pdf([""] * 1001), filename="too-large.pdf")
+
+
+def test_digital_pdf_stops_before_extracting_when_deadline_has_expired():
+    with pytest.raises(IngestTimeoutError):
+        Parser(ocr_tiers=[], deadline=time.monotonic() - 1).parse(
+            (FIXTURES / "clean_digital.pdf").read_bytes(), filename="digital.pdf")

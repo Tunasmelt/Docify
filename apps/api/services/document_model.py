@@ -70,6 +70,24 @@ class BBox:
     y1: float
 
 
+def normalize_document_text(text: str) -> str:
+    """Canonical extracted text without changing numbers, layout or scripts."""
+    import re
+    import unicodedata
+
+    text = unicodedata.normalize("NFC", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.translate(str.maketrans({
+        "\u00a0": " ", "\u202f": " ", "\u2007": " ",
+        "\u00ad": None, "\u200b": None, "\ufeff": None,
+        "ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl",
+    }))
+    # Keep tabs/newlines (tables and paragraphs), strip corrupt control bytes.
+    text = "".join(c for c in text if c in "\n\t" or unicodedata.category(c) != "Cc")
+    text = "\n".join(line.rstrip() for line in text.split("\n"))
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
 @dataclass
 class ParsedElement:
     element_type: ElementType
@@ -90,6 +108,11 @@ class ParsedElement:
     # unclaimed can still be picked up by chunker.py's own Tier-2 proximity
     # heuristic — unchanged by this rewrite.
     association_method: str | None = None
+
+    def __post_init__(self):
+        if isinstance(self.content, str):
+            self.content = normalize_document_text(self.content)
+
 
 
 @dataclass
